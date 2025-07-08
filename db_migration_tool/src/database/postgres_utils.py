@@ -120,6 +120,64 @@ class PostgresOptimizer:
             return False, f"권한 확인 중 오류 발생: {str(e)}"
     
     @staticmethod
+    def check_connection_quick(config: Dict[str, Any]) -> Tuple[bool, str]:
+        """빠른 연결 확인 (타임아웃 5초)
+        
+        Args:
+            config: 데이터베이스 연결 설정
+            
+        Returns:
+            (연결 성공 여부, 상태 메시지 또는 오류 메시지)
+        """
+        import psycopg
+        
+        # 연결 파라미터 준비
+        conn_params = {
+            'host': config['host'],
+            'port': config['port'],
+            'dbname': config['database'],
+            'user': config['username'],
+            'password': config['password'],
+            'connect_timeout': 5  # 5초 타임아웃
+        }
+        
+        # SSL 설정
+        if config.get('ssl'):
+            conn_params['sslmode'] = 'require'
+        
+        try:
+            # psycopg3를 사용하여 연결 시도
+            conn = psycopg.connect(**conn_params)
+            
+            # 간단한 쿼리로 연결 확인
+            with conn.cursor() as cursor:
+                cursor.execute("SELECT 1")
+                cursor.fetchone()
+            
+            conn.close()
+            return True, "연결 성공"
+            
+        except psycopg.OperationalError as e:
+            error_str = str(e)
+            
+            # 구체적인 오류 메시지 분류
+            if "could not connect to server" in error_str or "Name or service not known" in error_str:
+                return False, f"호스트를 찾을 수 없음: {config['host']}"
+            elif "password authentication failed" in error_str or "authentication failed" in error_str:
+                return False, f"인증 실패: 사용자 {config['username']}"
+            elif "timeout expired" in error_str:
+                return False, "네트워크 타임아웃"
+            elif "permission denied" in error_str:
+                return False, "권한 부족"
+            elif "database" in error_str and "does not exist" in error_str:
+                return False, f"데이터베이스 없음: {config['database']}"
+            else:
+                return False, f"연결 실패: {error_str}"
+                
+        except Exception as e:
+            return False, f"예상치 못한 오류: {str(e)}"
+    
+    @staticmethod
     def create_optimized_connection(config: Dict[str, Any]) -> psycopg2.extensions.connection:
         """최적화된 연결 생성"""
         # 연결 파라미터 준비

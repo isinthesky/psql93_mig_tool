@@ -42,6 +42,10 @@ class MigrationDialog(QDialog):
         
         layout = QVBoxLayout(self)
         
+        # 연결 상태 표시 영역
+        connection_status_widget = self.create_connection_status_widget()
+        layout.addWidget(connection_status_widget)
+        
         # 상단: 날짜 선택 영역
         date_group = self.create_date_selection_group()
         layout.addWidget(date_group)
@@ -81,6 +85,9 @@ class MigrationDialog(QDialog):
         # 타이머 설정 (5초마다 업데이트)
         self.update_timer = QTimer()
         self.update_timer.timeout.connect(self.update_progress)
+        
+        # 다이얼로그가 열릴 때 연결 확인 시작
+        QTimer.singleShot(100, self.check_connections)
         
     def create_date_selection_group(self):
         """날짜 선택 그룹 생성"""
@@ -190,6 +197,55 @@ class MigrationDialog(QDialog):
         
         group.setLayout(layout)
         return group
+        
+    def create_connection_status_widget(self):
+        """연결 상태 표시 위젯 생성"""
+        widget = QWidget()
+        layout = QHBoxLayout()
+        layout.setContentsMargins(10, 5, 10, 5)
+        
+        # 소스 DB 상태
+        source_label = QLabel("소스 DB:")
+        source_label.setStyleSheet("font-weight: bold;")
+        layout.addWidget(source_label)
+        
+        self.source_status_icon = QLabel("●")
+        self.source_status_icon.setStyleSheet("color: #FFFF00; font-size: 16px;")  # 노란색
+        layout.addWidget(self.source_status_icon)
+        
+        self.source_status_text = QLabel("확인 중...")
+        layout.addWidget(self.source_status_text)
+        
+        layout.addSpacing(30)
+        
+        # 대상 DB 상태
+        target_label = QLabel("대상 DB:")
+        target_label.setStyleSheet("font-weight: bold;")
+        layout.addWidget(target_label)
+        
+        self.target_status_icon = QLabel("●")
+        self.target_status_icon.setStyleSheet("color: #FFFF00; font-size: 16px;")  # 노란색
+        layout.addWidget(self.target_status_icon)
+        
+        self.target_status_text = QLabel("확인 중...")
+        layout.addWidget(self.target_status_text)
+        
+        layout.addStretch()
+        
+        widget.setLayout(layout)
+        widget.setStyleSheet("""
+            QWidget {
+                background-color: #2b2b2b;
+                border: 1px solid #444;
+                border-radius: 5px;
+            }
+        """)
+        
+        # 연결 상태 저장
+        self.source_connected = False
+        self.target_connected = False
+        
+        return widget
         
     def create_log_group(self):
         """로그 그룹 생성"""
@@ -322,11 +378,16 @@ class MigrationDialog(QDialog):
             QMessageBox.warning(self, "파티션 없음", "선택된 날짜 범위에 파티션이 없습니다.")
             return
             
-        # 이력 생성
+        # 이력 생성 (연결 상태 포함)
+        source_status = "연결 성공" if self.source_connected else self.source_status_text.text()
+        target_status = "연결 성공" if self.target_connected else self.target_status_text.text()
+        
         history = self.history_manager.create_history(
             self.profile.id,
             start_date.strftime("%Y-%m-%d"),
-            end_date.strftime("%Y-%m-%d")
+            end_date.strftime("%Y-%m-%d"),
+            source_status=source_status,
+            target_status=target_status
         )
         self.history_id = history.id
         
@@ -601,3 +662,63 @@ class MigrationDialog(QDialog):
                 self.worker.wait()  # 스레드 종료 대기
                 
         event.accept()
+    
+    def check_connections(self):
+        """연결 상태 확인"""
+        # 임시 worker를 생성하여 연결 확인
+        self.connection_checker = CopyMigrationWorker(
+            profile=self.profile,
+            partitions=[],  # 빈 리스트
+            history_id=0,  # 임시 ID
+            resume=False
+        )
+        
+        # 연결 상태 시그널 연결
+        self.connection_checker.connection_checking.connect(self.on_connection_checking)
+        self.connection_checker.source_connection_status.connect(self.on_source_connection_status)
+        self.connection_checker.target_connection_status.connect(self.on_target_connection_status)
+        
+        # 연결 확인만 수행하는 플래그 설정
+        self.connection_checker.check_connections_only = True
+        self.connection_checker.start()
+    
+    def on_connection_checking(self):
+        """연결 확인 시작"""
+        self.source_status_icon.setStyleSheet("color: #FFFF00; font-size: 16px;")  # 노란색
+        self.source_status_text.setText("확인 중...")
+        self.target_status_icon.setStyleSheet("color: #FFFF00; font-size: 16px;")  # 노란색
+        self.target_status_text.setText("확인 중...")
+    
+    def on_source_connection_status(self, connected: bool, message: str):
+        """소스 DB 연결 상태 업데이트"""
+        self.source_connected = connected
+        
+        if connected:
+            self.source_status_icon.setStyleSheet("color: #00FF00; font-size: 16px;")  # 초록색
+            self.source_status_text.setText("연결됨")
+        else:
+            self.source_status_icon.setStyleSheet("color: #FF0000; font-size: 16px;")  # 빨간색
+            self.source_status_text.setText(message)
+        
+        self.update_start_button_state()
+    
+    def on_target_connection_status(self, connected: bool, message: str):
+        """대상 DB 연결 상태 업데이트"""
+        self.target_connected = connected
+        
+        if connected:
+            self.target_status_icon.setStyleSheet("color: #00FF00; font-size: 16px;")  # 초록색
+            self.target_status_text.setText("연결됨")
+        else:
+            self.target_status_icon.setStyleSheet("color: #FF0000; font-size: 16px;")  # 빨간색
+            self.target_status_text.setText(message)
+        
+        self.update_start_button_state()
+    
+    def update_start_button_state(self):
+        """시작 버튼 상태 업데이트"""
+        # 양쪽 DB가 모두 연결되었고, 현재 실행 중이 아닐 때만 활성화
+        if self.source_connected and self.target_connected and not self.is_running:
+            self.start_btn.setEnabled(True)
+        else:
+            self.start_btn.setEnabled(False)

@@ -1,7 +1,11 @@
 {
   "permissions": {
     "allow": [
-      "Bash(pip3 index:*)"
+      "Bash(pip3 index:*)",
+      "Bash(python3:*)",
+      "Bash(source:*)",
+      "Bash(pip install:*)",
+      "Bash(ls:*)"
     ],
     "deny": []
   }

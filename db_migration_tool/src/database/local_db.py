@@ -37,6 +37,10 @@ class MigrationHistory(Base):
     status = Column(String(20))  # completed, failed, cancelled, running
     total_rows = Column(Integer)
     processed_rows = Column(Integer)
+    # 연결 상태 필드 추가
+    source_connection_status = Column(Text)  # 연결 성공/실패 메시지
+    target_connection_status = Column(Text)  # 연결 성공/실패 메시지
+    connection_check_time = Column(DateTime)  # 연결 확인 시간
 
 
 class Checkpoint(Base):
@@ -126,7 +130,11 @@ class LocalDatabase:
                     "ALTER TABLE checkpoints ADD COLUMN last_path_id INTEGER",
                     "ALTER TABLE checkpoints ADD COLUMN last_issued_date INTEGER",
                     "ALTER TABLE checkpoints ADD COLUMN copy_method VARCHAR(10) DEFAULT 'INSERT'",
-                    "ALTER TABLE checkpoints ADD COLUMN bytes_transferred INTEGER DEFAULT 0"
+                    "ALTER TABLE checkpoints ADD COLUMN bytes_transferred INTEGER DEFAULT 0",
+                    # migration_history 테이블에 연결 상태 컬럼 추가
+                    "ALTER TABLE migration_history ADD COLUMN source_connection_status TEXT",
+                    "ALTER TABLE migration_history ADD COLUMN target_connection_status TEXT",
+                    "ALTER TABLE migration_history ADD COLUMN connection_check_time DATETIME"
                 ]
                 
                 for migration in migrations:

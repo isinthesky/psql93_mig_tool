@@ -27,6 +27,11 @@ class CopyMigrationWorker(QThread):
     finished = Signal()      # 완료
     performance = Signal(dict)  # 성능 지표
     
+    # 연결 상태 시그널
+    connection_checking = Signal()  # 연결 확인 시작
+    source_connection_status = Signal(bool, str)  # 연결 성공 여부, 메시지
+    target_connection_status = Signal(bool, str)  # 연결 성공 여부, 메시지
+    
     def __init__(self, profile: ConnectionProfile, partitions: list[str],
                  history_id: int, resume: bool = False):
         super().__init__()
@@ -54,6 +59,11 @@ class CopyMigrationWorker(QThread):
     def run(self):
         """워커 실행"""
         self.is_running = True
+        
+        # 연결 확인만 수행하는 경우
+        if hasattr(self, 'check_connections_only') and self.check_connections_only:
+            self._check_connections()
+            return
         
         # 세션 ID 생성
         session_id = enhanced_logger.generate_session_id()
@@ -372,3 +382,19 @@ class CopyMigrationWorker(QThread):
     def get_stats(self) -> Dict[str, Any]:
         """통계 정보 반환 (MigrationDialog 호환성)"""
         return self.performance_metrics.get_stats()
+    
+    def _check_connections(self):
+        """연결 상태만 확인"""
+        self.connection_checking.emit()
+        
+        # 소스 DB 연결 확인
+        source_connected, source_message = PostgresOptimizer.check_connection_quick(
+            self.profile.source_config
+        )
+        self.source_connection_status.emit(source_connected, source_message)
+        
+        # 대상 DB 연결 확인
+        target_connected, target_message = PostgresOptimizer.check_connection_quick(
+            self.profile.target_config
+        )
+        self.target_connection_status.emit(target_connected, target_message)

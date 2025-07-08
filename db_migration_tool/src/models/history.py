@@ -74,7 +74,8 @@ class HistoryManager:
         self.db = get_db()
         
     def create_history(self, profile_id: int, start_date: str, 
-                      end_date: str) -> MigrationHistoryItem:
+                      end_date: str, source_status: str = None,
+                      target_status: str = None) -> MigrationHistoryItem:
         """새 이력 생성"""
         session = self.db.get_session()
         try:
@@ -83,7 +84,10 @@ class HistoryManager:
                 start_date=start_date,
                 end_date=end_date,
                 started_at=datetime.now(),
-                status="running"
+                status="running",
+                source_connection_status=source_status,
+                target_connection_status=target_status,
+                connection_check_time=datetime.now() if source_status or target_status else None
             )
             
             session.add(db_history)

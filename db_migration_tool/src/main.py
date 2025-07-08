@@ -7,6 +7,11 @@ import sys
 import os
 from pathlib import Path
 
+# UTF-8 locale 설정 (Qt 경고 방지)
+if sys.platform != 'win32':  # Windows가 아닌 경우에만
+    os.environ['LC_ALL'] = 'en_US.UTF-8'
+    os.environ['LANG'] = 'en_US.UTF-8'
+
 from PySide6.QtWidgets import QApplication
 from PySide6.QtCore import Qt, QTranslator, QLocale
 from PySide6.QtGui import QIcon
