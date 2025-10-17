@@ -120,9 +120,10 @@ class TestHistoryManager:
 
     @pytest.fixture
     def history_manager(self, temp_db, monkeypatch):
-        """HistoryManager 픽스처"""
+        """HistoryManager 픽스처 (Repository 패턴 지원)"""
         manager = HistoryManager()
-        monkeypatch.setattr(manager, 'db', temp_db)
+        # HistoryRepository의 db를 temp_db로 패치
+        monkeypatch.setattr(manager.repo, 'db', temp_db)
         return manager
 
     def test_create_history(self, history_manager):
@@ -200,25 +201,21 @@ class TestCheckpointManager:
 
     @pytest.fixture
     def checkpoint_manager(self, temp_db, monkeypatch):
-        """CheckpointManager 픽스처"""
+        """CheckpointManager 픽스처 (Repository 패턴 지원)"""
         manager = CheckpointManager()
-        monkeypatch.setattr(manager, 'db', temp_db)
+        # CheckpointRepository의 db를 temp_db로 패치
+        monkeypatch.setattr(manager.repo, 'db', temp_db)
         return manager
 
     @pytest.fixture
-    def history_id(self, temp_db):
-        """테스트용 히스토리 ID"""
+    def history_id(self, temp_db, monkeypatch):
+        """테스트용 히스토리 ID (Repository 패턴 지원)"""
         history_manager = HistoryManager()
-        # temp_db를 사용하도록 임시 패치
-        import sys
-        original_get_db = sys.modules['src.database.local_db'].get_db
-        sys.modules['src.database.local_db'].get_db = lambda: temp_db
+        # HistoryRepository의 db를 temp_db로 패치
+        monkeypatch.setattr(history_manager.repo, 'db', temp_db)
 
-        try:
-            history = history_manager.create_history(1, '2024-01-01', '2024-01-31')
-            return history.id
-        finally:
-            sys.modules['src.database.local_db'].get_db = original_get_db
+        history = history_manager.create_history(1, '2024-01-01', '2024-01-31')
+        return history.id
 
     def test_create_checkpoint(self, checkpoint_manager, history_id):
         """create_checkpoint가 session_scope를 사용하여 체크포인트를 생성하는지 확인"""

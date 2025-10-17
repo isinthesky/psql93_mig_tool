@@ -8,7 +8,8 @@ from contextlib import contextmanager
 from sqlalchemy import create_engine, Column, Integer, String, DateTime, Text, Boolean, text
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
-from PySide6.QtCore import QStandardPaths
+
+from src.utils.app_paths import AppPaths
 
 Base = declarative_base()
 
@@ -83,16 +84,8 @@ class LocalDatabase:
         self.Session = None
         
     def _get_db_path(self):
-        """데이터베이스 파일 경로 가져오기"""
-        # 애플리케이션 데이터 디렉토리
-        app_data_dir = QStandardPaths.writableLocation(
-            QStandardPaths.AppDataLocation
-        )
-        
-        # 디렉토리가 없으면 생성
-        Path(app_data_dir).mkdir(parents=True, exist_ok=True)
-        
-        return os.path.join(app_data_dir, "db_migration.db")
+        """데이터베이스 파일 경로 가져오기 (AppPaths 활용)"""
+        return str(AppPaths.get_db_path())
         
     def initialize(self):
         """데이터베이스 초기화"""

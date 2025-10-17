@@ -4,7 +4,7 @@
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QFormLayout,
     QLineEdit, QSpinBox, QPushButton, QTabWidget,
-    QWidget, QMessageBox, QCheckBox, QDialogButtonBox
+    QWidget, QMessageBox, QCheckBox, QDialogButtonBox, QLabel
 )
 from PySide6.QtCore import Qt
 import psycopg
@@ -12,6 +12,7 @@ import psycopg
 from src.models.profile import ConnectionProfile
 from src.utils.validators import ConnectionValidator
 from src.utils.logger import logger
+from .connection_mapper import ConnectionMapper
 
 
 class ConnectionDialog(QDialog):
@@ -127,74 +128,52 @@ class ConnectionDialog(QDialog):
         return widget
         
     def load_profile_data(self):
-        """프로필 데이터 로드"""
+        """프로필 데이터 로드 (ConnectionMapper 활용)"""
         if not self.profile:
             return
-            
+
         self.name_edit.setText(self.profile.name)
-        
-        # 소스 설정
-        source = self.profile.source_config
-        self.source_host.setText(source.get('host', 'localhost'))
-        self.source_port.setValue(source.get('port', 5432))
-        self.source_database.setText(source.get('database', ''))
-        self.source_username.setText(source.get('username', ''))
-        self.source_password.setText(source.get('password', ''))
-        self.source_ssl.setChecked(source.get('ssl', False))
-        
-        # 대상 설정
-        target = self.profile.target_config
-        self.target_host.setText(target.get('host', 'localhost'))
-        self.target_port.setValue(target.get('port', 5432))
-        self.target_database.setText(target.get('database', ''))
-        self.target_username.setText(target.get('username', ''))
-        self.target_password.setText(target.get('password', ''))
-        self.target_ssl.setChecked(target.get('ssl', False))
+
+        # 소스 설정 (ConnectionMapper 활용)
+        ConnectionMapper.set_ui_from_config(
+            self.profile.source_config,
+            self.source_host, self.source_port, self.source_database,
+            self.source_username, self.source_password, self.source_ssl
+        )
+
+        # 대상 설정 (ConnectionMapper 활용)
+        ConnectionMapper.set_ui_from_config(
+            self.profile.target_config,
+            self.target_host, self.target_port, self.target_database,
+            self.target_username, self.target_password, self.target_ssl
+        )
         
     def get_profile_data(self):
-        """프로필 데이터 가져오기"""
+        """프로필 데이터 가져오기 (ConnectionMapper 활용)"""
         return {
             'name': self.name_edit.text().strip(),
-            'source_config': {
-                'host': self.source_host.text().strip() or 'localhost',
-                'port': self.source_port.value(),
-                'database': self.source_database.text().strip(),
-                'username': self.source_username.text().strip(),
-                'password': self.source_password.text(),
-                'ssl': self.source_ssl.isChecked()
-            },
-            'target_config': {
-                'host': self.target_host.text().strip() or 'localhost',
-                'port': self.target_port.value(),
-                'database': self.target_database.text().strip(),
-                'username': self.target_username.text().strip(),
-                'password': self.target_password.text(),
-                'ssl': self.target_ssl.isChecked()
-            }
+            'source_config': ConnectionMapper.ui_to_profile_config(
+                self.source_host, self.source_port, self.source_database,
+                self.source_username, self.source_password, self.source_ssl
+            ),
+            'target_config': ConnectionMapper.ui_to_profile_config(
+                self.target_host, self.target_port, self.target_database,
+                self.target_username, self.target_password, self.target_ssl
+            )
         }
         
     def test_connection(self, db_type: str):
-        """연결 테스트"""
+        """연결 테스트 (ConnectionMapper 활용)"""
         if db_type == "source":
-            config = {
-                'host': self.source_host.text().strip() or 'localhost',
-                'port': self.source_port.value(),
-                'dbname': self.source_database.text().strip(),
-                'user': self.source_username.text().strip(),
-                'password': self.source_password.text(),
-            }
-            if self.source_ssl.isChecked():
-                config['sslmode'] = 'require'
+            config = ConnectionMapper.ui_to_psycopg_config(
+                self.source_host, self.source_port, self.source_database,
+                self.source_username, self.source_password, self.source_ssl
+            )
         else:
-            config = {
-                'host': self.target_host.text().strip() or 'localhost',
-                'port': self.target_port.value(),
-                'dbname': self.target_database.text().strip(),
-                'user': self.target_username.text().strip(),
-                'password': self.target_password.text(),
-            }
-            if self.target_ssl.isChecked():
-                config['sslmode'] = 'require'
+            config = ConnectionMapper.ui_to_psycopg_config(
+                self.target_host, self.target_port, self.target_database,
+                self.target_username, self.target_password, self.target_ssl
+            )
                 
         try:
             # 연결 테스트
@@ -230,41 +209,33 @@ class ConnectionDialog(QDialog):
             )
             
     def accept(self):
-        """다이얼로그 확인"""
+        """다이얼로그 확인 (ConnectionMapper 활용)"""
         # 프로필 이름 검증
         name = self.name_edit.text().strip()
         valid, msg = ConnectionValidator.validate_profile_name(name)
         if not valid:
             QMessageBox.warning(self, "입력 오류", msg)
             return
-            
-        # 소스 설정 검증
-        source_config = {
-            'host': self.source_host.text().strip() or 'localhost',
-            'port': self.source_port.value(),
-            'database': self.source_database.text().strip(),
-            'username': self.source_username.text().strip(),
-        }
+
+        # 소스 설정 검증 (ConnectionMapper 활용)
+        source_config = ConnectionMapper.ui_to_validation_config(
+            self.source_host, self.source_port,
+            self.source_database, self.source_username
+        )
         valid, msg = ConnectionValidator.validate_connection_config(source_config)
         if not valid:
             QMessageBox.warning(self, "소스 DB 오류", msg)
             return
-            
-        # 대상 설정 검증
-        target_config = {
-            'host': self.target_host.text().strip() or 'localhost',
-            'port': self.target_port.value(),
-            'database': self.target_database.text().strip(),
-            'username': self.target_username.text().strip(),
-        }
+
+        # 대상 설정 검증 (ConnectionMapper 활용)
+        target_config = ConnectionMapper.ui_to_validation_config(
+            self.target_host, self.target_port,
+            self.target_database, self.target_username
+        )
         valid, msg = ConnectionValidator.validate_connection_config(target_config)
         if not valid:
             QMessageBox.warning(self, "대상 DB 오류", msg)
             return
-            
+
         logger.info(f"연결 프로필 저장: {name}")
         super().accept()
-
-
-# QLabel import 추가
-from PySide6.QtWidgets import QLabel
