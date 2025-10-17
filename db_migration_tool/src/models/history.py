@@ -73,12 +73,11 @@ class HistoryManager:
     def __init__(self):
         self.db = get_db()
         
-    def create_history(self, profile_id: int, start_date: str, 
+    def create_history(self, profile_id: int, start_date: str,
                       end_date: str, source_status: str = None,
                       target_status: str = None) -> MigrationHistoryItem:
         """새 이력 생성"""
-        session = self.db.get_session()
-        try:
+        with self.db.session_scope() as session:
             db_history = MigrationHistory(
                 profile_id=profile_id,
                 start_date=start_date,
@@ -89,82 +88,59 @@ class HistoryManager:
                 target_connection_status=target_status,
                 connection_check_time=datetime.now() if source_status or target_status else None
             )
-            
+
             session.add(db_history)
-            session.commit()
-            
+            session.flush()  # ID 생성을 위해 flush
+
             return MigrationHistoryItem.from_db_model(db_history)
-            
-        except Exception as e:
-            session.rollback()
-            raise e
-        finally:
-            session.close()
             
     def get_history(self, history_id: int) -> Optional[MigrationHistoryItem]:
         """이력 조회"""
-        session = self.db.get_session()
-        try:
+        with self.db.session_scope() as session:
             db_history = session.query(MigrationHistory).filter_by(id=history_id).first()
             if db_history:
                 return MigrationHistoryItem.from_db_model(db_history)
             return None
-        finally:
-            session.close()
             
     def get_all_history(self) -> List[MigrationHistoryItem]:
         """모든 이력 조회"""
-        session = self.db.get_session()
-        try:
+        with self.db.session_scope() as session:
             db_histories = session.query(MigrationHistory)\
                 .order_by(MigrationHistory.started_at.desc()).all()
             return [
-                MigrationHistoryItem.from_db_model(h) 
+                MigrationHistoryItem.from_db_model(h)
                 for h in db_histories
             ]
-        finally:
-            session.close()
             
-    def update_history_status(self, history_id: int, status: str, 
+    def update_history_status(self, history_id: int, status: str,
                             processed_rows: int = None) -> bool:
         """이력 상태 업데이트"""
-        session = self.db.get_session()
-        try:
+        with self.db.session_scope() as session:
             db_history = session.query(MigrationHistory).filter_by(id=history_id).first()
             if not db_history:
                 return False
-                
+
             db_history.status = status
             if processed_rows is not None:
                 db_history.processed_rows = processed_rows
-                
+
             if status in ['completed', 'failed', 'cancelled']:
                 db_history.completed_at = datetime.now()
-                
-            session.commit()
+
             return True
-            
-        except Exception as e:
-            session.rollback()
-            raise e
-        finally:
-            session.close()
             
     def get_incomplete_history(self, profile_id: int) -> Optional[MigrationHistoryItem]:
         """미완료 이력 조회"""
-        session = self.db.get_session()
-        try:
+        with self.db.session_scope() as session:
             db_history = session.query(MigrationHistory)\
                 .filter_by(profile_id=profile_id)\
                 .filter(MigrationHistory.status.in_(['running', 'failed']))\
                 .order_by(MigrationHistory.started_at.desc())\
                 .first()
-                
+
             if db_history:
                 return MigrationHistoryItem.from_db_model(db_history)
             return None
-        finally:
-            session.close()
 
 
 class CheckpointManager:
@@ -175,75 +151,54 @@ class CheckpointManager:
         
     def create_checkpoint(self, history_id: int, partition_name: str) -> CheckpointItem:
         """체크포인트 생성"""
-        session = self.db.get_session()
-        try:
+        with self.db.session_scope() as session:
             db_checkpoint = Checkpoint(
                 history_id=history_id,
                 partition_name=partition_name,
                 status="pending"
             )
-            
+
             session.add(db_checkpoint)
-            session.commit()
-            
+            session.flush()  # ID 생성을 위해 flush
+
             return CheckpointItem.from_db_model(db_checkpoint)
-            
-        except Exception as e:
-            session.rollback()
-            raise e
-        finally:
-            session.close()
             
     def get_checkpoints(self, history_id: int) -> List[CheckpointItem]:
         """이력별 체크포인트 조회"""
-        session = self.db.get_session()
-        try:
+        with self.db.session_scope() as session:
             db_checkpoints = session.query(Checkpoint)\
                 .filter_by(history_id=history_id)\
                 .order_by(Checkpoint.partition_name).all()
             return [
-                CheckpointItem.from_db_model(c) 
+                CheckpointItem.from_db_model(c)
                 for c in db_checkpoints
             ]
-        finally:
-            session.close()
             
     def update_checkpoint_status(self, checkpoint_id: int, status: str,
-                               rows_processed: int = None, 
+                               rows_processed: int = None,
                                error_message: str = None) -> bool:
         """체크포인트 상태 업데이트"""
-        session = self.db.get_session()
-        try:
+        with self.db.session_scope() as session:
             db_checkpoint = session.query(Checkpoint).filter_by(id=checkpoint_id).first()
             if not db_checkpoint:
                 return False
-                
+
             db_checkpoint.status = status
             if rows_processed is not None:
                 db_checkpoint.rows_processed = rows_processed
             if error_message is not None:
                 db_checkpoint.error_message = error_message
-                
-            session.commit()
+
             return True
-            
-        except Exception as e:
-            session.rollback()
-            raise e
-        finally:
-            session.close()
             
     def get_pending_checkpoints(self, history_id: int) -> List[CheckpointItem]:
         """미완료 체크포인트 조회"""
-        session = self.db.get_session()
-        try:
+        with self.db.session_scope() as session:
             db_checkpoints = session.query(Checkpoint)\
                 .filter_by(history_id=history_id)\
                 .filter(Checkpoint.status != 'completed')\
                 .order_by(Checkpoint.partition_name).all()
             return [
-                CheckpointItem.from_db_model(c) 
+                CheckpointItem.from_db_model(c)
                 for c in db_checkpoints
             ]
-        finally:
-            session.close()

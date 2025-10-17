@@ -5,107 +5,89 @@ import time
 import psycopg2
 from psycopg2 import sql
 from io import StringIO
-from typing import Dict, Any, Optional, Tuple
-from PySide6.QtCore import QThread, Signal
-from datetime import datetime
+from typing import Dict, Any, Optional
+from PySide6.QtCore import Signal
 
+from src.core.base_migration_worker import BaseMigrationWorker
 from src.models.profile import ConnectionProfile
-from src.models.history import HistoryManager, CheckpointManager
 from src.core.table_creator import TableCreator
 from src.database.postgres_utils import PostgresOptimizer
 from src.core.performance_metrics import PerformanceMetrics
-from src.utils.enhanced_logger import enhanced_logger, log_emitter
+from src.utils.enhanced_logger import log_emitter
 
 
-class CopyMigrationWorker(QThread):
-    """COPY 명령을 사용한 고성능 마이그레이션 워커"""
-    
-    # 시그널 정의
-    progress = Signal(dict)  # 진행 상황
-    log = Signal(str, str)   # 메시지, 레벨
-    error = Signal(str)      # 오류 메시지
-    finished = Signal()      # 완료
+class CopyMigrationWorker(BaseMigrationWorker):
+    """COPY 명령 기반 고성능 마이그레이션 워커"""
+
+    # CopyMigrationWorker 전용 시그널
     performance = Signal(dict)  # 성능 지표
-    
-    # 연결 상태 시그널
     connection_checking = Signal()  # 연결 확인 시작
     source_connection_status = Signal(bool, str)  # 연결 성공 여부, 메시지
     target_connection_status = Signal(bool, str)  # 연결 성공 여부, 메시지
-    
+
     def __init__(self, profile: ConnectionProfile, partitions: list[str],
                  history_id: int, resume: bool = False):
-        super().__init__()
-        self.profile = profile
-        self.partitions = partitions
-        self.history_id = history_id
-        self.resume = resume
-        
-        self.history_manager = HistoryManager()
-        self.checkpoint_manager = CheckpointManager()
+        super().__init__(profile, partitions, history_id, resume)
+
+        # COPY 워커 전용 필드
         self.performance_metrics = PerformanceMetrics()
-        
-        self.is_running = False
-        self.is_paused = False
-        self.current_partition_index = 0
-        
+
         # psycopg2 연결 (COPY 명령용)
         self.source_conn = None
         self.target_conn = None
-        
+
         # 성능 지표 업데이트 타이머
         self.last_metric_update = 0
         self.metric_update_interval = 1.0  # 1초마다 업데이트
         
-    def run(self):
-        """워커 실행"""
-        self.is_running = True
-        
+    def _execute_migration(self):
+        """COPY 기반 마이그레이션 실행"""
         # 연결 확인만 수행하는 경우
         if hasattr(self, 'check_connections_only') and self.check_connections_only:
             self._check_connections()
             return
-        
-        # 세션 ID 생성
-        session_id = enhanced_logger.generate_session_id()
-        log_emitter.logger.set_session_id(session_id)
-        
+
         try:
             # psycopg2 연결 생성 (COPY 명령용)
             self.log.emit("PostgreSQL 연결 생성 중...", "INFO")
             log_emitter.emit_log("INFO", "COPY 기반 마이그레이션 시작")
-            
+
             self.source_conn = self._create_psycopg2_connection(self.profile.source_config)
             self.target_conn = self._create_psycopg2_connection(self.profile.target_config)
-            
+
             # COPY 권한 확인
             self._check_copy_permissions()
-            
+
             # 성능 지표 초기화
             self.performance_metrics.total_partitions = len(self.partitions)
-            
+
+            # 체크포인트를 딕셔너리로 캐싱 (성능 개선)
+            checkpoints_list = self.checkpoint_manager.get_checkpoints(self.history_id)
+            checkpoints_dict = {cp.partition_name: cp for cp in checkpoints_list}
+
             # 각 파티션 처리
             for i, partition in enumerate(self.partitions):
                 if not self.is_running:
                     break
-                    
+
                 self.current_partition_index = i
-                
-                # 체크포인트 확인
-                checkpoint = self._get_checkpoint(partition)
-                
+
+                # O(1) 체크포인트 조회
+                checkpoint = checkpoints_dict.get(partition)
+
                 if checkpoint and checkpoint.status == 'completed':
                     self.log.emit(f"{partition} - 이미 완료됨, 건너뛰기", "INFO")
                     log_emitter.emit_log("INFO", f"{partition} - 이미 완료됨, 건너뛰기")
                     self.performance_metrics.completed_partitions += 1
                     continue
-                    
+
                 # 파티션 마이그레이션
                 self._migrate_partition_with_copy(partition, checkpoint)
-                
+
             # 연결 종료
             self.source_conn.close()
             self.target_conn.close()
-            
+
             if self.is_running:  # 정상 완료
                 final_stats = self.performance_metrics.get_stats()
                 self.log.emit(
@@ -114,12 +96,11 @@ class CopyMigrationWorker(QThread):
                     "SUCCESS"
                 )
                 log_emitter.emit_log("SUCCESS", "COPY 기반 마이그레이션이 정상적으로 완료되었습니다")
-                self.finished.emit()
-                
+
         except Exception as e:
             self.log.emit(f"마이그레이션 오류: {str(e)}", "ERROR")
             log_emitter.emit_log("ERROR", f"마이그레이션 오류: {str(e)}")
-            self.error.emit(str(e))
+            raise
             
     def _create_psycopg2_connection(self, config: Dict[str, Any]) -> psycopg2.extensions.connection:
         """psycopg2 연결 생성 (COPY 명령용)"""
@@ -148,11 +129,6 @@ class CopyMigrationWorker(QThread):
             raise PermissionError(f"대상 데이터베이스 COPY FROM 권한 없음:\n{error_msg}")
             
         self.log.emit("COPY 권한 확인 완료", "INFO")
-        
-    def _get_checkpoint(self, partition_name: str) -> Optional[Any]:
-        """체크포인트 가져오기"""
-        checkpoints = self.checkpoint_manager.get_checkpoints(self.history_id)
-        return next((cp for cp in checkpoints if cp.partition_name == partition_name), None)
         
     def _migrate_partition_with_copy(self, partition_name: str, checkpoint: Any):
         """COPY 명령을 사용한 파티션 마이그레이션"""
@@ -360,27 +336,12 @@ class CopyMigrationWorker(QThread):
                 'current_rows': stats['current_partition_rows'],
                 'speed': stats['instant_rows_per_sec']
             })
-            
+
+
             self.last_metric_update = current_time
-            
-    def pause(self):
-        """일시정지"""
-        self.is_paused = True
-        self.log.emit("마이그레이션 일시정지", "INFO")
-        
-    def resume(self):
-        """재개"""
-        self.is_paused = False
-        self.log.emit("마이그레이션 재개", "INFO")
-        
-    def stop(self):
-        """중지"""
-        self.is_running = False
-        self.is_paused = False
-        self.log.emit("마이그레이션 중지 요청", "WARNING")
-        
+
     def get_stats(self) -> Dict[str, Any]:
-        """통계 정보 반환 (MigrationDialog 호환성)"""
+        """통계 정보 반환 (오버라이드 - 성능 지표 사용)"""
         return self.performance_metrics.get_stats()
     
     def _check_connections(self):

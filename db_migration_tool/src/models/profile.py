@@ -77,85 +77,56 @@ class ProfileManager:
         
     def create_profile(self, profile_data: Dict[str, Any]) -> ConnectionProfile:
         """새 프로필 생성"""
-        session = self.db.get_session()
-        try:
+        with self.db.session_scope() as session:
             # DB 모델 생성
             db_profile = Profile(
                 name=profile_data['name'],
                 source_config=self._encrypt_config(profile_data['source_config']),
                 target_config=self._encrypt_config(profile_data['target_config'])
             )
-            
+
             session.add(db_profile)
-            session.commit()
-            
+            session.flush()  # ID 생성을 위해 flush
+
             # 생성된 프로필 반환
             return ConnectionProfile.from_db_model(db_profile, self._cipher_suite)
             
-        except Exception as e:
-            session.rollback()
-            raise e
-        finally:
-            session.close()
-            
     def get_profile(self, profile_id: int) -> Optional[ConnectionProfile]:
         """프로필 조회"""
-        session = self.db.get_session()
-        try:
+        with self.db.session_scope() as session:
             db_profile = session.query(Profile).filter_by(id=profile_id).first()
             if db_profile:
                 return ConnectionProfile.from_db_model(db_profile, self._cipher_suite)
             return None
-        finally:
-            session.close()
             
     def get_all_profiles(self) -> List[ConnectionProfile]:
         """모든 프로필 조회"""
-        session = self.db.get_session()
-        try:
+        with self.db.session_scope() as session:
             db_profiles = session.query(Profile).order_by(Profile.name).all()
             return [
-                ConnectionProfile.from_db_model(p, self._cipher_suite) 
+                ConnectionProfile.from_db_model(p, self._cipher_suite)
                 for p in db_profiles
             ]
-        finally:
-            session.close()
             
     def update_profile(self, profile_id: int, profile_data: Dict[str, Any]) -> ConnectionProfile:
         """프로필 수정"""
-        session = self.db.get_session()
-        try:
+        with self.db.session_scope() as session:
             db_profile = session.query(Profile).filter_by(id=profile_id).first()
             if not db_profile:
                 raise ValueError(f"프로필을 찾을 수 없습니다: {profile_id}")
-                
+
             # 업데이트
             db_profile.name = profile_data['name']
             db_profile.source_config = self._encrypt_config(profile_data['source_config'])
             db_profile.target_config = self._encrypt_config(profile_data['target_config'])
-            
-            session.commit()
-            
+
             return ConnectionProfile.from_db_model(db_profile, self._cipher_suite)
-            
-        except Exception as e:
-            session.rollback()
-            raise e
-        finally:
-            session.close()
             
     def delete_profile(self, profile_id: int) -> bool:
         """프로필 삭제"""
-        session = self.db.get_session()
-        try:
+        with self.db.session_scope() as session:
             db_profile = session.query(Profile).filter_by(id=profile_id).first()
             if db_profile:
                 session.delete(db_profile)
-                session.commit()
                 return True
             return False
-        except Exception as e:
-            session.rollback()
-            raise e
-        finally:
-            session.close()

@@ -4,97 +4,78 @@
 import time
 from datetime import datetime
 from typing import List, Dict, Any
-from PySide6.QtCore import QThread, Signal
+from PySide6.QtCore import Signal
 import psycopg
 from psycopg import sql
 
+from src.core.base_migration_worker import BaseMigrationWorker
 from src.models.profile import ConnectionProfile
-from src.models.history import HistoryManager, CheckpointManager
 from src.core.table_creator import TableCreator
-from src.utils.enhanced_logger import enhanced_logger, log_emitter
+from src.utils.enhanced_logger import log_emitter
 
 
-class MigrationWorker(QThread):
-    """마이그레이션 작업을 수행하는 워커 스레드
-    
+class MigrationWorker(BaseMigrationWorker):
+    """INSERT 기반 마이그레이션 워커
+
     Note: 이 클래스는 레거시 INSERT 기반 마이그레이션을 위해 유지됩니다.
     고성능 마이그레이션을 위해서는 CopyMigrationWorker를 사용하세요.
     """
-    
-    # 시그널 정의
-    progress = Signal(dict)  # 진행 상황
-    log = Signal(str, str)   # 메시지, 레벨
-    error = Signal(str)      # 오류 메시지
-    finished = Signal()      # 완료
+
+    # MigrationWorker 전용 시그널
     truncate_requested = Signal(str, int)  # 테이블명, 행 수
-    
+
     def __init__(self, profile: ConnectionProfile, partitions: List[str],
                  history_id: int, resume: bool = False):
-        super().__init__()
-        self.profile = profile
-        self.partitions = partitions
-        self.history_id = history_id
-        self.resume = resume
-        
-        self.history_manager = HistoryManager()
-        self.checkpoint_manager = CheckpointManager()
-        
-        self.is_running = False
-        self.is_paused = False
+        super().__init__(profile, partitions, history_id, resume)
+
+        # INSERT 워커 전용 필드
         self.is_interrupted = False
-        self.current_partition_index = 0
-        self.total_rows_processed = 0
-        self.start_time = None
         self.truncate_permission = None  # None, True, False
-        
+
         # 배치 크기 설정
         self.batch_size = 100000  # 초기 배치 크기
         self.min_batch_size = 1000
         self.max_batch_size = 500000
         
-    def run(self):
-        """워커 실행"""
-        self.is_running = True
-        self.start_time = time.time()
-        
-        # 세션 ID 생성
-        session_id = enhanced_logger.generate_session_id()
-        
+    def _execute_migration(self):
+        """INSERT 기반 마이그레이션 실행"""
         try:
             # 소스 및 대상 연결 생성
             self.source_conn = self._create_connection(self.profile.source_config)
             target_conn = self._create_connection(self.profile.target_config)
-            
+
+            # 체크포인트를 딕셔너리로 캐싱 (성능 개선)
+            checkpoints_list = self.checkpoint_manager.get_checkpoints(self.history_id)
+            checkpoints_dict = {cp.partition_name: cp for cp in checkpoints_list}
+
             # 각 파티션 처리
             for i, partition in enumerate(self.partitions):
                 if not self.is_running:
                     break
-                    
+
                 self.current_partition_index = i
-                
-                # 체크포인트 확인
-                checkpoints = self.checkpoint_manager.get_checkpoints(self.history_id)
-                checkpoint = next((cp for cp in checkpoints if cp.partition_name == partition), None)
-                
+
+                # O(1) 체크포인트 조회
+                checkpoint = checkpoints_dict.get(partition)
+
                 if checkpoint and checkpoint.status == 'completed':
                     self.log.emit(f"{partition} - 이미 완료됨, 건너뛰기", "INFO")
                     log_emitter.emit_log("INFO", f"{partition} - 이미 완료됨, 건너뛰기")
                     continue
-                    
+
                 # 파티션 마이그레이션
                 self._migrate_partition(self.source_conn, target_conn, partition, checkpoint)
-                
+
             # 연결 종료
             self.source_conn.close()
             target_conn.close()
-            
+
             if self.is_running:  # 정상 완료
                 log_emitter.emit_log("SUCCESS", "마이그레이션이 정상적으로 완료되었습니다")
-                self.finished.emit()
-            
+
         except Exception as e:
             log_emitter.emit_log("ERROR", f"마이그레이션 오류: {str(e)}")
-            self.error.emit(str(e))
+            raise
             
     def _create_connection(self, config: Dict[str, Any]) -> psycopg.Connection:
         """데이터베이스 연결 생성"""
@@ -150,8 +131,7 @@ class MigrationWorker(QThread):
                     break
                     
                 # 일시정지 확인
-                while self.is_paused and self.is_running:
-                    time.sleep(0.1)
+                self._check_pause()
                     
                 try:
                     # 데이터 복사
@@ -333,48 +313,8 @@ class MigrationWorker(QThread):
             raise
             
         return rows_copied
-                
-    def _calculate_speed(self) -> int:
-        """처리 속도 계산 (rows/sec)"""
-        if not self.start_time or self.total_rows_processed == 0:
-            return 0
-            
-        elapsed = time.time() - self.start_time
-        if elapsed > 0:
-            return int(self.total_rows_processed / elapsed)
-        return 0
-        
-    def get_stats(self) -> Dict[str, Any]:
-        """통계 정보 반환"""
-        elapsed = time.time() - self.start_time if self.start_time else 0
-        speed = self._calculate_speed()
-        
-        # 남은 행 수 추정
-        remaining_partitions = len(self.partitions) - self.current_partition_index - 1
-        estimated_remaining_rows = remaining_partitions * 4000000  # 하루 400만 rows
-        
-        # 예상 완료 시간
-        eta_seconds = 0
-        if speed > 0:
-            eta_seconds = estimated_remaining_rows / speed
-            
-        return {
-            'elapsed_seconds': elapsed,
-            'total_rows_processed': self.total_rows_processed,
-            'speed': speed,
-            'eta_seconds': eta_seconds
-        }
-        
-    def pause(self):
-        """일시정지"""
-        self.is_paused = True
-        
-    def resume(self):
-        """재개"""
-        self.is_paused = False
-        
+
     def stop(self):
-        """중지"""
-        self.is_running = False
-        self.is_paused = False
+        """중지 (오버라이드)"""
+        super().stop()
         self.is_interrupted = True

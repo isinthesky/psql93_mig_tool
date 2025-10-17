@@ -4,6 +4,7 @@
 import os
 from pathlib import Path
 from datetime import datetime
+from contextlib import contextmanager
 from sqlalchemy import create_engine, Column, Integer, String, DateTime, Text, Boolean, text
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
@@ -115,7 +116,29 @@ class LocalDatabase:
         if not self.Session:
             raise RuntimeError("데이터베이스가 초기화되지 않았습니다.")
         return self.Session()
-        
+
+    @contextmanager
+    def session_scope(self):
+        """트랜잭션 컨텍스트 매니저
+
+        자동으로 commit/rollback/close를 처리합니다.
+
+        Usage:
+            with self.db.session_scope() as session:
+                session.add(obj)
+                # 정상 종료 시 자동 commit
+                # 예외 발생 시 자동 rollback
+        """
+        session = self.get_session()
+        try:
+            yield session
+            session.commit()
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            session.close()
+
     def close(self):
         """데이터베이스 연결 종료"""
         if self.engine:
