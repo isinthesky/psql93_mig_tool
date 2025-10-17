@@ -280,34 +280,20 @@ class CopyMigrationWorker(BaseMigrationWorker):
             
     def _prepare_target_table(self, partition_name: str):
         """대상 테이블 준비"""
-        with self.target_conn.cursor() as cursor:
-            # 테이블 존재 확인
-            cursor.execute("""
-                SELECT EXISTS (
-                    SELECT 1 FROM information_schema.tables 
-                    WHERE table_schema = 'public' 
-                    AND table_name = %s
-                )
-            """, (partition_name,))
-            
-            table_exists = cursor.fetchone()[0]
-            
-            if not table_exists:
-                # 테이블 생성
-                self.log.emit(f"{partition_name} 테이블 생성 중...", "INFO")
-                creator = TableCreator(self.source_conn, self.target_conn)
-                creator.create_partition_table(partition_name)
-                self.log.emit(f"{partition_name} 테이블 생성 완료", "SUCCESS")
-                log_emitter.emit_log("SUCCESS", f"{partition_name} 테이블 생성 완료")
-            else:
-                # 기존 데이터 삭제 (TRUNCATE)
-                self.log.emit(f"{partition_name} 기존 데이터 삭제 중...", "INFO")
-                cursor.execute(
-                    sql.SQL("TRUNCATE TABLE {} RESTART IDENTITY").format(
-                        sql.Identifier(partition_name)
-                    )
-                )
-                self.target_conn.commit()
+        # TableCreator를 사용하여 테이블 준비 (자동 TRUNCATE 모드)
+        creator = TableCreator(self.source_conn, self.target_conn)
+        created, row_count = creator.ensure_partition_ready(
+            partition_name,
+            truncate_mode='auto'
+        )
+
+        # 결과에 따른 로그 출력
+        if created:
+            self.log.emit(f"{partition_name} 테이블 생성 완료", "SUCCESS")
+            log_emitter.emit_log("SUCCESS", f"{partition_name} 테이블 생성 완료")
+        elif row_count > 0:
+            self.log.emit(f"{partition_name} 기존 데이터 삭제 완료", "INFO")
+            log_emitter.emit_log("INFO", f"{partition_name} 기존 데이터 삭제 완료")
                 
     def _update_checkpoint_completed(self, checkpoint: Any, rows: int):
         """체크포인트 완료 업데이트"""

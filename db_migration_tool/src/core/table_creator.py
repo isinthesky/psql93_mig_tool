@@ -3,7 +3,6 @@
 """
 from typing import Dict, Any
 import psycopg
-from psycopg import sql
 from datetime import datetime
 
 
@@ -267,5 +266,65 @@ class TableCreator:
                     datetime.now(),
                     True
                 ))
-                
+
             self.target_conn.commit()
+
+    def ensure_partition_ready(self, partition_name: str,
+                              truncate_mode: str = 'auto',
+                              confirm_callback=None) -> tuple[bool, int]:
+        """파티션 테이블 준비 (생성 또는 TRUNCATE)
+
+        Args:
+            partition_name: 파티션 테이블 이름
+            truncate_mode: 'auto' (자동 TRUNCATE), 'ask' (사용자 확인)
+            confirm_callback: 사용자 확인 콜백 함수 (truncate_mode='ask'일 때)
+                             함수 시그니처: callback(partition_name: str, row_count: int) -> bool
+
+        Returns:
+            (table_created, existing_row_count)
+            - table_created: 테이블이 새로 생성되었는지 여부
+            - existing_row_count: 테이블이 이미 존재했을 때의 기존 행 수
+
+        Raises:
+            ValueError: truncate_mode가 잘못되었거나 'ask' 모드에서 callback이 없을 때
+            Exception: 사용자가 TRUNCATE를 거부했을 때
+        """
+        with self.target_conn.cursor() as cursor:
+            # 테이블 존재 확인
+            cursor.execute("""
+                SELECT EXISTS (
+                    SELECT 1 FROM information_schema.tables
+                    WHERE table_schema = 'public'
+                    AND table_name = %s
+                )
+            """, (partition_name,))
+
+            table_exists = cursor.fetchone()[0]
+
+            if not table_exists:
+                # 테이블 생성
+                self.create_partition_table(partition_name)
+                return (True, 0)
+
+            # 기존 데이터 확인
+            cursor.execute(f"SELECT COUNT(*) FROM {partition_name}")
+            row_count = cursor.fetchone()[0]
+
+            if row_count > 0:
+                # TRUNCATE 모드에 따라 처리
+                if truncate_mode == 'auto':
+                    should_truncate = True
+                elif truncate_mode == 'ask':
+                    if confirm_callback is None:
+                        raise ValueError("confirm_callback required for 'ask' mode")
+                    should_truncate = confirm_callback(partition_name, row_count)
+                else:
+                    raise ValueError(f"Invalid truncate_mode: {truncate_mode}")
+
+                if should_truncate:
+                    cursor.execute(f"TRUNCATE TABLE {partition_name} RESTART IDENTITY")
+                    self.target_conn.commit()
+                else:
+                    raise Exception(f"기존 데이터 처리가 취소되었습니다: {partition_name}")
+
+            return (False, row_count)

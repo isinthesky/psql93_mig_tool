@@ -204,65 +204,48 @@ class MigrationWorker(BaseMigrationWorker):
             
     def _prepare_target_table(self, conn: psycopg.Connection, partition_name: str):
         """대상 테이블 준비"""
-        with conn.cursor() as cur:
-            # 테이블 존재 확인
-            cur.execute("""
-                SELECT EXISTS (
-                    SELECT 1 FROM information_schema.tables 
-                    WHERE table_schema = 'public' 
-                    AND table_name = %s
-                )
-            """, (partition_name,))
-            
-            table_exists = cur.fetchone()[0]
-            
-            if not table_exists:
-                # 테이블이 없으면 생성
-                self.log.emit(f"{partition_name} 테이블이 대상에 없어 생성합니다", "INFO")
-                log_emitter.emit_log("INFO", f"{partition_name} 테이블이 대상에 없어 생성합니다")
-                
-                # 테이블 생성기 사용
-                creator = TableCreator(self.source_conn, conn)
-                creator.create_partition_table(partition_name)
-                
+
+        def confirm_truncate(partition_name: str, row_count: int) -> bool:
+            """사용자에게 TRUNCATE 확인 요청"""
+            self.log.emit(
+                f"{partition_name} 테이블에 {row_count:,}개의 기존 데이터가 있습니다",
+                "WARNING"
+            )
+            log_emitter.emit_log(
+                "WARNING",
+                f"{partition_name} 테이블에 {row_count:,}개의 기존 데이터가 있습니다"
+            )
+            self.truncate_requested.emit(partition_name, row_count)
+
+            # 사용자 응답 대기
+            self.truncate_permission = None
+            while self.truncate_permission is None:
+                if self.is_interrupted:
+                    return False
+                time.sleep(0.1)
+
+            return self.truncate_permission
+
+        # TableCreator를 사용하여 테이블 준비
+        creator = TableCreator(self.source_conn, conn)
+        try:
+            created, row_count = creator.ensure_partition_ready(
+                partition_name,
+                truncate_mode='ask',
+                confirm_callback=confirm_truncate
+            )
+
+            # 결과에 따른 로그 출력
+            if created:
                 self.log.emit(f"{partition_name} 테이블 생성 완료", "SUCCESS")
                 log_emitter.emit_log("SUCCESS", f"{partition_name} 테이블 생성 완료")
-            else:
-                # 기존 데이터가 있는지 확인
-                cur.execute(
-                    sql.SQL("SELECT COUNT(*) FROM {}").format(
-                        sql.Identifier(partition_name)
-                    )
-                )
-                row_count = cur.fetchone()[0]
-                
-                if row_count > 0:
-                    self.log.emit(f"{partition_name} 테이블에 {row_count:,}개의 기존 데이터가 있습니다", "WARNING")
-                    log_emitter.emit_log("WARNING", f"{partition_name} 테이블에 {row_count:,}개의 기존 데이터가 있습니다")
-                    self.truncate_requested.emit(partition_name, row_count)
-                    
-                    # 사용자 응답 대기
-                    while self.truncate_permission is None:
-                        if self.is_interrupted:
-                            raise Exception("사용자가 작업을 취소했습니다")
-                        time.sleep(0.1)
-                    
-                    if self.truncate_permission:
-                        self.log.emit(f"{partition_name} 테이블 데이터 삭제 중...", "INFO")
-                        log_emitter.emit_log("INFO", f"{partition_name} 테이블 데이터 삭제 중...")
-                        cur.execute(
-                            sql.SQL("TRUNCATE TABLE {} RESTART IDENTITY").format(
-                                sql.Identifier(partition_name)
-                            )
-                        )
-                        conn.commit()
-                        self.log.emit(f"{partition_name} 테이블 데이터 삭제 완료", "SUCCESS")
-                        log_emitter.emit_log("SUCCESS", f"{partition_name} 테이블 데이터 삭제 완료")
-                    else:
-                        raise Exception(f"{partition_name} 테이블의 기존 데이터 처리가 취소되었습니다")
-                    
-                    # 권한 초기화
-                    self.truncate_permission = None
+            elif row_count > 0:
+                self.log.emit(f"{partition_name} 테이블 데이터 삭제 완료", "SUCCESS")
+                log_emitter.emit_log("SUCCESS", f"{partition_name} 테이블 데이터 삭제 완료")
+
+        finally:
+            # 권한 초기화
+            self.truncate_permission = None
             
     def _copy_batch(self, source_conn: psycopg.Connection,
                    target_conn: psycopg.Connection,
