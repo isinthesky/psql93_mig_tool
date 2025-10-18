@@ -462,6 +462,12 @@ class MigrationDialog(QDialog):
         self.add_log(f"마이그레이션 시작 - {len(partitions)}개 파티션", "INFO")
         self.add_log(f"날짜 범위: {start_date} ~ {end_date}", "INFO")
 
+        # 트레이 아이콘 알림: 마이그레이션 시작 및 실행 중 아이콘 변경
+        main_window = self.parent()
+        if main_window and hasattr(main_window, "tray_icon") and main_window.tray_icon:
+            main_window.tray_icon.set_migration_running(True)
+            main_window.tray_icon.notify_migration_started(self.profile.name)
+
     def pause_migration(self):
         """마이그레이션 일시정지"""
         if self.worker and self.is_running:
@@ -495,6 +501,11 @@ class MigrationDialog(QDialog):
                 if self.worker:
                     self.worker.stop()
                 self.add_log("사용자가 마이그레이션을 취소했습니다", "WARNING")
+
+                # 트레이 아이콘 기본 아이콘 복원
+                main_window = self.parent()
+                if main_window and hasattr(main_window, "tray_icon") and main_window.tray_icon:
+                    main_window.tray_icon.set_migration_running(False)
         else:
             self.close()
 
@@ -563,6 +574,15 @@ class MigrationDialog(QDialog):
 
         self.add_log("마이그레이션이 완료되었습니다", "SUCCESS")
 
+        # 트레이 아이콘 알림: 마이그레이션 완료 및 기본 아이콘 복원
+        main_window = self.parent()
+        if main_window and hasattr(main_window, "tray_icon") and main_window.tray_icon:
+            # 처리된 총 행 수 계산
+            history = self.history_manager.get_history(self.history_id)
+            rows_processed = history.processed_rows if history else 0
+            main_window.tray_icon.set_migration_running(False)
+            main_window.tray_icon.notify_migration_completed(self.profile.name, rows_processed)
+
         QMessageBox.information(
             self,
             "완료",
@@ -590,6 +610,12 @@ class MigrationDialog(QDialog):
             self.history_manager.update_history_status(self.history_id, "failed")
 
         self.add_log(f"오류 발생: {error_msg}", "ERROR")
+
+        # 트레이 아이콘 알림: 마이그레이션 오류 및 기본 아이콘 복원
+        main_window = self.parent()
+        if main_window and hasattr(main_window, "tray_icon") and main_window.tray_icon:
+            main_window.tray_icon.set_migration_running(False)
+            main_window.tray_icon.notify_migration_error(error_msg)
 
         QMessageBox.critical(
             self,
