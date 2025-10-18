@@ -2,8 +2,10 @@
 
 ConnectionDialog에서 UI 위젯과 Dict 간 변환 로직을 중앙집중화합니다.
 """
-from typing import Dict, Any, Tuple
-from PySide6.QtWidgets import QLineEdit, QSpinBox, QCheckBox
+
+from typing import Any
+
+from PySide6.QtWidgets import QCheckBox, QLineEdit, QSpinBox
 
 
 class ConnectionMapper:
@@ -26,8 +28,8 @@ class ConnectionMapper:
         database: QLineEdit,
         username: QLineEdit,
         password: QLineEdit,
-        ssl: QCheckBox
-    ) -> Dict[str, Any]:
+        ssl: QCheckBox,
+    ) -> dict[str, Any]:
         """UI 위젯 → 프로필 저장용 Dict
 
         Args:
@@ -48,12 +50,12 @@ class ConnectionMapper:
             >>> print(config['host'])  # 'localhost'
         """
         return {
-            'host': host.text().strip() or 'localhost',
-            'port': port.value(),
-            'database': database.text().strip(),
-            'username': username.text().strip(),
-            'password': password.text(),
-            'ssl': ssl.isChecked()
+            "host": host.text().strip() or "localhost",
+            "port": port.value(),
+            "database": database.text().strip(),
+            "username": username.text().strip(),
+            "password": password.text(),
+            "ssl": ssl.isChecked(),
         }
 
     @staticmethod
@@ -63,8 +65,8 @@ class ConnectionMapper:
         database: QLineEdit,
         username: QLineEdit,
         password: QLineEdit,
-        ssl: QCheckBox
-    ) -> Dict[str, Any]:
+        ssl: QCheckBox,
+    ) -> dict[str, Any]:
         """UI 위젯 → psycopg 연결용 Dict
 
         Args:
@@ -85,25 +87,22 @@ class ConnectionMapper:
             >>> conn = psycopg.connect(**config)
         """
         config = {
-            'host': host.text().strip() or 'localhost',
-            'port': port.value(),
-            'dbname': database.text().strip(),  # psycopg는 'dbname' 사용
-            'user': username.text().strip(),    # psycopg는 'user' 사용
-            'password': password.text(),
+            "host": host.text().strip() or "localhost",
+            "port": port.value(),
+            "dbname": database.text().strip(),  # psycopg는 'dbname' 사용
+            "user": username.text().strip(),  # psycopg는 'user' 사용
+            "password": password.text(),
         }
 
         if ssl.isChecked():
-            config['sslmode'] = 'require'
+            config["sslmode"] = "require"
 
         return config
 
     @staticmethod
     def ui_to_validation_config(
-        host: QLineEdit,
-        port: QSpinBox,
-        database: QLineEdit,
-        username: QLineEdit
-    ) -> Dict[str, Any]:
+        host: QLineEdit, port: QSpinBox, database: QLineEdit, username: QLineEdit
+    ) -> dict[str, Any]:
         """UI 위젯 → 검증용 Dict
 
         Args:
@@ -122,16 +121,14 @@ class ConnectionMapper:
             >>> valid, msg = ConnectionValidator.validate_connection_config(config)
         """
         return {
-            'host': host.text().strip() or 'localhost',
-            'port': port.value(),
-            'database': database.text().strip(),
-            'username': username.text().strip(),
+            "host": host.text().strip() or "localhost",
+            "port": port.value(),
+            "database": database.text().strip(),
+            "username": username.text().strip(),
         }
 
     @staticmethod
-    def profile_config_to_ui(
-        config: Dict[str, Any]
-    ) -> Tuple[str, int, str, str, str, bool]:
+    def profile_config_to_ui(config: dict[str, Any]) -> tuple[str, int, str, str, str, bool]:
         """프로필 Dict → UI 값 튜플
 
         Args:
@@ -145,23 +142,23 @@ class ConnectionMapper:
             >>> host, port, db, user, pwd, ssl = ConnectionMapper.profile_config_to_ui(config)
         """
         return (
-            config.get('host', 'localhost'),
-            config.get('port', 5432),
-            config.get('database', ''),
-            config.get('username', ''),
-            config.get('password', ''),
-            config.get('ssl', False)
+            config.get("host", "localhost"),
+            config.get("port", 5432),
+            config.get("database", ""),
+            config.get("username", ""),
+            config.get("password", ""),
+            config.get("ssl", False),
         )
 
     @staticmethod
     def set_ui_from_config(
-        config: Dict[str, Any],
+        config: dict[str, Any],
         host: QLineEdit,
         port: QSpinBox,
         database: QLineEdit,
         username: QLineEdit,
         password: QLineEdit,
-        ssl: QCheckBox
+        ssl: QCheckBox,
     ):
         """프로필 Dict → UI 위젯 설정
 
@@ -180,12 +177,12 @@ class ConnectionMapper:
             ...     host_edit, port_spin, db_edit, user_edit, pwd_edit, ssl_check
             ... )
         """
-        host.setText(config.get('host', 'localhost'))
-        port.setValue(config.get('port', 5432))
-        database.setText(config.get('database', ''))
-        username.setText(config.get('username', ''))
-        password.setText(config.get('password', ''))
-        ssl.setChecked(config.get('ssl', False))
+        host.setText(config.get("host", "localhost"))
+        port.setValue(config.get("port", 5432))
+        database.setText(config.get("database", ""))
+        username.setText(config.get("username", ""))
+        password.setText(config.get("password", ""))
+        ssl.setChecked(config.get("ssl", False))
 
 
 class ConnectionWidgetSet:
@@ -214,7 +211,7 @@ class ConnectionWidgetSet:
         database: QLineEdit,
         username: QLineEdit,
         password: QLineEdit,
-        ssl: QCheckBox
+        ssl: QCheckBox,
     ):
         """ConnectionWidgetSet 초기화
 
@@ -233,29 +230,27 @@ class ConnectionWidgetSet:
         self.password = password
         self.ssl = ssl
 
-    def to_profile_config(self) -> Dict[str, Any]:
+    def to_profile_config(self) -> dict[str, Any]:
         """프로필 저장용 Dict 반환
 
         Returns:
             프로필 저장용 딕셔너리
         """
         return ConnectionMapper.ui_to_profile_config(
-            self.host, self.port, self.database,
-            self.username, self.password, self.ssl
+            self.host, self.port, self.database, self.username, self.password, self.ssl
         )
 
-    def to_psycopg_config(self) -> Dict[str, Any]:
+    def to_psycopg_config(self) -> dict[str, Any]:
         """psycopg 연결용 Dict 반환
 
         Returns:
             psycopg 연결용 딕셔너리
         """
         return ConnectionMapper.ui_to_psycopg_config(
-            self.host, self.port, self.database,
-            self.username, self.password, self.ssl
+            self.host, self.port, self.database, self.username, self.password, self.ssl
         )
 
-    def to_validation_config(self) -> Dict[str, Any]:
+    def to_validation_config(self) -> dict[str, Any]:
         """검증용 Dict 반환
 
         Returns:
@@ -265,13 +260,12 @@ class ConnectionWidgetSet:
             self.host, self.port, self.database, self.username
         )
 
-    def load_from_config(self, config: Dict[str, Any]):
+    def load_from_config(self, config: dict[str, Any]):
         """프로필 Dict에서 UI 위젯 설정
 
         Args:
             config: 프로필 설정 딕셔너리
         """
         ConnectionMapper.set_ui_from_config(
-            config, self.host, self.port, self.database,
-            self.username, self.password, self.ssl
+            config, self.host, self.port, self.database, self.username, self.password, self.ssl
         )

@@ -4,11 +4,12 @@ MigrationDialog를 위한 ViewModel
 마이그레이션 진행 상태와 UI 상태를 관리합니다.
 """
 
+from typing import Any, Optional
+
 from PySide6.QtCore import Signal
-from typing import List, Optional, Dict, Any
-from datetime import date
 
 from src.models.profile import ConnectionProfile
+
 from .base_viewmodel import BaseViewModel
 
 
@@ -42,33 +43,33 @@ class MigrationViewModel(BaseViewModel):
         self.profile = profile
 
         # 파티션 상태
-        self._partitions: List[str] = []
+        self._partitions: list[str] = []
         self._partition_count: int = 0
 
         # 진행률 상태
-        self._progress_data: Dict[str, Any] = {
-            'total_progress': 0,
-            'completed_partitions': 0,
-            'total_partitions': 0,
-            'current_partition': '',
-            'current_progress': 0,
-            'current_rows': 0,
-            'speed': 0
+        self._progress_data: dict[str, Any] = {
+            "total_progress": 0,
+            "completed_partitions": 0,
+            "total_partitions": 0,
+            "current_partition": "",
+            "current_progress": 0,
+            "current_rows": 0,
+            "speed": 0,
         }
 
         # 성능 지표 상태
-        self._performance_data: Dict[str, Any] = {
-            'instant_rows_per_sec': 0,
-            'instant_mb_per_sec': 0.0,
-            'eta_time': '계산중...',
-            'elapsed_time': '00:00:00'
+        self._performance_data: dict[str, Any] = {
+            "instant_rows_per_sec": 0,
+            "instant_mb_per_sec": 0.0,
+            "eta_time": "계산중...",
+            "elapsed_time": "00:00:00",
         }
 
         # 연결 상태
         self._source_connected: bool = False
         self._target_connected: bool = False
-        self._source_status_message: str = '확인 중...'
-        self._target_status_message: str = '확인 중...'
+        self._source_status_message: str = "확인 중..."
+        self._target_status_message: str = "확인 중..."
 
         # 마이그레이션 실행 상태
         self._is_running: bool = False
@@ -76,7 +77,7 @@ class MigrationViewModel(BaseViewModel):
 
     # --- 파티션 관련 메서드 ---
 
-    def set_partitions(self, partitions: List[str], count_message: str = ""):
+    def set_partitions(self, partitions: list[str], count_message: str = ""):
         """파티션 목록 설정
 
         Args:
@@ -88,11 +89,10 @@ class MigrationViewModel(BaseViewModel):
 
         self.partition_list_changed.emit(partitions)
         self.partition_count_changed.emit(
-            self._partition_count,
-            count_message or f"총 {self._partition_count}개 파티션"
+            self._partition_count, count_message or f"총 {self._partition_count}개 파티션"
         )
 
-    def get_partitions(self) -> List[str]:
+    def get_partitions(self) -> list[str]:
         """파티션 목록 반환"""
         return self._partitions
 
@@ -103,7 +103,7 @@ class MigrationViewModel(BaseViewModel):
 
     # --- 진행률 관련 메서드 ---
 
-    def update_progress(self, progress_data: Dict[str, Any]):
+    def update_progress(self, progress_data: dict[str, Any]):
         """진행률 업데이트
 
         Args:
@@ -119,7 +119,7 @@ class MigrationViewModel(BaseViewModel):
         self._progress_data.update(progress_data)
         self.progress_changed.emit(self._progress_data)
 
-    def update_performance(self, performance_data: Dict[str, Any]):
+    def update_performance(self, performance_data: dict[str, Any]):
         """성능 지표 업데이트
 
         Args:
@@ -133,12 +133,12 @@ class MigrationViewModel(BaseViewModel):
         self.performance_changed.emit(self._performance_data)
 
     @property
-    def progress_data(self) -> Dict[str, Any]:
+    def progress_data(self) -> dict[str, Any]:
         """현재 진행률 데이터"""
         return self._progress_data.copy()
 
     @property
-    def performance_data(self) -> Dict[str, Any]:
+    def performance_data(self) -> dict[str, Any]:
         """현재 성능 지표 데이터"""
         return self._performance_data.copy()
 
@@ -152,10 +152,10 @@ class MigrationViewModel(BaseViewModel):
             connected: 연결 성공 여부
             message: 상태 메시지
         """
-        if db_type == 'source':
+        if db_type == "source":
             self._source_connected = connected
             self._source_status_message = message
-        elif db_type == 'target':
+        elif db_type == "target":
             self._target_connected = connected
             self._target_status_message = message
 

@@ -1,9 +1,11 @@
 """logger_mixins.py 단위 테스트"""
-import pytest
-import time
-import re
 
-from src.utils.logger_mixins import SensitiveDataMasker, DatabaseLoggerMixin
+import re
+import time
+
+import pytest
+
+from src.utils.logger_mixins import DatabaseLoggerMixin, SensitiveDataMasker
 
 
 class TestSensitiveDataMasker:
@@ -121,7 +123,7 @@ class TestDatabaseLoggerMixin:
         assert mixin.session_id == session_id
 
         # 형식 확인: YYYYMMDD_HHMMSS_XXXX
-        pattern = r'\d{8}_\d{6}_[0-9A-F]{4}'
+        pattern = r"\d{8}_\d{6}_[0-9A-F]{4}"
         assert re.match(pattern, session_id)
 
         mixin.close()
@@ -141,7 +143,7 @@ class TestDatabaseLoggerMixin:
         mixin = DatabaseLoggerMixin()
         assert mixin.session_id is None
 
-        mixin.log_to_db('INFO', 'Test message')
+        mixin.log_to_db("INFO", "Test message")
 
         assert mixin.session_id is not None
 
@@ -151,8 +153,8 @@ class TestDatabaseLoggerMixin:
         """log_to_db가 큐에 로그를 추가하는지 테스트"""
         mixin = DatabaseLoggerMixin()
 
-        mixin.log_to_db('INFO', 'Test message 1')
-        mixin.log_to_db('DEBUG', 'Test message 2')
+        mixin.log_to_db("INFO", "Test message 1")
+        mixin.log_to_db("DEBUG", "Test message 2")
 
         # 큐에 아이템이 있어야 함
         assert not mixin.db_queue.empty()
@@ -190,9 +192,9 @@ class TestDatabaseLoggerMixin:
         """다양한 로그 레벨로 DB 로그 저장 테스트"""
         mixin = DatabaseLoggerMixin()
 
-        levels = ['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL', 'SUCCESS']
+        levels = ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL", "SUCCESS"]
         for level in levels:
-            mixin.log_to_db(level, f'{level} message')
+            mixin.log_to_db(level, f"{level} message")
 
         # 큐에 아이템이 있어야 함
         assert mixin.db_queue.qsize() >= len(levels)
@@ -203,13 +205,13 @@ class TestDatabaseLoggerMixin:
         """커스텀 로거 이름으로 DB 로그 저장 테스트"""
         mixin = DatabaseLoggerMixin()
 
-        custom_logger = 'CustomLogger'
-        mixin.log_to_db('INFO', 'Custom logger message', logger_name=custom_logger)
+        custom_logger = "CustomLogger"
+        mixin.log_to_db("INFO", "Custom logger message", logger_name=custom_logger)
 
         # 큐에서 아이템 확인
         assert not mixin.db_queue.empty()
         log_data = mixin.db_queue.get()
-        assert log_data['logger_name'] == custom_logger
+        assert log_data["logger_name"] == custom_logger
 
         mixin.close()
 
@@ -220,7 +222,7 @@ class TestDatabaseLoggerMixin:
         # 큐를 가득 채우기 (매우 많은 로그)
         try:
             for i in range(10000):
-                mixin.log_to_db('INFO', f'Message {i}')
+                mixin.log_to_db("INFO", f"Message {i}")
         except Exception as e:
             pytest.fail(f"log_to_db should not raise exception: {e}")
 
@@ -234,8 +236,8 @@ class TestDatabaseLoggerMixin:
         mixin1.set_session_id("session_1")
         mixin2.set_session_id("session_2")
 
-        mixin1.log_to_db('INFO', 'From session 1')
-        mixin2.log_to_db('INFO', 'From session 2')
+        mixin1.log_to_db("INFO", "From session 1")
+        mixin2.log_to_db("INFO", "From session 2")
 
         # 각자의 큐에 로그가 있어야 함
         assert not mixin1.db_queue.empty()

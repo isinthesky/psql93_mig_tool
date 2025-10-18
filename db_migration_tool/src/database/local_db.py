@@ -1,11 +1,11 @@
 """
 로컬 SQLite 데이터베이스 관리
 """
-import os
-from pathlib import Path
-from datetime import datetime
+
 from contextlib import contextmanager
-from sqlalchemy import create_engine, Column, Integer, String, DateTime, Text, Boolean, text
+from datetime import datetime
+
+from sqlalchemy import Column, DateTime, Integer, String, Text, create_engine, text
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 
@@ -16,8 +16,9 @@ Base = declarative_base()
 
 class Profile(Base):
     """연결 프로필 테이블"""
-    __tablename__ = 'profiles'
-    
+
+    __tablename__ = "profiles"
+
     id = Column(Integer, primary_key=True)
     name = Column(String(100), unique=True, nullable=False)
     source_config = Column(Text, nullable=False)  # JSON (암호화)
@@ -28,12 +29,13 @@ class Profile(Base):
 
 class MigrationHistory(Base):
     """작업 이력 테이블"""
-    __tablename__ = 'migration_history'
-    
+
+    __tablename__ = "migration_history"
+
     id = Column(Integer, primary_key=True)
     profile_id = Column(Integer, nullable=False)
     start_date = Column(String(10))  # YYYY-MM-DD
-    end_date = Column(String(10))    # YYYY-MM-DD
+    end_date = Column(String(10))  # YYYY-MM-DD
     started_at = Column(DateTime)
     completed_at = Column(DateTime)
     status = Column(String(20))  # completed, failed, cancelled, running
@@ -47,8 +49,9 @@ class MigrationHistory(Base):
 
 class Checkpoint(Base):
     """체크포인트 테이블 (재개용)"""
-    __tablename__ = 'checkpoints'
-    
+
+    __tablename__ = "checkpoints"
+
     id = Column(Integer, primary_key=True)
     history_id = Column(Integer, nullable=False)
     partition_name = Column(String(100), nullable=False)
@@ -58,14 +61,15 @@ class Checkpoint(Base):
     # 새 필드: COPY 방식 재개를 위한 마지막 처리 키
     last_path_id = Column(Integer)
     last_issued_date = Column(Integer)
-    copy_method = Column(String(10), default='INSERT')  # COPY or INSERT
+    copy_method = Column(String(10), default="INSERT")  # COPY or INSERT
     bytes_transferred = Column(Integer, default=0)
 
 
 class LogEntry(Base):
     """로그 엔트리 테이블"""
-    __tablename__ = 'logs'
-    
+
+    __tablename__ = "logs"
+
     id = Column(Integer, primary_key=True)
     timestamp = Column(DateTime, nullable=False, index=True)
     session_id = Column(String(20), index=True)
@@ -77,33 +81,33 @@ class LogEntry(Base):
 
 class LocalDatabase:
     """로컬 데이터베이스 관리 클래스"""
-    
+
     def __init__(self):
         self.db_path = self._get_db_path()
         self.engine = None
         self.Session = None
-        
+
     def _get_db_path(self):
         """데이터베이스 파일 경로 가져오기 (AppPaths 활용)"""
         return str(AppPaths.get_db_path())
-        
+
     def initialize(self):
         """데이터베이스 초기화"""
         # SQLite 연결 문자열
         connection_string = f"sqlite:///{self.db_path}"
-        
+
         # 엔진 생성
         self.engine = create_engine(connection_string, echo=False)
-        
+
         # 테이블 생성
         Base.metadata.create_all(self.engine)
-        
+
         # 스키마 마이그레이션 실행
         self._migrate_schema()
-        
+
         # 세션 팩토리 생성
         self.Session = sessionmaker(bind=self.engine)
-        
+
     def get_session(self):
         """데이터베이스 세션 반환"""
         if not self.Session:
@@ -136,7 +140,7 @@ class LocalDatabase:
         """데이터베이스 연결 종료"""
         if self.engine:
             self.engine.dispose()
-            
+
     def _migrate_schema(self):
         """기존 데이터베이스 스키마 마이그레이션"""
         try:
@@ -150,9 +154,9 @@ class LocalDatabase:
                     # migration_history 테이블에 연결 상태 컬럼 추가
                     "ALTER TABLE migration_history ADD COLUMN source_connection_status TEXT",
                     "ALTER TABLE migration_history ADD COLUMN target_connection_status TEXT",
-                    "ALTER TABLE migration_history ADD COLUMN connection_check_time DATETIME"
+                    "ALTER TABLE migration_history ADD COLUMN connection_check_time DATETIME",
                 ]
-                
+
                 for migration in migrations:
                     try:
                         conn.execute(text(migration))
@@ -160,8 +164,8 @@ class LocalDatabase:
                     except Exception:
                         # 컬럼이 이미 존재하는 경우 무시
                         pass
-                        
-        except Exception as e:
+
+        except Exception:
             # 마이그레이션 실패는 무시 (새 DB는 이미 올바른 스키마)
             pass
 

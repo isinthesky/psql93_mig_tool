@@ -1,6 +1,7 @@
 """
 로깅 유틸리티
 """
+
 import logging
 
 from .app_paths import AppPaths
@@ -27,32 +28,30 @@ class MigrationLogger:
 
         # 로거 설정 (LoggerConfig 활용)
         self.logger = LoggerConfig.setup_logger(
-            name='DBMigration',
+            name="DBMigration",
             level=logging.DEBUG,
-            handlers=[
-                LoggerConfig.create_file_handler(level=logging.DEBUG)
-            ],
-            clear_existing=True
+            handlers=[LoggerConfig.create_file_handler(level=logging.DEBUG)],
+            clear_existing=True,
         )
 
         self._initialized = True
-        
+
     def debug(self, message: str):
         """디버그 로그"""
         self.logger.debug(message)
-        
+
     def info(self, message: str):
         """정보 로그"""
         self.logger.info(message)
-        
+
     def warning(self, message: str):
         """경고 로그"""
         self.logger.warning(message)
-        
+
     def error(self, message: str, exc_info: bool = False):
         """오류 로그"""
         self.logger.error(message, exc_info=exc_info)
-        
+
     def critical(self, message: str, exc_info: bool = False):
         """치명적 오류 로그"""
         self.logger.critical(message, exc_info=exc_info)

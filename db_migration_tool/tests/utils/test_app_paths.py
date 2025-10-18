@@ -1,9 +1,11 @@
 """app_paths.py 단위 테스트"""
-import pytest
+
 import tempfile
 from pathlib import Path
 
-from src.utils.app_paths import AppPaths, get_app_data_dir, get_logs_dir, get_db_path
+import pytest
+
+from src.utils.app_paths import AppPaths, get_app_data_dir, get_db_path, get_logs_dir
 
 
 class TestAppPaths:

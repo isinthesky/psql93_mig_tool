@@ -1,11 +1,13 @@
 """logger_config.py 단위 테스트"""
-import pytest
+
 import logging
 import tempfile
 from pathlib import Path
 
-from src.utils.logger_config import LoggerConfig
+import pytest
+
 from src.utils.app_paths import AppPaths
+from src.utils.logger_config import LoggerConfig
 
 
 class TestLoggerConfig:
@@ -41,14 +43,12 @@ class TestLoggerConfig:
         """커스텀 파일명 패턴으로 핸들러 생성 테스트"""
         with tempfile.TemporaryDirectory() as tmpdir:
             AppPaths.set_custom_root(Path(tmpdir))
-            handler = LoggerConfig.create_file_handler(
-                filename_pattern="custom_{date}.log"
-            )
+            handler = LoggerConfig.create_file_handler(filename_pattern="custom_{date}.log")
 
             assert isinstance(handler, logging.FileHandler)
             # 핸들러가 파일을 생성했는지 확인
             logs_dir = AppPaths.get_logs_dir()
-            log_files = list(logs_dir.glob("custom_*.log"))
+            list(logs_dir.glob("custom_*.log"))
             # baseFilename 속성으로 파일명 확인
             assert "custom_" in handler.baseFilename
 
@@ -68,7 +68,7 @@ class TestLoggerConfig:
 
     def test_create_console_handler_with_custom_format(self):
         """커스텀 포맷으로 콘솔 핸들러 생성 테스트"""
-        custom_format = '%(levelname)s - %(message)s'
+        custom_format = "%(levelname)s - %(message)s"
         handler = LoggerConfig.create_console_handler(format_string=custom_format)
 
         assert handler.formatter._fmt == custom_format
@@ -81,12 +81,9 @@ class TestLoggerConfig:
             file_handler = LoggerConfig.create_file_handler()
             console_handler = LoggerConfig.create_console_handler()
 
-            logger = LoggerConfig.setup_logger(
-                'TestLogger',
-                [file_handler, console_handler]
-            )
+            logger = LoggerConfig.setup_logger("TestLogger", [file_handler, console_handler])
 
-            assert logger.name == 'TestLogger'
+            assert logger.name == "TestLogger"
             assert logger.level == logging.DEBUG
             assert len(logger.handlers) == 2
             assert file_handler in logger.handlers
@@ -96,12 +93,12 @@ class TestLoggerConfig:
         """로거 설정 시 기존 핸들러 제거 테스트"""
         # 첫 번째 설정
         handler1 = LoggerConfig.create_console_handler()
-        logger = LoggerConfig.setup_logger('TestLogger2', [handler1])
+        logger = LoggerConfig.setup_logger("TestLogger2", [handler1])
         assert len(logger.handlers) == 1
 
         # 두 번째 설정 (기존 핸들러 제거됨)
         handler2 = LoggerConfig.create_console_handler()
-        logger = LoggerConfig.setup_logger('TestLogger2', [handler2])
+        logger = LoggerConfig.setup_logger("TestLogger2", [handler2])
         assert len(logger.handlers) == 1
         assert handler2 in logger.handlers
         assert handler1 not in logger.handlers
@@ -109,10 +106,10 @@ class TestLoggerConfig:
     def test_setup_logger_without_clearing(self):
         """기존 핸들러 유지하면서 로거 설정 테스트"""
         handler1 = LoggerConfig.create_console_handler()
-        logger = LoggerConfig.setup_logger('TestLogger3', [handler1])
+        logger = LoggerConfig.setup_logger("TestLogger3", [handler1])
 
         handler2 = LoggerConfig.create_console_handler()
-        logger = LoggerConfig.setup_logger('TestLogger3', [handler2], clear_existing=False)
+        logger = LoggerConfig.setup_logger("TestLogger3", [handler2], clear_existing=False)
 
         # 두 핸들러 모두 존재해야 함
         assert len(logger.handlers) == 2
@@ -120,7 +117,7 @@ class TestLoggerConfig:
     def test_logger_propagate_false(self):
         """로거 전파 방지 확인"""
         handler = LoggerConfig.create_console_handler()
-        logger = LoggerConfig.setup_logger('TestLogger4', [handler])
+        logger = LoggerConfig.setup_logger("TestLogger4", [handler])
 
         assert logger.propagate is False
 
@@ -145,7 +142,7 @@ class TestLoggerConfig:
         with tempfile.TemporaryDirectory() as tmpdir:
             AppPaths.set_custom_root(Path(tmpdir))
             handler = LoggerConfig.create_file_handler()
-            logger = LoggerConfig.setup_logger('FileWriteTest', [handler])
+            logger = LoggerConfig.setup_logger("FileWriteTest", [handler])
 
             # 로그 작성
             test_message = "Test log message"
@@ -159,7 +156,7 @@ class TestLoggerConfig:
             assert log_file.exists()
             content = log_file.read_text()
             assert test_message in content
-            assert 'INFO' in content
+            assert "INFO" in content
 
     def test_multiple_handlers_same_logger(self):
         """하나의 로거에 여러 핸들러 추가 테스트"""
@@ -171,8 +168,7 @@ class TestLoggerConfig:
             console_handler = LoggerConfig.create_console_handler()
 
             logger = LoggerConfig.setup_logger(
-                'MultiHandlerTest',
-                [file_handler1, file_handler2, console_handler]
+                "MultiHandlerTest", [file_handler1, file_handler2, console_handler]
             )
 
             assert len(logger.handlers) == 3

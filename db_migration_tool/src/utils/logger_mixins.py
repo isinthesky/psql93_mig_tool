@@ -2,13 +2,14 @@
 
 민감정보 마스킹과 DB 로그 저장 기능을 제공합니다.
 """
-import re
+
 import random
+import re
+import time
 from datetime import datetime
-from typing import Optional
 from queue import Queue
 from threading import Thread
-import time
+from typing import Optional
 
 
 class SensitiveDataMasker:
@@ -25,13 +26,13 @@ class SensitiveDataMasker:
     # 마스킹 패턴 (패턴, 치환 문자열) 쌍
     PATTERNS = [
         # password=value 형태
-        (r'(password|pwd|pass)=([^\s]{0,3})([^\s]*)', r'\1=\2***'),
+        (r"(password|pwd|pass)=([^\s]{0,3})([^\s]*)", r"\1=\2***"),
         # Password=value 형태 (대문자)
-        (r'(Password|Pwd|Pass)=([^\s]{0,3})([^\s]*)', r'\1=\2***'),
+        (r"(Password|Pwd|Pass)=([^\s]{0,3})([^\s]*)", r"\1=\2***"),
         # "password": "value" 형태 (JSON)
         (r'"(password|pwd|pass)":\s*"([^"]{0,3})([^"]*)"', r'"\1": "\2***"'),
         # PostgreSQL 연결 문자열
-        (r'(postgresql://[^:]+:)([^@]{0,3})([^@]*)(@)', r'\1\2***\4'),
+        (r"(postgresql://[^:]+:)([^@]{0,3})([^@]*)(@)", r"\1\2***\4"),
     ]
 
     @classmethod
@@ -97,7 +98,7 @@ class DatabaseLoggerMixin:
         """
         # 지연 import (순환 의존성 방지)
         try:
-            from ..database.local_db import get_db, LogEntry
+            from ..database.local_db import LogEntry, get_db
         except ImportError:
             # DB 모듈이 없으면 종료
             return
@@ -115,7 +116,7 @@ class DatabaseLoggerMixin:
                     try:
                         log_data = self.db_queue.get_nowait()
                         logs_to_save.append(log_data)
-                    except:
+                    except Exception:
                         break
 
                 # DB에 저장
@@ -124,11 +125,11 @@ class DatabaseLoggerMixin:
                     try:
                         for log_data in logs_to_save:
                             log_entry = LogEntry(
-                                timestamp=log_data['timestamp'],
-                                session_id=log_data['session_id'],
-                                level=log_data['level'],
-                                logger_name=log_data['logger_name'],
-                                message=log_data['message']
+                                timestamp=log_data["timestamp"],
+                                session_id=log_data["session_id"],
+                                level=log_data["level"],
+                                logger_name=log_data["logger_name"],
+                                message=log_data["message"],
                             )
                             session.add(log_entry)
                         session.commit()
@@ -141,7 +142,7 @@ class DatabaseLoggerMixin:
             except Exception as e:
                 print(f"로그 스레드 오류: {e}")
 
-    def log_to_db(self, level: str, message: str, logger_name: str = 'DBMigration'):
+    def log_to_db(self, level: str, message: str, logger_name: str = "DBMigration"):
         """DB에 로그 저장 (비동기)
 
         Args:
@@ -157,17 +158,17 @@ class DatabaseLoggerMixin:
             self.generate_session_id()
 
         log_data = {
-            'timestamp': datetime.now(),
-            'session_id': self.session_id,
-            'level': level,
-            'logger_name': logger_name,
-            'message': message
+            "timestamp": datetime.now(),
+            "session_id": self.session_id,
+            "level": level,
+            "logger_name": logger_name,
+            "message": message,
         }
 
         # 큐에 추가 (논블로킹)
         try:
             self.db_queue.put_nowait(log_data)
-        except:
+        except Exception:
             pass  # 큐가 가득 찬 경우 무시
 
     def generate_session_id(self) -> str:
@@ -181,8 +182,8 @@ class DatabaseLoggerMixin:
             >>> session_id = mixin.generate_session_id()
             >>> print(session_id)  # '20250118_143022_A3F5'
         """
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        random_suffix = ''.join(random.choices('0123456789ABCDEF', k=4))
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        random_suffix = "".join(random.choices("0123456789ABCDEF", k=4))
         self.session_id = f"{timestamp}_{random_suffix}"
         return self.session_id
 

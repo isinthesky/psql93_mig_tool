@@ -7,4 +7,4 @@ Qt 위젯에 직접 의존하지 않고 테스트 가능한 상태 관리를 제
 
 from .base_viewmodel import BaseViewModel
 
-__all__ = ['BaseViewModel']
+__all__ = ["BaseViewModel"]

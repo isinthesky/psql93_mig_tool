@@ -2,10 +2,11 @@
 
 logging 핸들러 생성과 로거 설정을 중앙집중화합니다.
 """
+
 import logging
-from pathlib import Path
 from datetime import datetime
-from typing import Optional, List
+from pathlib import Path
+from typing import Optional
 
 from .app_paths import AppPaths
 
@@ -21,7 +22,7 @@ class LoggerConfig:
         >>> logger = LoggerConfig.setup_logger('MyLogger', [handler])
     """
 
-    DEFAULT_FORMAT = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    DEFAULT_FORMAT = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
     DEFAULT_LEVEL = logging.DEBUG
 
     @staticmethod
@@ -29,7 +30,7 @@ class LoggerConfig:
         log_dir: Optional[Path] = None,
         filename_pattern: str = "migration_{date}.log",
         level: int = logging.DEBUG,
-        encoding: str = 'utf-8'
+        encoding: str = "utf-8",
     ) -> logging.FileHandler:
         """파일 핸들러 생성
 
@@ -52,22 +53,17 @@ class LoggerConfig:
             log_dir = Path(log_dir)
             log_dir.mkdir(parents=True, exist_ok=True)
 
-        filename = filename_pattern.format(
-            date=datetime.now().strftime('%Y%m%d')
-        )
+        filename = filename_pattern.format(date=datetime.now().strftime("%Y%m%d"))
         log_file = log_dir / filename
 
         handler = logging.FileHandler(log_file, encoding=encoding)
         handler.setLevel(level)
-        handler.setFormatter(
-            logging.Formatter(LoggerConfig.DEFAULT_FORMAT)
-        )
+        handler.setFormatter(logging.Formatter(LoggerConfig.DEFAULT_FORMAT))
         return handler
 
     @staticmethod
     def create_console_handler(
-        level: int = logging.INFO,
-        format_string: Optional[str] = None
+        level: int = logging.INFO, format_string: Optional[str] = None
     ) -> logging.StreamHandler:
         """콘솔 핸들러 생성
 
@@ -87,17 +83,15 @@ class LoggerConfig:
         if format_string is None:
             format_string = LoggerConfig.DEFAULT_FORMAT
 
-        handler.setFormatter(
-            logging.Formatter(format_string)
-        )
+        handler.setFormatter(logging.Formatter(format_string))
         return handler
 
     @staticmethod
     def setup_logger(
         name: str,
-        handlers: List[logging.Handler],
+        handlers: list[logging.Handler],
         level: int = logging.DEBUG,
-        clear_existing: bool = True
+        clear_existing: bool = True,
     ) -> logging.Logger:
         """로거 설정
 

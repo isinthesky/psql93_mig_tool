@@ -1,21 +1,22 @@
 """
 pytest 설정 및 공통 픽스처
 """
-import pytest
-import tempfile
+
 import os
-from pathlib import Path
+import tempfile
+
+import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from src.database.local_db import Base, LocalDatabase
 
 
-@pytest.fixture(scope='function')
+@pytest.fixture(scope="function")
 def temp_db():
     """임시 테스트 데이터베이스 픽스처"""
     # 임시 데이터베이스 파일 생성
-    temp_fd, temp_path = tempfile.mkstemp(suffix='.db')
+    temp_fd, temp_path = tempfile.mkstemp(suffix=".db")
 
     try:
         # 테스트용 LocalDatabase 인스턴스 생성
@@ -43,21 +44,21 @@ def temp_db():
 def sample_profile_data():
     """샘플 프로필 데이터"""
     return {
-        'name': 'Test Profile',
-        'source_config': {
-            'host': 'source.example.com',
-            'port': 5432,
-            'database': 'source_db',
-            'username': 'source_user',
-            'password': 'source_pass',
-            'ssl': False
+        "name": "Test Profile",
+        "source_config": {
+            "host": "source.example.com",
+            "port": 5432,
+            "database": "source_db",
+            "username": "source_user",
+            "password": "source_pass",
+            "ssl": False,
         },
-        'target_config': {
-            'host': 'target.example.com',
-            'port': 5432,
-            'database': 'target_db',
-            'username': 'target_user',
-            'password': 'target_pass',
-            'ssl': False
-        }
+        "target_config": {
+            "host": "target.example.com",
+            "port": 5432,
+            "database": "target_db",
+            "username": "target_user",
+            "password": "target_pass",
+            "ssl": False,
+        },
     }

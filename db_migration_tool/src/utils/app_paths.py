@@ -3,9 +3,10 @@
 모든 파일 시스템 경로를 중앙집중화하여 관리합니다.
 테스트 환경에서는 커스텀 루트 경로를 주입할 수 있습니다.
 """
-import os
+
 from pathlib import Path
 from typing import Optional
+
 from PySide6.QtCore import QStandardPaths
 
 
@@ -81,9 +82,7 @@ class AppPaths:
             if cls._custom_root:
                 cls._app_data_dir = cls._custom_root
             else:
-                app_data = QStandardPaths.writableLocation(
-                    QStandardPaths.AppDataLocation
-                )
+                app_data = QStandardPaths.writableLocation(QStandardPaths.AppDataLocation)
                 if not app_data:
                     # QStandardPaths가 빈 문자열 반환 시 fallback
                     app_data = str(Path.home() / ".db_migration_tool")
@@ -189,6 +188,7 @@ class AppPaths:
                     item.unlink()
                 elif item.is_dir():
                     import shutil
+
                     shutil.rmtree(item)
             except Exception:
                 pass  # 실패해도 무시

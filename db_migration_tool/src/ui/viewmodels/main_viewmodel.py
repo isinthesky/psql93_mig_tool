@@ -4,11 +4,13 @@ MainWindow를 위한 ViewModel
 프로필 관리와 이력 조회 로직을 담당합니다.
 """
 
-from PySide6.QtCore import Signal
-from typing import List, Optional
+from typing import Optional
 
-from src.models.profile import ProfileManager, ConnectionProfile
+from PySide6.QtCore import Signal
+
 from src.models.history import HistoryManager, MigrationHistoryItem
+from src.models.profile import ConnectionProfile, ProfileManager
+
 from .base_viewmodel import BaseViewModel
 
 
@@ -25,8 +27,11 @@ class MainViewModel(BaseViewModel):
     # 이력 관련 시그널
     histories_changed = Signal(list)  # 이력 목록 변경
 
-    def __init__(self, profile_manager: Optional[ProfileManager] = None,
-                 history_manager: Optional[HistoryManager] = None):
+    def __init__(
+        self,
+        profile_manager: Optional[ProfileManager] = None,
+        history_manager: Optional[HistoryManager] = None,
+    ):
         super().__init__()
 
         # 매니저 인스턴스 (테스트 시 목 주입 가능)
@@ -34,9 +39,9 @@ class MainViewModel(BaseViewModel):
         self.history_manager = history_manager or HistoryManager()
 
         # 내부 상태
-        self._profiles: List[ConnectionProfile] = []
+        self._profiles: list[ConnectionProfile] = []
         self._current_profile: Optional[ConnectionProfile] = None
-        self._histories: List[MigrationHistoryItem] = []
+        self._histories: list[MigrationHistoryItem] = []
 
     # --- 프로필 관련 메서드 ---
 
@@ -138,7 +143,7 @@ class MainViewModel(BaseViewModel):
         return self._current_profile
 
     @property
-    def profiles(self) -> List[ConnectionProfile]:
+    def profiles(self) -> list[ConnectionProfile]:
         """프로필 목록"""
         return self._profiles
 
@@ -160,7 +165,7 @@ class MainViewModel(BaseViewModel):
         self.load_histories()
 
     @property
-    def histories(self) -> List[MigrationHistoryItem]:
+    def histories(self) -> list[MigrationHistoryItem]:
         """이력 목록"""
         return self._histories
 

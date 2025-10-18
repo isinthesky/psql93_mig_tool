@@ -3,13 +3,13 @@
 CRUD 공통 로직을 제공하는 베이스 리포지토리와
 엔티티별 전용 리포지토리를 정의합니다.
 """
-from typing import TypeVar, Generic, Optional, List, Type, Dict, Any
-from sqlalchemy.orm import Session
+
 from contextlib import contextmanager
+from typing import Generic, Optional, TypeVar
 
-from .local_db import get_db, MigrationHistory, Checkpoint
+from .local_db import Checkpoint, MigrationHistory, get_db
 
-T = TypeVar('T')
+T = TypeVar("T")
 
 
 class BaseRepository(Generic[T]):
@@ -25,7 +25,7 @@ class BaseRepository(Generic[T]):
         >>> history = repo.create(profile_id=1, start_date='2025-01-01', ...)
     """
 
-    def __init__(self, model_class: Type[T], db=None):
+    def __init__(self, model_class: type[T], db=None):
         """베이스 리포지토리 초기화
 
         Args:
@@ -102,7 +102,7 @@ class BaseRepository(Generic[T]):
                 session.expunge(obj)
             return obj
 
-    def get_all(self, order_by=None) -> List[T]:
+    def get_all(self, order_by=None) -> list[T]:
         """전체 조회
 
         Args:
@@ -125,7 +125,7 @@ class BaseRepository(Generic[T]):
                 session.expunge(obj)
             return results
 
-    def get_many_by(self, order_by=None, **filters) -> List[T]:
+    def get_many_by(self, order_by=None, **filters) -> list[T]:
         """조건으로 다건 조회
 
         Args:
@@ -243,16 +243,18 @@ class HistoryRepository(BaseRepository[MigrationHistory]):
             미완료 이력 또는 None
         """
         with self._session_scope() as session:
-            obj = session.query(MigrationHistory)\
-                .filter_by(profile_id=profile_id)\
-                .filter(MigrationHistory.status.in_(['running', 'failed']))\
-                .order_by(MigrationHistory.started_at.desc())\
+            obj = (
+                session.query(MigrationHistory)
+                .filter_by(profile_id=profile_id)
+                .filter(MigrationHistory.status.in_(["running", "failed"]))
+                .order_by(MigrationHistory.started_at.desc())
                 .first()
+            )
             if obj:
                 session.expunge(obj)
             return obj
 
-    def get_all_desc(self) -> List[MigrationHistory]:
+    def get_all_desc(self) -> list[MigrationHistory]:
         """최신순 전체 조회
 
         started_at 기준 내림차순으로 정렬합니다.
@@ -274,7 +276,7 @@ class CheckpointRepository(BaseRepository[Checkpoint]):
         """
         super().__init__(Checkpoint, db)
 
-    def get_by_history(self, history_id: int) -> List[Checkpoint]:
+    def get_by_history(self, history_id: int) -> list[Checkpoint]:
         """이력별 체크포인트 조회
 
         partition_name 기준 오름차순으로 정렬합니다.
@@ -285,12 +287,9 @@ class CheckpointRepository(BaseRepository[Checkpoint]):
         Returns:
             체크포인트 리스트
         """
-        return self.get_many_by(
-            history_id=history_id,
-            order_by=Checkpoint.partition_name
-        )
+        return self.get_many_by(history_id=history_id, order_by=Checkpoint.partition_name)
 
-    def get_pending_by_history(self, history_id: int) -> List[Checkpoint]:
+    def get_pending_by_history(self, history_id: int) -> list[Checkpoint]:
         """미완료 체크포인트 조회
 
         completed가 아닌 체크포인트를 반환합니다.
@@ -302,11 +301,13 @@ class CheckpointRepository(BaseRepository[Checkpoint]):
             미완료 체크포인트 리스트
         """
         with self._session_scope() as session:
-            results = session.query(Checkpoint)\
-                .filter_by(history_id=history_id)\
-                .filter(Checkpoint.status != 'completed')\
-                .order_by(Checkpoint.partition_name)\
+            results = (
+                session.query(Checkpoint)
+                .filter_by(history_id=history_id)
+                .filter(Checkpoint.status != "completed")
+                .order_by(Checkpoint.partition_name)
                 .all()
+            )
             for obj in results:
                 session.expunge(obj)
             return results

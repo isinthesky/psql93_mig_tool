@@ -1,18 +1,21 @@
 """
 마이그레이션 워커 추상 기반 클래스
 """
+
 import time
 from abc import ABCMeta, abstractmethod
-from typing import List, Dict, Any
+from typing import Any
+
 from PySide6.QtCore import QThread, Signal
 
+from src.models.history import CheckpointManager, HistoryManager
 from src.models.profile import ConnectionProfile
-from src.models.history import HistoryManager, CheckpointManager
 from src.utils.enhanced_logger import enhanced_logger, log_emitter
 
 
 class QThreadABCMeta(type(QThread), ABCMeta):
     """QThread와 ABC를 동시에 상속하기 위한 메타클래스"""
+
     pass
 
 
@@ -25,12 +28,17 @@ class BaseMigrationWorker(QThread, metaclass=QThreadABCMeta):
 
     # 공통 시그널
     progress = Signal(dict)  # 진행 상황
-    log = Signal(str, str)   # 메시지, 레벨
-    error = Signal(str)      # 오류 메시지
-    finished = Signal()      # 완료
+    log = Signal(str, str)  # 메시지, 레벨
+    error = Signal(str)  # 오류 메시지
+    finished = Signal()  # 완료
 
-    def __init__(self, profile: ConnectionProfile, partitions: List[str],
-                 history_id: int, resume: bool = False):
+    def __init__(
+        self,
+        profile: ConnectionProfile,
+        partitions: list[str],
+        history_id: int,
+        resume: bool = False,
+    ):
         """워커 초기화
 
         Args:
@@ -134,7 +142,7 @@ class BaseMigrationWorker(QThread, metaclass=QThreadABCMeta):
             return int(self.total_rows_processed / elapsed)
         return 0
 
-    def get_stats(self) -> Dict[str, Any]:
+    def get_stats(self) -> dict[str, Any]:
         """통계 정보 반환
 
         Returns:
@@ -153,8 +161,8 @@ class BaseMigrationWorker(QThread, metaclass=QThreadABCMeta):
             eta_seconds = estimated_remaining_rows / speed
 
         return {
-            'elapsed_seconds': elapsed,
-            'total_rows_processed': self.total_rows_processed,
-            'speed': speed,
-            'eta_seconds': eta_seconds
+            "elapsed_seconds": elapsed,
+            "total_rows_processed": self.total_rows_processed,
+            "speed": speed,
+            "eta_seconds": eta_seconds,
         }

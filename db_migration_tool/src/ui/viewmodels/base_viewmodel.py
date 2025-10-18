@@ -7,8 +7,9 @@ ViewModel 베이스 클래스
 - 상태 변경 알림
 """
 
-from PySide6.QtCore import QObject, Signal
 from typing import Optional
+
+from PySide6.QtCore import QObject, Signal
 
 
 class BaseViewModel(QObject):

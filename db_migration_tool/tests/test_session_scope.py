@@ -1,7 +1,9 @@
 """
 session_scope() 컨텍스트 매니저 테스트
 """
+
 import pytest
+
 from src.database.local_db import Profile
 
 
@@ -18,7 +20,7 @@ class TestSessionScope:
             profile = Profile(
                 name=profile_name,
                 source_config='{"encrypted": "source"}',
-                target_config='{"encrypted": "target"}'
+                target_config='{"encrypted": "target"}',
             )
             session.add(profile)
             session.flush()
@@ -43,7 +45,7 @@ class TestSessionScope:
                 profile = Profile(
                     name="Should Rollback",
                     source_config='{"encrypted": "source"}',
-                    target_config='{"encrypted": "target"}'
+                    target_config='{"encrypted": "target"}',
                 )
                 session.add(profile)
                 session.flush()
@@ -62,7 +64,7 @@ class TestSessionScope:
             profile = Profile(
                 name="Test Close",
                 source_config='{"encrypted": "source"}',
-                target_config='{"encrypted": "target"}'
+                target_config='{"encrypted": "target"}',
             )
             session.add(profile)
             # session은 아직 열려있음
@@ -81,12 +83,11 @@ class TestSessionScope:
             profile = Profile(
                 name="Test Flush ID",
                 source_config='{"encrypted": "source"}',
-                target_config='{"encrypted": "target"}'
+                target_config='{"encrypted": "target"}',
             )
             session.add(profile)
 
             # flush 전에는 ID가 None일 수 있음
-            pre_flush_id = profile.id
 
             session.flush()
 
@@ -107,7 +108,7 @@ class TestSessionScope:
                 profile1 = Profile(
                     name="Profile 1",
                     source_config='{"encrypted": "source1"}',
-                    target_config='{"encrypted": "target1"}'
+                    target_config='{"encrypted": "target1"}',
                 )
                 session.add(profile1)
                 session.flush()
@@ -116,7 +117,7 @@ class TestSessionScope:
                 profile2 = Profile(
                     name="Profile 2",
                     source_config='{"encrypted": "source2"}',
-                    target_config='{"encrypted": "target2"}'
+                    target_config='{"encrypted": "target2"}',
                 )
                 session.add(profile2)
                 session.flush()
@@ -139,7 +140,7 @@ class TestSessionScope:
                 profile = Profile(
                     name=name,
                     source_config=f'{{"encrypted": "source_{name}"}}',
-                    target_config=f'{{"encrypted": "target_{name}"}}'
+                    target_config=f'{{"encrypted": "target_{name}"}}',
                 )
                 session.add(profile)
 

@@ -2,12 +2,11 @@
 MainViewModel 테스트
 """
 
+from unittest.mock import Mock
+
 import pytest
-from unittest.mock import Mock, MagicMock
 
 from src.ui.viewmodels.main_viewmodel import MainViewModel
-from src.models.profile import ConnectionProfile
-from src.models.history import MigrationHistoryItem
 
 
 class TestMainViewModel:
@@ -35,8 +34,7 @@ class TestMainViewModel:
     def viewmodel(self, mock_profile_manager, mock_history_manager):
         """MainViewModel 픽스처"""
         return MainViewModel(
-            profile_manager=mock_profile_manager,
-            history_manager=mock_history_manager
+            profile_manager=mock_profile_manager, history_manager=mock_history_manager
         )
 
     def test_initial_state(self, viewmodel):
@@ -48,10 +46,7 @@ class TestMainViewModel:
     def test_load_profiles_emits_signal(self, viewmodel, mock_profile_manager, qtbot):
         """프로필 로드 시 시그널 발행 확인"""
         # Given: 목 프로필 데이터
-        mock_profiles = [
-            Mock(id=1, name='Profile 1'),
-            Mock(id=2, name='Profile 2')
-        ]
+        mock_profiles = [Mock(id=1, name="Profile 1"), Mock(id=2, name="Profile 2")]
         mock_profile_manager.get_all_profiles.return_value = mock_profiles
 
         # When: 프로필 로드
@@ -66,7 +61,7 @@ class TestMainViewModel:
     def test_select_profile_emits_signal(self, viewmodel, mock_profile_manager, qtbot):
         """프로필 선택 시 시그널 발행 확인"""
         # Given: 목 프로필
-        mock_profile = Mock(id=1, name='Test Profile')
+        mock_profile = Mock(id=1, name="Test Profile")
         mock_profile_manager.get_profile.return_value = mock_profile
 
         # When: 프로필 선택
@@ -81,11 +76,11 @@ class TestMainViewModel:
     def test_create_profile_reloads_profiles(self, viewmodel, mock_profile_manager, qtbot):
         """프로필 생성 시 목록 자동 갱신 확인"""
         # Given: 생성 후 갱신된 프로필 목록
-        mock_profile_manager.get_all_profiles.return_value = [Mock(id=1, name='New Profile')]
+        mock_profile_manager.get_all_profiles.return_value = [Mock(id=1, name="New Profile")]
 
         # When: 프로필 생성
         with qtbot.waitSignal(viewmodel.profiles_changed, timeout=1000):
-            result = viewmodel.create_profile({'name': 'New Profile'})
+            result = viewmodel.create_profile({"name": "New Profile"})
 
         # Then: 생성 성공 및 목록 갱신 확인
         assert result is True
@@ -99,7 +94,7 @@ class TestMainViewModel:
 
         # When: 프로필 생성 시도
         with qtbot.waitSignal(viewmodel.error_occurred, timeout=1000) as blocker:
-            result = viewmodel.create_profile({'name': 'Bad Profile'})
+            result = viewmodel.create_profile({"name": "Bad Profile"})
 
         # Then: 실패 반환 및 오류 시그널 발행
         assert result is False
@@ -108,20 +103,22 @@ class TestMainViewModel:
     def test_update_profile_reloads_profiles(self, viewmodel, mock_profile_manager, qtbot):
         """프로필 업데이트 시 목록 자동 갱신 확인"""
         # Given: 업데이트 후 갱신된 프로필 목록
-        mock_profile_manager.get_all_profiles.return_value = [Mock(id=1, name='Updated Profile')]
+        mock_profile_manager.get_all_profiles.return_value = [Mock(id=1, name="Updated Profile")]
 
         # When: 프로필 업데이트
         with qtbot.waitSignal(viewmodel.profiles_changed, timeout=1000):
-            result = viewmodel.update_profile(1, {'name': 'Updated Profile'})
+            result = viewmodel.update_profile(1, {"name": "Updated Profile"})
 
         # Then: 업데이트 성공 및 목록 갱신 확인
         assert result is True
-        mock_profile_manager.update_profile.assert_called_once_with(1, {'name': 'Updated Profile'})
+        mock_profile_manager.update_profile.assert_called_once_with(1, {"name": "Updated Profile"})
 
-    def test_delete_profile_reloads_and_clears_current(self, viewmodel, mock_profile_manager, qtbot):
+    def test_delete_profile_reloads_and_clears_current(
+        self, viewmodel, mock_profile_manager, qtbot
+    ):
         """프로필 삭제 시 목록 갱신 및 current_profile 초기화 확인"""
         # Given: 현재 프로필이 선택된 상태
-        mock_profile = Mock(id=1, name='To Delete')
+        mock_profile = Mock(id=1, name="To Delete")
         mock_profile_manager.get_profile.return_value = mock_profile
         viewmodel.select_profile(1)
         assert viewmodel.current_profile is not None
@@ -139,10 +136,12 @@ class TestMainViewModel:
         assert viewmodel.current_profile is None
         mock_profile_manager.delete_profile.assert_called_once_with(1)
 
-    def test_delete_profile_does_not_clear_different_current(self, viewmodel, mock_profile_manager, qtbot):
+    def test_delete_profile_does_not_clear_different_current(
+        self, viewmodel, mock_profile_manager, qtbot
+    ):
         """다른 프로필 삭제 시 current_profile 유지 확인"""
         # Given: 프로필 1이 선택된 상태
-        mock_profile = Mock(id=1, name='Current')
+        mock_profile = Mock(id=1, name="Current")
         mock_profile_manager.get_profile.return_value = mock_profile
         viewmodel.select_profile(1)
 
@@ -161,8 +160,8 @@ class TestMainViewModel:
         """이력 로드 시 시그널 발행 확인"""
         # Given: 목 이력 데이터
         mock_histories = [
-            Mock(id=1, profile_id=1, status='completed'),
-            Mock(id=2, profile_id=2, status='running')
+            Mock(id=1, profile_id=1, status="completed"),
+            Mock(id=2, profile_id=2, status="running"),
         ]
         mock_history_manager.get_all_history.return_value = mock_histories
 
@@ -187,7 +186,9 @@ class TestMainViewModel:
         # Then: 이력이 로드됨
         assert viewmodel.histories == mock_histories
 
-    def test_initialize_loads_both(self, viewmodel, mock_profile_manager, mock_history_manager, qtbot):
+    def test_initialize_loads_both(
+        self, viewmodel, mock_profile_manager, mock_history_manager, qtbot
+    ):
         """initialize가 프로필과 이력을 모두 로드하는지 확인"""
         # Given: 목 데이터
         mock_profiles = [Mock(id=1)]
