@@ -160,12 +160,9 @@ class TestBaseMigrationWorker:
         assert "speed" in stats
         assert "eta_seconds" in stats
 
-    @patch("src.utils.enhanced_logger.enhanced_logger")
-    @patch("src.utils.enhanced_logger.log_emitter")
-    def test_base_worker_run_template_method(self, mock_log_emitter, mock_logger, mock_profile):
+    def test_base_worker_run_template_method(self, mock_profile):
         """run() 템플릿 메서드가 _execute_migration()을 호출하는지 확인"""
-        # Given: Worker 생성
-        mock_logger.generate_session_id.return_value = "test_session_id"
+        # Given: Worker 생성 (conftest의 mock_log_emitter가 자동 적용됨)
         worker = self.ConcreteWorker(mock_profile, ["partition_1"], history_id=1)
 
         # When: run 실행

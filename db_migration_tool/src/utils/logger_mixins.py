@@ -80,11 +80,16 @@ class DatabaseLoggerMixin:
 
     def __init__(self):
         """DB 로거 믹스인 초기화"""
+        import os
+
         self.session_id: Optional[str] = None
         self.db_queue = Queue()
         self.is_running = True
         self.db_thread: Optional[Thread] = None
-        self._start_db_thread()
+
+        # pytest 실행 중에는 DB 스레드 시작하지 않음 (성능 최적화)
+        if os.environ.get("PYTEST_CURRENT_TEST") is None:
+            self._start_db_thread()
 
     def _start_db_thread(self):
         """DB 저장 스레드 시작"""

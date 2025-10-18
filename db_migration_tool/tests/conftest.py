@@ -4,6 +4,7 @@ pytest 설정 및 공통 픽스처
 
 import os
 import tempfile
+from unittest.mock import MagicMock, patch
 
 import pytest
 from sqlalchemy import create_engine
@@ -62,3 +63,24 @@ def sample_profile_data():
             "ssl": False,
         },
     }
+
+
+@pytest.fixture(scope="session", autouse=True)
+def mock_log_emitter():
+    """테스트 환경에서 log_emitter 모킹 (자동 적용)
+
+    DB 로깅으로 인한 테스트 지연을 방지합니다.
+    - DB 초기화 비용 제거 (0.5~1초)
+    - 백그라운드 스레드 플러시 대기 제거 (0.1~0.2초/호출)
+    """
+    with patch("src.utils.enhanced_logger.log_emitter") as mock_emitter:
+        # Mock logger 설정
+        mock_logger = MagicMock()
+        mock_logger.generate_session_id.return_value = "TEST_SESSION"
+        mock_logger.set_session_id = MagicMock()
+
+        # Mock emitter 설정
+        mock_emitter.logger = mock_logger
+        mock_emitter.emit_log = MagicMock()  # no-op
+
+        yield mock_emitter
