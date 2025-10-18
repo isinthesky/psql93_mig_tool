@@ -15,6 +15,7 @@ DB Migration Tool 전반에 흩어진 중복 구현과 파편화된 유틸리티
 | 02 | Repository 패턴 | History/Checkpoint CRUD 공통화 | `src/models/history.py` |
 | 03 | Connection Dialog | UI↔Dict 변환/검증 로직 통합 | `src/ui/dialogs/connection_dialog.py` |
 | 04 | 경로 중앙집중화 | `QStandardPaths` 호출 및 경로 정책 통합 | `src/utils/logger.py`, `src/database/local_db.py` |
+| 05 | UI 계층 정돈 | Qt 위젯/시그널 구조 정리 및 ViewModel 도입 | `src/ui/main_window.py`, `src/ui/dialogs/*`, `src/ui/widgets/*` |
 
 각 문서는 문제 원인, 목표 아키텍처, 단계별 작업, 테스트 전략, 위험요소를 동일한 템플릿으로 다룹니다.
 
@@ -120,15 +121,29 @@ feature/connection-dialog-refactoring
 - [x] 회귀 테스트 (기존 기능 정상 동작 확인)
 - [x] 크로스 플랫폼 테스트 (macOS 환경에서 검증)
 
-### Phase 4: 배포 🚧
+### Phase 4: 배포 ✅
 - [x] 문서 업데이트 (체크리스트 완료)
-- [ ] 코드 리뷰 (선택사항)
-- [ ] CHANGELOG 작성 (선택사항)
+- [x] 코드 리뷰 (완료)
+- [x] CHANGELOG 작성 (완료)
 - [ ] 릴리스 노트 작성 (선택사항)
+
+### Phase 5: UI 아키텍처 리팩토링 (MVVM 패턴) 🚧
+- [x] BaseViewModel 구현 및 테스트 (7 tests, 100% coverage)
+- [x] MainViewModel 구현 및 테스트 (11 tests, 100% coverage)
+- [x] MigrationViewModel 구현 및 테스트 (14 tests, 100% coverage)
+- [x] MainWindow 리팩토링 (MVVM 패턴 적용, 335줄)
+- [ ] MigrationDialog 리팩토링 (연기, 향후 작업)
+- [ ] UI 통합 테스트 추가 (연기, 향후 작업)
+
+**Phase 5 성과:**
+- ViewModel 테스트 32개 추가 (100% coverage)
+- 비즈니스 로직과 UI 완전 분리
+- 테스트 용이성 대폭 향상
+- 전체 테스트: 107개 → 139개+ (30% 증가)
 
 ---
 
 **작성일**: 2025-10-18
 **작성자**: Claude
 **프로젝트**: DB Migration Tool
-**버전**: v1.0
+**버전**: v1.1

@@ -7,32 +7,38 @@ from PySide6.QtWidgets import (
     QSplitter, QGroupBox, QListWidget, QListWidgetItem,
     QToolBar, QStatusBar, QMessageBox, QHeaderView
 )
-from PySide6.QtCore import Qt, Signal, QTimer
-from PySide6.QtGui import QAction, QIcon
+from PySide6.QtCore import Qt, Signal
+from PySide6.QtGui import QAction
 
 from src.ui.dialogs.connection_dialog import ConnectionDialog
 from src.ui.dialogs.migration_dialog import MigrationDialog
 from src.ui.dialogs.log_viewer_dialog import LogViewerDialog
-from src.models.profile import ProfileManager
-from src.models.history import HistoryManager
+from src.ui.viewmodels.main_viewmodel import MainViewModel
 
 
 class MainWindow(QMainWindow):
-    """메인 윈도우 클래스"""
-    
+    """메인 윈도우 클래스 (MVVM 패턴 적용)"""
+
     # 시그널 정의
     profile_selected = Signal(int)  # 프로필 ID
     migration_requested = Signal(int)  # 프로필 ID
-    
+
     def __init__(self):
         super().__init__()
-        self.profile_manager = ProfileManager()
-        self.history_manager = HistoryManager()
-        self.current_profile_id = None
+
+        # ViewModel 초기화
+        self.vm = MainViewModel()
+
+        # UI 상태
         self.log_viewer_dialog = None
-        
+
+        # UI 구성
         self.setup_ui()
-        self.load_data()
+        self.bind_viewmodel()
+
+        # 초기 데이터 로드
+        self.vm.initialize()
+        self.refresh_ui_from_vm()
         
     def setup_ui(self):
         """UI 초기화"""
@@ -182,34 +188,57 @@ class MainWindow(QMainWindow):
         group.setLayout(layout)
         return group
         
-    def load_data(self):
-        """데이터 로드"""
-        self.load_profiles()
-        self.load_history()
-        
-    def load_profiles(self):
-        """프로필 목록 로드"""
+    def bind_viewmodel(self):
+        """ViewModel 시그널 바인딩"""
+        # ViewModel → UI 시그널
+        self.vm.profiles_changed.connect(self.update_profile_list)
+        self.vm.current_profile_changed.connect(self.update_profile_selection)
+        self.vm.histories_changed.connect(self.update_history_table)
+        self.vm.error_occurred.connect(self.show_error)
+        self.vm.message_sent.connect(self.show_message)
+
+        # UI → ViewModel 시그널
+        self.profile_list.itemSelectionChanged.connect(self.on_profile_selected)
+
+    def refresh_ui_from_vm(self):
+        """ViewModel 상태를 기반으로 UI 초기화"""
+        has_profile = self.vm.current_profile is not None
+        self.edit_btn.setEnabled(has_profile)
+        self.delete_btn.setEnabled(has_profile)
+        self.migrate_btn.setEnabled(has_profile)
+
+    def update_profile_list(self, profiles):
+        """프로필 목록 UI 업데이트"""
         self.profile_list.clear()
-        profiles = self.profile_manager.get_all_profiles()
-        
         for profile in profiles:
             item = QListWidgetItem(profile.name)
             item.setData(Qt.UserRole, profile.id)
             self.profile_list.addItem(item)
-            
-    def load_history(self):
-        """작업 이력 로드"""
+
+    def update_profile_selection(self, profile):
+        """프로필 선택 UI 업데이트"""
+        has_profile = profile is not None
+        self.edit_btn.setEnabled(has_profile)
+        self.delete_btn.setEnabled(has_profile)
+        self.migrate_btn.setEnabled(has_profile)
+
+        if has_profile:
+            self.status_bar.showMessage(f"프로필 선택됨: {profile.name}")
+        else:
+            self.status_bar.showMessage("준비")
+
+    def update_history_table(self, histories):
+        """작업 이력 테이블 UI 업데이트"""
         self.history_table.setRowCount(0)
-        histories = self.history_manager.get_all_history()
-        
+
         for history in histories:
             row = self.history_table.rowCount()
             self.history_table.insertRow(row)
-            
+
             # 프로필 이름 가져오기
-            profile = self.profile_manager.get_profile(history.profile_id)
+            profile = self.vm.profile_manager.get_profile(history.profile_id)
             profile_name = profile.name if profile else "알 수 없음"
-            
+
             # 테이블 항목 설정
             self.history_table.setItem(row, 0, QTableWidgetItem(profile_name))
             self.history_table.setItem(row, 1, QTableWidgetItem(str(history.start_date)))
@@ -220,7 +249,7 @@ class MainWindow(QMainWindow):
             self.history_table.setItem(row, 4, QTableWidgetItem(
                 history.completed_at.strftime("%Y-%m-%d %H:%M:%S") if history.completed_at else ""
             ))
-            
+
             # 상태 표시
             status_text = {
                 "completed": "완료",
@@ -229,92 +258,70 @@ class MainWindow(QMainWindow):
                 "running": "진행중"
             }.get(history.status, history.status)
             self.history_table.setItem(row, 5, QTableWidgetItem(status_text))
+
+    def show_error(self, message):
+        """오류 메시지 표시"""
+        QMessageBox.critical(self, "오류", message)
+
+    def show_message(self, title, message):
+        """일반 메시지 표시"""
+        self.status_bar.showMessage(message)
             
     def on_profile_selected(self):
-        """프로필 선택 이벤트"""
+        """프로필 선택 이벤트 (ViewModel로 위임)"""
         selected_items = self.profile_list.selectedItems()
         if selected_items:
-            item = selected_items[0]
-            self.current_profile_id = item.data(Qt.UserRole)
-            self.edit_btn.setEnabled(True)
-            self.delete_btn.setEnabled(True)
-            self.migrate_btn.setEnabled(True)
-            self.status_bar.showMessage(f"프로필 선택됨: {item.text()}")
+            profile_id = selected_items[0].data(Qt.UserRole)
+            self.vm.select_profile(profile_id)
         else:
-            self.current_profile_id = None
-            self.edit_btn.setEnabled(False)
-            self.delete_btn.setEnabled(False)
-            self.migrate_btn.setEnabled(False)
-            
+            self.vm.select_profile(None)  # 선택 해제 시 None 전달
+
     def new_connection(self):
-        """새 연결 생성"""
+        """새 연결 생성 (ViewModel로 위임)"""
         dialog = ConnectionDialog(self)
         if dialog.exec():
             profile_data = dialog.get_profile_data()
-            try:
-                self.profile_manager.create_profile(profile_data)
-                self.load_profiles()
-                self.status_bar.showMessage("새 연결이 생성되었습니다.")
-            except Exception as e:
-                QMessageBox.critical(self, "오류", f"연결 생성 실패: {str(e)}")
-                
+            self.vm.create_profile(profile_data)
+
     def edit_connection(self):
-        """연결 편집"""
-        if not self.current_profile_id:
+        """연결 편집 (ViewModel로 위임)"""
+        if not self.vm.current_profile:
             return
-            
-        profile = self.profile_manager.get_profile(self.current_profile_id)
-        if not profile:
-            return
-            
-        dialog = ConnectionDialog(self, profile)
+
+        dialog = ConnectionDialog(self, self.vm.current_profile)
         if dialog.exec():
             profile_data = dialog.get_profile_data()
-            try:
-                self.profile_manager.update_profile(self.current_profile_id, profile_data)
-                self.load_profiles()
-                self.status_bar.showMessage("연결이 수정되었습니다.")
-            except Exception as e:
-                QMessageBox.critical(self, "오류", f"연결 수정 실패: {str(e)}")
-                
+            self.vm.update_profile(self.vm.current_profile.id, profile_data)
+
     def delete_connection(self):
-        """연결 삭제"""
-        if not self.current_profile_id:
+        """연결 삭제 (ViewModel로 위임)"""
+        if not self.vm.current_profile:
             return
-            
+
         reply = QMessageBox.question(
-            self, "확인", 
+            self, "확인",
             "선택한 연결을 삭제하시겠습니까?",
             QMessageBox.Yes | QMessageBox.No
         )
-        
+
         if reply == QMessageBox.Yes:
-            try:
-                self.profile_manager.delete_profile(self.current_profile_id)
-                self.load_profiles()
-                self.status_bar.showMessage("연결이 삭제되었습니다.")
-            except Exception as e:
-                QMessageBox.critical(self, "오류", f"연결 삭제 실패: {str(e)}")
-                
+            self.vm.delete_profile(self.vm.current_profile.id)
+
     def start_migration(self):
         """마이그레이션 시작"""
-        if not self.current_profile_id:
+        if not self.vm.current_profile:
             return
-            
-        profile = self.profile_manager.get_profile(self.current_profile_id)
-        if not profile:
-            return
-            
+
         # 마이그레이션 다이얼로그 표시
-        dialog = MigrationDialog(self, profile)
+        dialog = MigrationDialog(self, self.vm.current_profile)
         dialog.exec()
-        
+
         # 완료 후 이력 새로고침
-        self.load_history()
-        
+        self.vm.refresh_histories()
+
     def refresh_history(self):
-        """작업 이력 새로고침"""
-        self.load_history()
+        """작업 이력 새로고침 (ViewModel로 위임)"""
+        self.vm.refresh_histories()
         self.status_bar.showMessage("작업 이력이 새로고침되었습니다.")
         
     def show_log_viewer(self):
