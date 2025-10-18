@@ -2,8 +2,8 @@
 메인 윈도우 UI
 """
 
-from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QAction
+from PySide6.QtCore import QEvent, Qt, QTimer, Signal
+from PySide6.QtGui import QAction, QCloseEvent
 from PySide6.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
@@ -43,6 +43,11 @@ class MainWindow(QMainWindow):
 
         # UI 상태
         self.log_viewer_dialog = None
+
+        # 트레이 아이콘 관련
+        self.tray_icon = None  # TrayIconManager 인스턴스 (main.py에서 설정)
+        self.minimize_to_tray = True  # 트레이 최소화 활성화 (설정으로 관리 가능)
+        self.first_minimize = True  # 첫 최소화 여부
 
         # UI 구성
         self.setup_ui()
@@ -353,3 +358,37 @@ class MainWindow(QMainWindow):
         else:
             self.log_viewer_dialog.raise_()
             self.log_viewer_dialog.activateWindow()
+
+    # === 트레이 아이콘 관련 메서드 ===
+
+    def closeEvent(self, event: QCloseEvent):
+        """윈도우 닫기 이벤트 처리
+
+        트레이 아이콘이 활성화되어 있으면 트레이로 최소화
+        """
+        if self.minimize_to_tray and self.tray_icon:
+            # 트레이로 최소화
+            event.ignore()
+            self.hide()
+
+            # 첫 최소화 시 안내 메시지
+            if self.first_minimize:
+                self.tray_icon.notify_first_minimize()
+                self.first_minimize = False
+        else:
+            # 실제 종료
+            event.accept()
+
+    def changeEvent(self, event: QEvent):
+        """윈도우 상태 변경 이벤트
+
+        최소화 버튼 클릭 시 트레이로 숨김
+        """
+        if event.type() == QEvent.Type.WindowStateChange:
+            if self.isMinimized() and self.minimize_to_tray and self.tray_icon:
+                # 최소화 시 트레이로 숨김 (약간의 지연 후)
+                QTimer.singleShot(0, self.hide)
+                event.ignore()
+                return
+
+        super().changeEvent(event)

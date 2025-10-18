@@ -68,6 +68,9 @@ def main():
     # 애플리케이션 초기화
     app = initialize_application()
 
+    # 트레이 아이콘 사용 시 윈도우 닫힘으로 종료 방지
+    app.setQuitOnLastWindowClosed(False)
+
     # 로컬 데이터베이스 초기화
     try:
         initialize_database()
@@ -79,8 +82,22 @@ def main():
         )
         return 1
 
-    # 메인 윈도우 생성 및 표시
+    # 메인 윈도우 생성
     window = MainWindow()
+
+    # 트레이 아이콘 설정
+    from src.ui.tray_icon import TrayIconManager
+
+    tray_manager = TrayIconManager(app, window)
+    if tray_manager.setup():
+        window.tray_icon = tray_manager
+
+        # 시그널 연결
+        tray_manager.show_window_requested.connect(lambda: window.show())
+        tray_manager.show_history_requested.connect(window.refresh_history)
+        tray_manager.quit_requested.connect(app.quit)
+
+    # 윈도우 표시
     window.show()
 
     # 애플리케이션 실행
