@@ -2,7 +2,11 @@
   "permissions": {
     "allow": [
       "Bash(rg:*)",
-      "Bash(mkdir:*)"
+      "Bash(mkdir:*)",
+      "Bash(build.bat)",
+      "Bash(cmd /c \"cd db_migration_tool && build.bat\")",
+      "Bash(dir:*)",
+      "Bash(nul)"
     ],
     "deny": []
   }
