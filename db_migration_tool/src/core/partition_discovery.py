@@ -1,10 +1,12 @@
 """
 파티션 테이블 탐색 및 분석
 """
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Tuple, Optional
 from datetime import datetime, date
 import psycopg
 from psycopg import sql
+
+from .table_types import TableType, DEFAULT_TABLE_TYPE
 
 
 class PartitionDiscovery:
@@ -13,62 +15,103 @@ class PartitionDiscovery:
     def __init__(self, connection_config: Dict[str, Any]):
         self.connection_config = connection_config
         
-    def discover_partitions(self, start_date: date, end_date: date) -> List[Dict[str, Any]]:
-        """날짜 범위에 해당하는 파티션 탐색"""
+    def discover_partitions(
+        self,
+        start_date: date,
+        end_date: date,
+        table_types: Optional[List[TableType]] = None
+    ) -> List[Dict[str, Any]]:
+        """
+        날짜 범위에 해당하는 파티션 탐색
+
+        Args:
+            start_date: 시작 날짜
+            end_date: 종료 날짜
+            table_types: 탐색할 테이블 타입 리스트 (기본값: [DEFAULT_TABLE_TYPE])
+
+        Returns:
+            파티션 정보 리스트. 각 항목에는 table_name, table_type, start_date, end_date 등 포함
+        """
         partitions = []
-        
+
+        # 기본값 설정 (backward compatibility)
+        if table_types is None:
+            table_types = [DEFAULT_TABLE_TYPE]
+
+        # 빈 리스트 검증
+        if not table_types:
+            raise ValueError("최소 1개의 테이블 타입을 지정해야 합니다. (At least one table type must be specified)")
+
+        # TableType enum을 문자열로 변환
+        table_type_codes = [tt.value for tt in table_types]
+
         try:
             # 연결 생성
             conn = self._create_connection()
-            
+
             with conn.cursor() as cur:
                 # partition_table_info 테이블에서 날짜 범위에 해당하는 파티션 조회
-                cur.execute("""
-                    SELECT 
+                # IN 절을 사용하여 여러 테이블 타입 지원
+                placeholders = ', '.join(['%s'] * len(table_type_codes))
+                query = f"""
+                    SELECT
                         table_name,
                         table_data,
                         from_date,
                         to_date,
                         use_flag
                     FROM partition_table_info
-                    WHERE table_data = 'PH'  -- point_history 타입
+                    WHERE table_data IN ({placeholders})
                     AND use_flag = true
                     AND from_date <= %s
                     AND to_date >= %s
-                    ORDER BY from_date
-                """, (
+                    ORDER BY table_data, from_date
+                """
+
+                params = tuple(table_type_codes) + (
                     self._date_to_timestamp(end_date),
                     self._date_to_timestamp(start_date)
-                ))
-                
+                )
+
+                cur.execute(query, params)
+
                 for row in cur.fetchall():
                     table_name, table_data, from_date, to_date, use_flag = row
-                    
+
                     # 날짜 범위 확인
                     partition_start = self._timestamp_to_date(from_date)
                     partition_end = self._timestamp_to_date(to_date)
-                    
+
                     # 선택된 날짜 범위와 겹치는지 확인
                     if partition_start <= end_date and partition_end >= start_date:
                         # 테이블 존재 여부 확인
                         if self._check_table_exists(cur, table_name):
                             # 행 수 조회
                             row_count = self._get_row_count(cur, table_name)
-                            
+
+                            # TableType enum으로 변환
+                            try:
+                                table_type = TableType(table_data)
+                            except ValueError:
+                                # 알 수 없는 타입은 건너뜀
+                                continue
+
                             partitions.append({
                                 'table_name': table_name,
+                                'table_type': table_type,  # TableType enum 추가
+                                'table_type_code': table_data,  # 'PH', 'TH' 등
                                 'start_date': partition_start,
                                 'end_date': partition_end,
                                 'row_count': row_count,
                                 'from_timestamp': from_date,
                                 'to_timestamp': to_date
                             })
-                            
+
             conn.close()
-            
+
         except Exception as e:
             raise Exception(f"파티션 탐색 오류: {str(e)}")
-            
+
         return partitions
         
     def get_partition_info(self, partition_name: str) -> Dict[str, Any]:

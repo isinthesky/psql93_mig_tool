@@ -5,17 +5,19 @@ from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel,
     QPushButton, QProgressBar, QTextEdit, QGroupBox,
     QCalendarWidget, QListWidget, QListWidgetItem,
-    QMessageBox, QSplitter, QWidget, QSpinBox
+    QMessageBox, QSplitter, QWidget, QSpinBox, QCheckBox
 )
 from PySide6.QtCore import Qt, QThread, Signal, QTimer, QDate
 from PySide6.QtGui import QTextCursor
 from datetime import datetime, date
+from typing import List
 
 from src.models.profile import ConnectionProfile
 from src.models.history import HistoryManager, CheckpointManager
 from src.core.migration_worker import MigrationWorker
 from src.core.copy_migration_worker import CopyMigrationWorker
 from src.core.partition_discovery import PartitionDiscovery
+from src.core.table_types import TableType, TABLE_TYPE_CONFIG, get_all_table_types
 from src.utils.enhanced_logger import log_emitter
 
 
@@ -30,7 +32,11 @@ class MigrationDialog(QDialog):
         self.worker = None
         self.history_id = None
         self.is_running = False
-        
+
+        # 선택된 테이블 타입 (기본값: Point History만)
+        self.selected_table_types: List[TableType] = [TableType.POINT_HISTORY]
+        self.table_type_checkboxes = {}  # 체크박스 저장용
+
         self.setup_ui()
         self.check_incomplete_migration()
         
@@ -90,10 +96,34 @@ class MigrationDialog(QDialog):
         QTimer.singleShot(100, self.check_connections)
         
     def create_date_selection_group(self):
-        """날짜 선택 그룹 생성"""
-        group = QGroupBox("날짜 범위 선택")
-        layout = QHBoxLayout()
-        
+        """날짜 범위 및 테이블 타입 선택 그룹 생성"""
+        group = QGroupBox("마이그레이션 설정")
+        main_layout = QVBoxLayout()
+
+        # 테이블 타입 선택 (상단)
+        table_type_layout = QHBoxLayout()
+        table_type_layout.addWidget(QLabel("테이블 타입:"))
+
+        # 각 테이블 타입별 체크박스 생성
+        for table_type in get_all_table_types():
+            config = TABLE_TYPE_CONFIG[table_type]
+            checkbox = QCheckBox(f"{config.display_name} ({table_type.value})")
+            checkbox.setToolTip(config.description)
+
+            # Point History는 기본 선택
+            if table_type == TableType.POINT_HISTORY:
+                checkbox.setChecked(True)
+
+            checkbox.stateChanged.connect(self.on_table_type_changed)
+            self.table_type_checkboxes[table_type] = checkbox
+            table_type_layout.addWidget(checkbox)
+
+        table_type_layout.addStretch()
+        main_layout.addLayout(table_type_layout)
+
+        # 날짜 선택 영역
+        date_partition_layout = QHBoxLayout()
+
         # 시작 날짜
         start_layout = QVBoxLayout()
         start_layout.addWidget(QLabel("시작 날짜:"))
@@ -101,8 +131,8 @@ class MigrationDialog(QDialog):
         self.start_calendar.setMaximumHeight(200)
         self.start_calendar.selectionChanged.connect(self.on_date_changed)
         start_layout.addWidget(self.start_calendar)
-        layout.addLayout(start_layout)
-        
+        date_partition_layout.addLayout(start_layout)
+
         # 종료 날짜
         end_layout = QVBoxLayout()
         end_layout.addWidget(QLabel("종료 날짜:"))
@@ -110,8 +140,8 @@ class MigrationDialog(QDialog):
         self.end_calendar.setMaximumHeight(200)
         self.end_calendar.selectionChanged.connect(self.on_date_changed)
         end_layout.addWidget(self.end_calendar)
-        layout.addLayout(end_layout)
-        
+        date_partition_layout.addLayout(end_layout)
+
         # 파티션 목록
         partition_layout = QVBoxLayout()
         partition_layout.addWidget(QLabel("선택된 파티션:"))
@@ -120,9 +150,11 @@ class MigrationDialog(QDialog):
         partition_layout.addWidget(self.partition_list)
         self.partition_count_label = QLabel("총 0개 파티션")
         partition_layout.addWidget(self.partition_count_label)
-        layout.addLayout(partition_layout)
-        
-        group.setLayout(layout)
+        date_partition_layout.addLayout(partition_layout)
+
+        main_layout.addLayout(date_partition_layout)
+
+        group.setLayout(main_layout)
         return group
         
     def create_progress_group(self):
@@ -276,53 +308,90 @@ class MigrationDialog(QDialog):
             if reply == QMessageBox.Yes:
                 self.resume_migration(incomplete.id)
                 
+    def on_table_type_changed(self, state):
+        """테이블 타입 체크박스 변경 이벤트"""
+        # 선택된 테이블 타입 업데이트
+        self.selected_table_types = [
+            table_type
+            for table_type, checkbox in self.table_type_checkboxes.items()
+            if checkbox.isChecked()
+        ]
+
+        # 최소 1개는 선택되어야 함
+        if not self.selected_table_types:
+            # 체크 해제한 것을 다시 체크
+            sender = self.sender()
+            if sender:
+                sender.setChecked(True)
+            QMessageBox.warning(
+                self,
+                "선택 오류",
+                "최소 1개의 테이블 타입을 선택해야 합니다."
+            )
+            return
+
+        # 파티션 목록 업데이트
+        start_date = self.start_calendar.selectedDate().toPython()
+        end_date = self.end_calendar.selectedDate().toPython()
+        if start_date <= end_date:
+            self.update_partition_list(start_date, end_date)
+
     def on_date_changed(self):
         """날짜 변경 이벤트"""
         start_date = self.start_calendar.selectedDate().toPython()
         end_date = self.end_calendar.selectedDate().toPython()
-        
+
         if start_date > end_date:
             return
-            
+
         # 파티션 목록 업데이트
         self.update_partition_list(start_date, end_date)
         
     def update_partition_list(self, start_date: date, end_date: date):
         """파티션 목록 업데이트"""
         self.partition_list.clear()
-        
+
         try:
-            # 파티션 탐색
+            # 파티션 탐색 (선택된 테이블 타입 전달)
             discovery = PartitionDiscovery(self.profile.source_config)
-            partitions = discovery.discover_partitions(start_date, end_date)
-            
+            partitions = discovery.discover_partitions(
+                start_date,
+                end_date,
+                table_types=self.selected_table_types
+            )
+
             if partitions:
+                # 테이블 타입별로 그룹화하여 표시
+                table_type_groups = {}
                 for partition in partitions:
-                    item_text = f"{partition['table_name']} ({partition['row_count']:,} rows)"
-                    item = QListWidgetItem(item_text)
-                    item.setData(Qt.UserRole, partition['table_name'])
-                    self.partition_list.addItem(item)
-                    
-                self.partition_count_label.setText(f"총 {len(partitions)}개 파티션")
-                self.add_log(f"파티션 {len(partitions)}개 발견", "INFO")
+                    table_type = partition['table_type']
+                    if table_type not in table_type_groups:
+                        table_type_groups[table_type] = []
+                    table_type_groups[table_type].append(partition)
+
+                # 각 테이블 타입별로 항목 추가
+                total_count = 0
+                for table_type in sorted(table_type_groups.keys(), key=lambda t: t.value):
+                    partitions_for_type = table_type_groups[table_type]
+                    config = TABLE_TYPE_CONFIG[table_type]
+
+                    for partition in partitions_for_type:
+                        item_text = f"[{config.display_name}] {partition['table_name']} ({partition['row_count']:,} rows)"
+                        item = QListWidgetItem(item_text)
+                        item.setData(Qt.UserRole, partition['table_name'])
+                        self.partition_list.addItem(item)
+                        total_count += 1
+
+                self.partition_count_label.setText(f"총 {total_count}개 파티션")
+                self.add_log(f"파티션 {total_count}개 발견 (타입: {len(table_type_groups)}개)", "INFO")
             else:
-                # 파티션이 없는 경우 수동 생성 (fallback)
-                self.add_log("partition_table_info에서 파티션을 찾을 수 없어 수동 생성", "WARNING")
-                current = start_date
-                manual_partitions = []
-                
-                while current <= end_date:
-                    partition_name = f"point_history_{current.strftime('%y%m%d')}"
-                    manual_partitions.append(partition_name)
-                    self.partition_list.addItem(partition_name)
-                    current = date(current.year, current.month, current.day + 1)
-                    
-                self.partition_count_label.setText(f"총 {len(manual_partitions)}개 파티션 (수동)")
-                
+                # 파티션이 없는 경우
+                self.partition_count_label.setText("총 0개 파티션")
+                self.add_log("선택한 조건에 해당하는 파티션이 없습니다", "WARNING")
+
         except Exception as e:
             self.add_log(f"파티션 탐색 오류: {str(e)}", "ERROR")
-            # 오류 시 수동 생성
-            current = start_date
+            self.partition_count_label.setText("총 0개 파티션 (오류)")
             manual_partitions = []
             
             while current <= end_date:
