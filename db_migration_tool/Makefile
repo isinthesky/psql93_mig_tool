@@ -1,131 +1,242 @@
 # DB Migration Tool - Makefile
-# uv 기반 의존성 관리 및 태스크 자동화
+# Cross-platform build automation using uv
 
-.PHONY: help install install-dev sync clean test test-cov lint format check dev build build-mac clean-build
+.DEFAULT_GOAL := help
 
-# 기본 변수
-PYTHON := uv run python
+# Platform detection
+ifeq ($(OS),Windows_NT)
+	PLATFORM := Windows
+	VENV_BIN := .venv/Scripts
+	PYTHON := $(VENV_BIN)/python.exe
+	UV := uv
+	RM := cmd /c rmdir /s /q
+	RMFILE := cmd /c del /f /q
+	MKDIR := cmd /c mkdir
+	PATHSEP := \\
+else
+	PLATFORM := $(shell uname -s)
+	VENV_BIN := .venv/bin
+	PYTHON := $(VENV_BIN)/python
+	UV := uv
+	RM := rm -rf
+	RMFILE := rm -f
+	MKDIR := mkdir -p
+	PATHSEP := /
+endif
+
+# Project variables
+APP_NAME := DBMigrationTool
+SRC_DIR := src
+DIST_DIR := dist
+BUILD_DIR := build
+SPEC_FILE_WIN := db_migration_tool.spec
+SPEC_FILE_MAC := build_mac.spec
+
+# Tool shortcuts for uv run
 PYTEST := uv run pytest
 RUFF := uv run ruff
 MYPY := uv run mypy
-PYINSTALLER := uv run pyinstaller
 
-# 색상 정의
+# Colors for output
+CYAN := \033[0;36m
 GREEN := \033[0;32m
 YELLOW := \033[0;33m
 RED := \033[0;31m
 NC := \033[0m # No Color
 
-help: ## 사용 가능한 명령어 표시
-	@echo "$(GREEN)DB Migration Tool - 개발 명령어$(NC)"
+.PHONY: help setup install install-dev install-test build clean test run check-uv
+
+help: ## Show this help message
+	@echo "$(CYAN)DB Migration Tool - Make Commands$(NC)"
 	@echo ""
-	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "  $(YELLOW)%-20s$(NC) %s\n", $$1, $$2}'
+	@echo "$(GREEN)Available targets:$(NC)"
+	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  $(CYAN)%-15s$(NC) %s\n", $$1, $$2}'
+	@echo ""
+	@echo "$(YELLOW)Platform: $(PLATFORM)$(NC)"
 
-install: ## 프로덕션 의존성 설치
-	@echo "$(GREEN)프로덕션 의존성 설치 중...$(NC)"
-	uv sync --no-dev
+check-uv: ## Check if uv is installed
+	@command -v uv >/dev/null 2>&1 || { echo "$(RED)Error: uv is not installed. Install it from https://github.com/astral-sh/uv$(NC)"; exit 1; }
+	@echo "$(GREEN)✓ uv is installed$(NC)"
 
-install-dev: ## 개발 의존성 포함 전체 설치
-	@echo "$(GREEN)개발 의존성 포함 전체 설치 중...$(NC)"
-	uv sync --all-extras
+setup: check-uv ## Setup development environment (create venv + install dependencies)
+	@echo "$(CYAN)Setting up development environment...$(NC)"
+	$(UV) venv
+	@echo "$(GREEN)✓ Virtual environment created$(NC)"
+	$(UV) pip install -e .
+	@echo "$(GREEN)✓ Core dependencies installed$(NC)"
+	@echo "$(YELLOW)Run 'make install-dev' to install development tools$(NC)"
 
-sync: ## 의존성 동기화 (uv.lock 기반)
-	@echo "$(GREEN)의존성 동기화 중...$(NC)"
+install: check-uv ## Install core dependencies only
+	@echo "$(CYAN)Installing core dependencies...$(NC)"
+	$(UV) pip install -e .
+	@echo "$(GREEN)✓ Dependencies installed$(NC)"
+
+install-dev: check-uv ## Install development dependencies (PyInstaller, ruff, mypy)
+	@echo "$(CYAN)Installing development dependencies...$(NC)"
+	$(UV) pip install -e ".[dev]"
+	@echo "$(GREEN)✓ Development dependencies installed$(NC)"
+
+install-test: check-uv ## Install test dependencies
+	@echo "$(CYAN)Installing test dependencies...$(NC)"
+	$(UV) pip install -e ".[test]"
+	@echo "$(GREEN)✓ Test dependencies installed$(NC)"
+
+install-all: check-uv ## Install all dependencies (core + dev + test)
+	@echo "$(CYAN)Installing all dependencies...$(NC)"
+	$(UV) pip install -e ".[dev,test]"
+	@echo "$(GREEN)✓ All dependencies installed$(NC)"
+
+sync: check-uv ## Sync dependencies (based on uv.lock)
+	@echo "$(CYAN)Syncing dependencies...$(NC)"
 	uv sync
+	@echo "$(GREEN)✓ Dependencies synced$(NC)"
 
-clean: ## 빌드 아티팩트 및 캐시 삭제
-	@echo "$(YELLOW)빌드 아티팩트 제거 중...$(NC)"
-	rm -rf build/
-	rm -rf dist/
-	rm -rf *.egg-info
-	rm -rf .pytest_cache
-	rm -rf .ruff_cache
-	rm -rf .mypy_cache
-	rm -rf htmlcov/
-	rm -rf .coverage
-	find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
-	find . -type f -name "*.pyc" -delete
-	find . -type f -name "*.pyo" -delete
-	@echo "$(GREEN)정리 완료$(NC)"
+build: install-dev ## Build executable with PyInstaller
+ifeq ($(PLATFORM),Windows)
+	@echo "$(CYAN)Building Windows executable...$(NC)"
+	@if not exist $(SPEC_FILE_WIN) ( \
+		echo "$(YELLOW)Generating PyInstaller spec file...$(NC)" && \
+		$(PYTHON) -m PyInstaller --name=$(APP_NAME) \
+			--windowed \
+			--onefile \
+			--icon=resources/icons/app.ico \
+			--add-data "resources;resources" \
+			$(SRC_DIR)/main.py \
+	)
+	@echo "$(CYAN)Running PyInstaller...$(NC)"
+	$(PYTHON) -m PyInstaller $(SPEC_FILE_WIN) --clean
+	@if exist $(DIST_DIR)\$(APP_NAME).exe ( \
+		echo "$(GREEN)✓ Build successful: $(DIST_DIR)\$(APP_NAME).exe$(NC)" \
+	) else ( \
+		echo "$(RED)✗ Build failed$(NC)" && exit 1 \
+	)
+else
+	@echo "$(CYAN)Building macOS application...$(NC)"
+	@if [ ! -f $(SPEC_FILE_MAC) ]; then \
+		echo "$(YELLOW)Generating PyInstaller spec file...$(NC)"; \
+		$(PYTHON) -m PyInstaller --name="DB Migration Tool" \
+			--windowed \
+			--onefile \
+			--icon=resources/icons/app.icns \
+			--add-data "resources:resources" \
+			$(SRC_DIR)/main.py; \
+	fi
+	@echo "$(CYAN)Running PyInstaller...$(NC)"
+	$(PYTHON) -m PyInstaller $(SPEC_FILE_MAC) --clean
+	@if [ -d "$(DIST_DIR)/DB Migration Tool.app" ]; then \
+		echo "$(GREEN)✓ Build successful: $(DIST_DIR)/DB Migration Tool.app$(NC)"; \
+	else \
+		echo "$(RED)✗ Build failed$(NC)"; exit 1; \
+	fi
+endif
 
-test: ## 테스트 실행
-	@echo "$(GREEN)테스트 실행 중...$(NC)"
-	$(PYTEST) tests/ -v --tb=short
-
-test-cov: ## 커버리지 포함 테스트 실행
-	@echo "$(GREEN)커버리지 포함 테스트 실행 중...$(NC)"
-	$(PYTEST) tests/ -v --tb=short --cov=src --cov-report=term-missing --cov-report=html
-	@echo "$(GREEN)커버리지 리포트: htmlcov/index.html$(NC)"
-
-test-unit: ## 단위 테스트만 실행
-	@echo "$(GREEN)단위 테스트 실행 중...$(NC)"
-	$(PYTEST) tests/ -v -m unit
-
-test-integration: ## 통합 테스트만 실행
-	@echo "$(GREEN)통합 테스트 실행 중...$(NC)"
-	$(PYTEST) tests/ -v -m integration
-
-lint: ## 코드 린트 검사 (ruff)
-	@echo "$(GREEN)Ruff 린트 검사 중...$(NC)"
-	$(RUFF) check src/ tests/
-
-lint-fix: ## 코드 린트 자동 수정
-	@echo "$(GREEN)Ruff 자동 수정 중...$(NC)"
-	$(RUFF) check --fix src/ tests/
-
-format: ## 코드 포맷팅 (ruff)
-	@echo "$(GREEN)코드 포맷팅 중...$(NC)"
-	$(RUFF) format src/ tests/
-
-format-check: ## 포맷팅 검사 (수정 없이)
-	@echo "$(GREEN)포맷팅 검사 중...$(NC)"
-	$(RUFF) format --check src/ tests/
-
-typecheck: ## 타입 체크 (mypy)
-	@echo "$(GREEN)타입 체크 중...$(NC)"
-	$(MYPY) src/
-
-check: format-check lint typecheck ## 전체 코드 품질 검사 (format + lint + typecheck)
-	@echo "$(GREEN)모든 검사 통과!$(NC)"
-
-dev: ## 개발 모드로 애플리케이션 실행
-	@echo "$(GREEN)개발 모드 실행 중...$(NC)"
-	$(PYTHON) src/main.py
-
-build-mac: clean ## macOS용 애플리케이션 빌드
-	@echo "$(GREEN)macOS 애플리케이션 빌드 중...$(NC)"
+build-mac: clean ## macOS build using shell script
+	@echo "$(CYAN)Building macOS application...$(NC)"
 	chmod +x build_mac.sh
 	./build_mac.sh
-	@echo "$(GREEN)빌드 완료: dist/DB\ Migration\ Tool.app$(NC)"
+	@echo "$(GREEN)✓ Build complete: dist/DB Migration Tool.app$(NC)"
 
-build: clean ## PyInstaller로 빌드 (기본)
-	@echo "$(GREEN)PyInstaller 빌드 중...$(NC)"
-	$(PYINSTALLER) db_migration_tool.spec
-	@echo "$(GREEN)빌드 완료: dist/$(NC)"
+test: install-test ## Run tests with pytest
+	@echo "$(CYAN)Running tests...$(NC)"
+	$(PYTEST) tests/ -v --tb=short
+	@echo "$(GREEN)✓ Tests completed$(NC)"
 
-clean-build: clean build ## 클린 빌드 (전체 정리 후 빌드)
+test-cov: install-test ## Run tests with coverage report
+	@echo "$(CYAN)Running tests with coverage...$(NC)"
+	$(PYTEST) tests/ -v --tb=short --cov=$(SRC_DIR) --cov-report=html --cov-report=term-missing
+	@echo "$(GREEN)✓ Coverage report generated in htmlcov/$(NC)"
 
-ci: install-dev check test ## CI 파이프라인 시뮬레이션
+test-unit: ## Run unit tests only
+	@echo "$(CYAN)Running unit tests...$(NC)"
+	$(PYTEST) tests/ -v -m unit
 
-# 버전 정보 표시
-version: ## 프로젝트 버전 표시
-	@echo "$(GREEN)DB Migration Tool$(NC)"
-	@$(PYTHON) -c "import toml; print('Version:', toml.load('pyproject.toml')['project']['version'])" 2>/dev/null || echo "Version: 1.0.0"
+test-integration: ## Run integration tests only
+	@echo "$(CYAN)Running integration tests...$(NC)"
+	$(PYTEST) tests/ -v -m integration
 
-# 의존성 트리 표시
-deps: ## 의존성 트리 표시
-	@echo "$(GREEN)의존성 트리:$(NC)"
+lint: ## Check code with ruff
+	@echo "$(CYAN)Running ruff lint...$(NC)"
+	$(RUFF) check $(SRC_DIR)/ tests/
+
+lint-fix: ## Auto-fix lint issues
+	@echo "$(CYAN)Running ruff auto-fix...$(NC)"
+	$(RUFF) check --fix $(SRC_DIR)/ tests/
+
+format: ## Format code with ruff
+	@echo "$(CYAN)Formatting code...$(NC)"
+	$(RUFF) format $(SRC_DIR)/ tests/
+
+format-check: ## Check formatting (no changes)
+	@echo "$(CYAN)Checking format...$(NC)"
+	$(RUFF) format --check $(SRC_DIR)/ tests/
+
+typecheck: ## Type check with mypy
+	@echo "$(CYAN)Running mypy...$(NC)"
+	$(MYPY) $(SRC_DIR)/
+
+check: format-check lint typecheck ## Run all quality checks (format + lint + typecheck)
+	@echo "$(GREEN)✓ All checks passed!$(NC)"
+
+run: ## Run application in development mode
+	@echo "$(CYAN)Running application...$(NC)"
+	$(PYTHON) $(SRC_DIR)/main.py
+
+dev: run ## Alias for run
+
+clean: ## Clean build artifacts and cache
+	@echo "$(CYAN)Cleaning build artifacts...$(NC)"
+ifeq ($(PLATFORM),Windows)
+	@if exist $(DIST_DIR) $(RM) $(DIST_DIR)
+	@if exist $(BUILD_DIR) $(RM) $(BUILD_DIR)
+	@if exist __pycache__ $(RM) __pycache__
+	@if exist $(SRC_DIR)\__pycache__ $(RM) $(SRC_DIR)\__pycache__
+	@if exist *.spec $(RMFILE) *.spec
+	@for /d /r %%i in (__pycache__) do @if exist "%%i" $(RM) "%%i"
+	@for /d /r %%i in (*.egg-info) do @if exist "%%i" $(RM) "%%i"
+else
+	$(RM) $(DIST_DIR) $(BUILD_DIR)
+	$(RM) .pytest_cache .ruff_cache .mypy_cache htmlcov .coverage
+	find . -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
+	find . -type d -name "*.egg-info" -exec rm -rf {} + 2>/dev/null || true
+	find . -type f -name "*.pyc" -delete
+endif
+	@echo "$(GREEN)✓ Cleaned$(NC)"
+
+clean-all: clean ## Clean everything including venv
+	@echo "$(CYAN)Cleaning virtual environment...$(NC)"
+ifeq ($(PLATFORM),Windows)
+	@if exist .venv $(RM) .venv
+else
+	$(RM) .venv
+endif
+	@echo "$(GREEN)✓ All cleaned$(NC)"
+
+ci: install-all check test ## CI pipeline simulation
+
+deps: ## Show dependency tree
+	@echo "$(CYAN)Dependency tree:$(NC)"
 	uv tree
 
-# 의존성 업데이트
-update: ## 의존성 업데이트
-	@echo "$(YELLOW)의존성 업데이트 중...$(NC)"
+update: ## Update dependencies
+	@echo "$(YELLOW)Updating dependencies...$(NC)"
 	uv lock --upgrade
-	@echo "$(GREEN)uv.lock 업데이트 완료$(NC)"
+	@echo "$(GREEN)✓ uv.lock updated$(NC)"
 
-# Python 버전 확인
-python-version: ## Python 버전 확인
-	@echo "$(GREEN)Python 버전:$(NC)"
+version: ## Show project version
+	@echo "$(CYAN)DB Migration Tool$(NC)"
+	@$(PYTHON) -c "import toml; print('Version:', toml.load('pyproject.toml')['project']['version'])" 2>/dev/null || echo "Version: 1.0.0"
+
+python-version: ## Show Python version
+	@echo "$(CYAN)Python version:$(NC)"
 	@$(PYTHON) --version
-	@echo "$(GREEN)uv 버전:$(NC)"
+	@echo "$(CYAN)uv version:$(NC)"
 	@uv --version
+
+.PHONY: info
+info: ## Show project information
+	@echo "$(CYAN)Project Information$(NC)"
+	@echo "  Name: DB Migration Tool"
+	@echo "  Platform: $(PLATFORM)"
+	@echo "  Python: $(PYTHON)"
+	@echo "  Source: $(SRC_DIR)"
+	@echo "  Dist: $(DIST_DIR)"

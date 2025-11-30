@@ -23,7 +23,11 @@
       "Bash(python3:*)",
       "Bash(uv run ruff check:*)",
       "Bash(uv pip:*)",
-      "Bash(uv pip install:*)"
+      "Bash(uv pip install:*)",
+      "Bash(build.bat)",
+      "Bash(cmd /c \"cd db_migration_tool && build.bat\")",
+      "Bash(dir:*)",
+      "Bash(nul)"
     ],
     "deny": []
   }
