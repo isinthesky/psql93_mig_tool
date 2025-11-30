@@ -5,7 +5,7 @@ PostgreSQL COPY 명령 기반 고성능 마이그레이션 워커
 import threading
 import time
 from queue import Empty, Queue
-from typing import Any
+from typing import Any, Union
 
 import psycopg2
 from PySide6.QtCore import Signal
@@ -13,6 +13,7 @@ from PySide6.QtCore import Signal
 from src.core.base_migration_worker import BaseMigrationWorker
 from src.core.performance_metrics import PerformanceMetrics
 from src.core.table_creator import TableCreator
+from src.core.table_types import TABLE_TYPE_CONFIG, get_table_type
 from src.database.postgres_utils import PostgresOptimizer
 from src.database.version_info import PgVersionInfo
 from src.models.profile import ConnectionProfile
@@ -29,22 +30,28 @@ class CopyStreamBuffer:
     """
 
     def __init__(self, max_queue_size: int = 8):
-        self.queue: Queue[str | None] = Queue(maxsize=max_queue_size)
-        self.last_path_id: int | None = None
-        self.last_issued_date: int | None = None
+        self.queue: Queue[Union[str, bytes, None]] = Queue(maxsize=max_queue_size)
+        self.last_key: str | None = None
+        self.last_date: str | None = None
         self.row_count: int = 0
         self.total_bytes: int = 0
         self._partial_line: str = ""
         self._closed = False
         self.error: Exception | None = None
 
-    def write(self, data: str):
+    def write(self, data: Union[str, bytes]):
         """COPY OUT이 호출하는 write; 청크를 큐에 적재"""
         if self._closed:
             return
 
-        self._track_last_row(data)
-        self.total_bytes += len(data.encode("utf-8"))
+        # psycopg2는 bytes를 줄 수 있으므로 문자열로 변환
+        if isinstance(data, bytes):
+            data_str = data.decode("utf-8")
+        else:
+            data_str = data
+
+        self._track_last_row(data_str)
+        self.total_bytes += len(data_str.encode("utf-8"))
         self.queue.put(data)
 
     def read(self, size: int = -1) -> str:
@@ -70,8 +77,14 @@ class CopyStreamBuffer:
                 self._closed = True
                 break
 
-            chunks.append(chunk)
-            bytes_read += len(chunk)
+            # psycopg2 COPY IN은 str을 기대하므로 bytes면 디코드
+            if isinstance(chunk, bytes):
+                chunk_str = chunk.decode("utf-8")
+            else:
+                chunk_str = chunk
+
+            chunks.append(chunk_str)
+            bytes_read += len(chunk_str)
 
             if size > 0 and bytes_read >= size:
                 break
@@ -107,9 +120,9 @@ class CopyStreamBuffer:
             self.row_count += 1
             parts = line.split(",")
             try:
-                self.last_path_id = int(parts[0])
-                self.last_issued_date = int(parts[1])
-            except (ValueError, IndexError):
+                self.last_key = parts[0]
+                self.last_date = parts[1]
+            except (IndexError):
                 continue
 
     def _finalize_partial_line(self):
@@ -123,9 +136,9 @@ class CopyStreamBuffer:
         self.row_count += 1
         parts = line.split(",")
         try:
-            self.last_path_id = int(parts[0])
-            self.last_issued_date = int(parts[1])
-        except (ValueError, IndexError):
+            self.last_key = parts[0]
+            self.last_date = parts[1]
+        except (IndexError):
             pass
 
 
@@ -322,6 +335,31 @@ class CopyMigrationWorker(BaseMigrationWorker):
 
         self.log.emit("COPY 권한 확인 완료", "INFO")
 
+    def _detect_table_type(self, partition_name: str):
+        """파티션명에서 테이블 타입 추론 (부모 테이블 기준)"""
+        parent_table = "_".join(partition_name.split("_")[:-1])
+        try:
+            return get_table_type(parent_table)
+        except Exception:
+            # 기본값: POINT_HISTORY
+            return get_table_type("point_history")
+
+    @staticmethod
+    def _format_literal(value: Any, is_timestamp: bool) -> str:
+        """값을 SQL 리터럴로 변환 (재개 조건용)"""
+        if value is None:
+            return "NULL"
+        if not is_timestamp:
+            try:
+                int_val = int(value)
+                return str(int_val)
+            except (TypeError, ValueError):
+                pass
+        safe = str(value).replace("'", "''")
+        if is_timestamp:
+            return f"'{safe}'::timestamp"
+        return f"'{safe}'"
+
     def _migrate_partition_with_copy(self, partition_name: str, checkpoint: Any):
         """COPY 명령을 사용한 파티션 마이그레이션 (청크 단위 처리)"""
         self.log.emit(f"{partition_name} COPY 마이그레이션 시작 (배치 크기: {self.batch_size:,})", "INFO")
@@ -401,92 +439,101 @@ class CopyMigrationWorker(BaseMigrationWorker):
             if accumulated_rows:
                 self.performance_metrics.current_partition_rows = accumulated_rows
 
-            # 청크 단위 처리 루프
-            while self.is_running:
-                # WHERE 절 구성
-                where_clause = ""
-                if last_path_id is not None:
-                    where_clause = (
-                        f"WHERE path_id > {last_path_id} OR "
-                        f"(path_id = {last_path_id} AND issued_date > '{last_issued_date}')"
-                    )
+        # 테이블 타입/컬럼 구성
+        table_type = self._detect_table_type(partition_name)
+        table_config = TABLE_TYPE_CONFIG[table_type]
+        columns_csv = ", ".join(table_config.columns)
+        key_column = table_config.columns[0]
+        date_column = table_config.date_column
+        is_timestamp_date = table_config.date_is_timestamp
 
-                # LIMIT를 사용한 부분 쿼리
-                copy_to_query = f"""
-                    COPY (
-                        SELECT path_id, issued_date, changed_value,
-                               COALESCE(connection_status::text, 'true') as connection_status
-                        FROM {partition_name}
-                        {where_clause}
-                        ORDER BY path_id, issued_date
-                        LIMIT {self.batch_size}
-                    ) TO STDOUT WITH (FORMAT CSV, HEADER FALSE, NULL 'NULL')
-                """
+        # 청크 단위 처리 루프
+        while self.is_running:
+            # WHERE 절 구성
+            where_clause = ""
+            if last_path_id is not None:
+                key_literal = self._format_literal(last_path_id, is_timestamp=False)
+                date_literal = self._format_literal(last_issued_date, is_timestamp_date)
+                where_clause = (
+                    f"WHERE {key_column} > {key_literal} OR "
+                    f"({key_column} = {key_literal} AND {date_column} > {date_literal})"
+                )
 
-                copy_from_query = f"""
-                    COPY {partition_name} (path_id, issued_date, changed_value, connection_status)
-                    FROM STDIN WITH (FORMAT CSV, HEADER FALSE, NULL 'NULL')
-                """
+            # LIMIT를 사용한 부분 쿼리
+            copy_to_query = f"""
+                COPY (
+                    SELECT {columns_csv}
+                    FROM {partition_name}
+                    {where_clause}
+                    ORDER BY {key_column}, {date_column}
+                    LIMIT {self.batch_size}
+                ) TO STDOUT WITH (FORMAT CSV, HEADER FALSE, NULL 'NULL')
+            """
 
-                stream_buffer = CopyStreamBuffer()
+            copy_from_query = f"""
+                COPY {partition_name} ({columns_csv})
+                FROM STDIN WITH (FORMAT CSV, HEADER FALSE, NULL 'NULL')
+            """
 
-                # 소스 → 대상 스트리밍 (큐 기반)
-                def copy_out():
-                    try:
-                        with self.source_conn.cursor() as source_cursor:
-                            source_cursor.copy_expert(copy_to_query, stream_buffer)
-                    except Exception as exc:
-                        stream_buffer.set_error(exc)
-                    finally:
-                        stream_buffer.close()
+            stream_buffer = CopyStreamBuffer()
 
-                producer_thread = threading.Thread(target=copy_out, daemon=True)
-                producer_thread.start()
+            # 소스 → 대상 스트리밍 (큐 기반)
+            def copy_out():
+                try:
+                    with self.source_conn.cursor() as source_cursor:
+                        source_cursor.copy_expert(copy_to_query, stream_buffer)
+                except Exception as exc:
+                    stream_buffer.set_error(exc)
+                finally:
+                    stream_buffer.close()
 
-                # 대상 COPY IN (stream_buffer.read 사용)
-                with self.target_conn.cursor() as target_cursor:
-                    try:
-                        target_cursor.copy_expert(copy_from_query, stream_buffer)
-                    except Exception as exc:
-                        stream_buffer.set_error(exc)
-                        raise
+            producer_thread = threading.Thread(target=copy_out, daemon=True)
+            producer_thread.start()
 
-                producer_thread.join()
+            # 대상 COPY IN (stream_buffer.read 사용)
+            with self.target_conn.cursor() as target_cursor:
+                try:
+                    target_cursor.copy_expert(copy_from_query, stream_buffer)
+                except Exception as exc:
+                    stream_buffer.set_error(exc)
+                    raise
 
-                if stream_buffer.error:
-                    raise stream_buffer.error
+            producer_thread.join()
 
-                # COPY FROM 트랜잭션 커밋
-                self.target_conn.commit()
+            if stream_buffer.error:
+                raise stream_buffer.error
 
-                copied_rows = stream_buffer.row_count
+            # COPY FROM 트랜잭션 커밋
+            self.target_conn.commit()
 
-                # 데이터가 없으면 완료
-                if copied_rows == 0:
-                    break
+            copied_rows = stream_buffer.row_count
 
-                # 트래커에서 마지막 키 값 가져오기
-                if stream_buffer.last_path_id is not None:
-                    last_path_id = stream_buffer.last_path_id
-                    last_issued_date = stream_buffer.last_issued_date
+            # 데이터가 없으면 완료
+            if copied_rows == 0:
+                break
 
-                # 누적 행 수 업데이트
-                accumulated_rows += copied_rows
+            # 트래커에서 마지막 키 값 가져오기
+            if stream_buffer.last_key is not None:
+                last_path_id = stream_buffer.last_key
+                last_issued_date = stream_buffer.last_date
 
-                # 성능 지표 업데이트
-                self.performance_metrics.update(copied_rows, stream_buffer.total_bytes)
+            # 누적 행 수 업데이트
+            accumulated_rows += copied_rows
 
-                # 체크포인트 업데이트 (중간 저장)
-                if checkpoint:
-                    self.checkpoint_manager.update_checkpoint_status(
-                        checkpoint.id,
-                        "running",
-                        rows_processed=accumulated_rows,
-                        last_path_id=last_path_id,
-                        last_issued_date=last_issued_date,
-                        copy_method="COPY",
-                        bytes_transferred=self.performance_metrics.total_bytes,
-                    )
+            # 성능 지표 업데이트
+            self.performance_metrics.update(copied_rows, stream_buffer.total_bytes)
+
+            # 체크포인트 업데이트 (중간 저장)
+            if checkpoint:
+                self.checkpoint_manager.update_checkpoint_status(
+                    checkpoint.id,
+                    "running",
+                    rows_processed=accumulated_rows,
+                    last_path_id=last_path_id,
+                    last_issued_date=last_issued_date,
+                    copy_method="COPY",
+                    bytes_transferred=self.performance_metrics.total_bytes,
+                )
 
                 # 성능 지표 전송
                 self._emit_performance_metrics()

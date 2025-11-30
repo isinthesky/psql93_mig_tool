@@ -34,7 +34,7 @@ class TableCreator:
             parent_table = '_'.join(partition_name.split('_')[:-1])
 
             # 소스에서 파티션 정보 가져오기
-            partition_info = self._get_partition_info(partition_name)
+            partition_info = self._get_partition_info(partition_name, parent_table)
             if not partition_info:
                 raise Exception(f"파티션 정보를 찾을 수 없습니다: {partition_name}")
 
@@ -66,7 +66,7 @@ class TableCreator:
             traceback.print_exc()
             raise Exception(f"테이블 생성 오류: {str(e)}")
 
-    def _get_partition_info(self, partition_name: str) -> Dict[str, Any]:
+    def _get_partition_info(self, partition_name: str, parent_table: str) -> Dict[str, Any]:
         """
         소스에서 파티션 정보 조회
 
@@ -103,24 +103,38 @@ class TableCreator:
             # partition_table_info에 없으면 파티션 이름에서 추측
             # 날짜 추출 (예: point_history_221026 -> 22, 10, 26)
             parts = partition_name.split("_")
+            table_type = None
+
+            # parent_table 기반으로 테이블 타입 추론
+            try:
+                table_type = get_table_type(parent_table)
+            except Exception:
+                table_type = TableType.POINT_HISTORY
+
             if len(parts) >= 3 and len(parts[-1]) == 6:
-                date_str = parts[-1]  # 221026
+                # yymmdd 형태
+                date_str = parts[-1]  # 예: 221026
                 year = 2000 + int(date_str[:2])
                 month = int(date_str[2:4])
                 day = int(date_str[4:6])
 
-                # 시작과 종료 타임스탬프 계산
                 from_date = datetime(year, month, day, 0, 0, 0)
                 to_date = datetime(year, month, day, 23, 59, 59, 999000)
 
                 return {
-                    'table_data': 'PH',
-                    'table_type': TableType.POINT_HISTORY,
+                    'table_data': table_type.value,
+                    'table_type': table_type,
                     'from_date': int(from_date.timestamp() * 1000),
                     'to_date': int(to_date.timestamp() * 1000)
                 }
 
-            return None
+            # 날짜 파싱이 안 되는 경우라도 테이블 타입만 설정해 반환
+            return {
+                'table_data': table_type.value,
+                'table_type': table_type,
+                'from_date': None,
+                'to_date': None,
+            }
 
     def _check_parent_table_exists(self, parent_table: str) -> bool:
         """부모 테이블 존재 확인"""
@@ -230,33 +244,52 @@ class TableCreator:
                 raise Exception(f"알 수 없는 테이블 타입: {parent_table}")
 
         config = TABLE_TYPE_CONFIG[table_type]
-        from_date = partition_info['from_date']
-        to_date = partition_info['to_date']
+        from_date = partition_info.get('from_date')
+        to_date = partition_info.get('to_date')
 
         with self.target_conn.cursor() as cur:
             # CHECK constraint 생성
-            date_check = f"""CHECK({config.date_column} >= {from_date}
-                          AND {config.date_column} <= {to_date})"""
+            date_check = None
+            if from_date is not None and to_date is not None:
+                if config.date_is_timestamp:
+                    # 밀리초 → timestamp 변환 후 비교 (9.3 호환)
+                    from_ts = f"to_timestamp({from_date}::double precision / 1000)"
+                    to_ts = f"to_timestamp({to_date}::double precision / 1000)"
+                    date_check = (
+                        f"CHECK({config.date_column} >= {from_ts} "
+                        f"AND {config.date_column} <= {to_ts})"
+                    )
+                else:
+                    date_check = (
+                        f"CHECK({config.date_column} >= {from_date} "
+                        f"AND {config.date_column} <= {to_date})"
+                    )
 
             # 테이블 타입별 constraint 추가
             constraints = []
 
             if table_type == TableType.POINT_HISTORY:
                 # PH: PRIMARY KEY 추가
-                constraints.append(f"CONSTRAINT {partition_name}_pkey PRIMARY KEY(path_id, issued_date)")
-                constraints.append(f"CONSTRAINT {partition_name}_issued_date_check {date_check}")
+                constraints.append(
+                    f"CONSTRAINT {partition_name}_pkey PRIMARY KEY(path_id, issued_date)"
+                )
+                if date_check:
+                    constraints.append(f"CONSTRAINT {partition_name}_issued_date_check {date_check}")
 
             elif table_type == TableType.TREND_HISTORY:
                 # TH: CHECK만
-                constraints.append(f"CONSTRAINT {partition_name}_issued_date_check {date_check}")
+                if date_check:
+                    constraints.append(f"CONSTRAINT {partition_name}_issued_date_check {date_check}")
 
             elif table_type == TableType.ENERGY_DISPLAY:
                 # ED: CHECK만 (timestamp 타입)
-                constraints.append(f"CONSTRAINT {partition_name}_issued_date_check {date_check}")
+                if date_check:
+                    constraints.append(f"CONSTRAINT {partition_name}_issued_date_check {date_check}")
 
             elif table_type == TableType.RUNNING_TIME_HISTORY:
                 # RT: CHECK만
-                constraints.append(f"CONSTRAINT {partition_name}_issued_date_check {date_check}")
+                if date_check:
+                    constraints.append(f"CONSTRAINT {partition_name}_issued_date_check {date_check}")
 
             # CREATE TABLE 문 생성
             if constraints:
@@ -429,14 +462,14 @@ class TableCreator:
             table_type: 테이블 타입
             cursor: 데이터베이스 커서
         """
-        # 인덱스 생성
-        cursor.execute(f"""
-            CREATE INDEX IF NOT EXISTS {parent_table}_path_id_date
-            ON {parent_table} USING btree (path_id, issued_date);
-
-            CREATE INDEX IF NOT EXISTS {parent_table}_path_id_idx
-            ON {parent_table} USING btree (path_id);
-        """)
+        # 인덱스 생성 (9.3 호환: IF NOT EXISTS 미지원 → 중복은 예외 무시)
+        self._create_indexes(
+            cursor,
+            [
+                f"CREATE INDEX {parent_table}_path_id_date ON {parent_table} USING btree (path_id, issued_date)",
+                f"CREATE INDEX {parent_table}_path_id_idx ON {parent_table} USING btree (path_id)",
+            ],
+        )
 
         # 트리거 함수 생성
         cursor.execute(f"""
@@ -477,36 +510,36 @@ class TableCreator:
             table_type: 테이블 타입
             cursor: 데이터베이스 커서
         """
-        # 테이블 타입별 인덱스
+        # 테이블 타입별 인덱스 (9.3 호환: IF NOT EXISTS 미지원 → 중복은 예외 무시)
         if table_type == TableType.POINT_HISTORY or table_type == TableType.TREND_HISTORY:
             # PH, TH: path_id + issued_date 인덱스
-            cursor.execute(f"""
-                CREATE INDEX IF NOT EXISTS {parent_table}_path_id_date
-                ON {parent_table} USING btree (path_id, issued_date);
-
-                CREATE INDEX IF NOT EXISTS {parent_table}_path_id_idx
-                ON {parent_table} USING btree (path_id);
-            """)
+            self._create_indexes(
+                cursor,
+                [
+                    f"CREATE INDEX {parent_table}_path_id_date ON {parent_table} USING btree (path_id, issued_date)",
+                    f"CREATE INDEX {parent_table}_path_id_idx ON {parent_table} USING btree (path_id)",
+                ],
+            )
 
         elif table_type == TableType.ENERGY_DISPLAY:
             # ED: sensor_id + issued_date 인덱스
-            cursor.execute(f"""
-                CREATE INDEX IF NOT EXISTS {parent_table}_sensor_id_date
-                ON {parent_table} USING btree (sensor_id, issued_date);
-
-                CREATE INDEX IF NOT EXISTS {parent_table}_station_id_idx
-                ON {parent_table} USING btree (station_id);
-            """)
+            self._create_indexes(
+                cursor,
+                [
+                    f"CREATE INDEX {parent_table}_sensor_id_date ON {parent_table} USING btree (sensor_id, issued_date)",
+                    f"CREATE INDEX {parent_table}_station_id_idx ON {parent_table} USING btree (station_id)",
+                ],
+            )
 
         elif table_type == TableType.RUNNING_TIME_HISTORY:
             # RT: path_id + issued_date 인덱스
-            cursor.execute(f"""
-                CREATE INDEX IF NOT EXISTS {parent_table}_path_id_date
-                ON {parent_table} USING btree (path_id, issued_date);
-
-                CREATE INDEX IF NOT EXISTS {parent_table}_path_id_idx
-                ON {parent_table} USING btree (path_id);
-            """)
+            self._create_indexes(
+                cursor,
+                [
+                    f"CREATE INDEX {parent_table}_path_id_date ON {parent_table} USING btree (path_id, issued_date)",
+                    f"CREATE INDEX {parent_table}_path_id_idx ON {parent_table} USING btree (path_id)",
+                ],
+            )
 
     def _create_rule_for_partition(
         self,
@@ -531,39 +564,56 @@ class TableCreator:
         to_date = partition_info['to_date']
 
         # 날짜 조건 생성 (타입에 따라 다름)
-        if config.date_is_timestamp:
-            # timestamp 타입 (energy_display)
-            # bigint timestamp를 timestamp로 변환
-            from_dt = datetime.fromtimestamp(from_date / 1000)
-            to_dt = datetime.fromtimestamp(to_date / 1000)
+        date_condition = None
+        if from_date is not None and to_date is not None:
+            if config.date_is_timestamp:
+                # timestamp 타입 (energy_display)
+                # bigint timestamp를 timestamp로 변환
+                from_dt = datetime.fromtimestamp(from_date / 1000)
+                to_dt = datetime.fromtimestamp(to_date / 1000)
 
-            date_condition = f"""(new.{config.date_column} >= '{from_dt.strftime('%Y-%m-%d %H:%M:%S')}'::timestamp without time zone)
-            AND (new.{config.date_column} <= '{to_dt.strftime('%Y-%m-%d %H:%M:%S')}'::timestamp without time zone)"""
-        else:
-            # bigint 타입 (point_history, trend_history, running_time_history)
-            date_condition = f"""(new.{config.date_column} >= '{from_date}'::bigint)
-            AND (new.{config.date_column} <= '{to_date}'::bigint)"""
+                date_condition = f"""(new.{config.date_column} >= '{from_dt.strftime('%Y-%m-%d %H:%M:%S')}'::timestamp without time zone)
+                AND (new.{config.date_column} <= '{to_dt.strftime('%Y-%m-%d %H:%M:%S')}'::timestamp without time zone)"""
+            else:
+                # bigint 타입 (point_history, trend_history, running_time_history)
+                date_condition = f"""(new.{config.date_column} >= '{from_date}'::bigint)
+                AND (new.{config.date_column} <= '{to_date}'::bigint)"""
 
         # 컬럼 리스트 생성
         columns = ', '.join(config.columns)
         values = ', '.join([f'new.{col}' for col in config.columns])
 
-        # RULE 생성 SQL
-        rule_name = f"rule_{partition_name}"
+        # RULE 생성 SQL (날짜 범위가 없으면 RULE 생성을 건너뜀)
+        if date_condition:
+            rule_name = f"rule_{partition_name}"
 
-        # 기존 RULE 제거 (있다면)
-        cursor.execute(f"""
-            DROP RULE IF EXISTS {rule_name} ON {parent_table};
-        """)
-        print(f"  - RULE 재생성: {rule_name} (기존 RULE 삭제 후 생성)")
+            # 기존 RULE 제거 (있다면)
+            cursor.execute(f"""
+                DROP RULE IF EXISTS {rule_name} ON {parent_table};
+            """)
+            print(f"  - RULE 재생성: {rule_name} (기존 RULE 삭제 후 생성)")
 
-        # 새 RULE 생성
-        rule_sql = f"""
-            CREATE RULE {rule_name} AS
-            ON INSERT TO {parent_table}
-            WHERE {date_condition}
-            DO INSTEAD INSERT INTO {partition_name} ({columns})
-            VALUES ({values});
-        """
+            rule_sql = f"""
+                CREATE RULE {rule_name} AS
+                ON INSERT TO {parent_table}
+                WHERE {date_condition}
+                DO INSTEAD INSERT INTO {partition_name} ({columns})
+                VALUES ({values});
+            """
 
-        cursor.execute(rule_sql)
+            cursor.execute(rule_sql)
+        else:
+            print(f"  ⚠ RULE 생성을 건너뜀(날짜 범위 없음): {partition_name}")
+
+    def _create_indexes(self, cursor, statements: list[str]):
+        """IF NOT EXISTS가 없는 환경(9.3)에서도 안전하게 인덱스 생성"""
+        for stmt in statements:
+            try:
+                cursor.execute(stmt)
+            except psycopg.errors.DuplicateObject:
+                # 이미 존재하는 경우 무시
+                print(f"  ⚠ 인덱스 생성 스킵(이미 존재): {stmt.split()[2]}")
+            except psycopg.errors.InsufficientPrivilege:
+                print(f"  ⚠ 인덱스 생성 실패(권한 부족): {stmt}")
+            except Exception as exc:
+                print(f"  ⚠ 인덱스 생성 실패: {stmt} - {type(exc).__name__}: {exc}")

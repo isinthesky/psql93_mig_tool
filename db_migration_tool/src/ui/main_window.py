@@ -115,8 +115,8 @@ class MainWindow(QMainWindow):
 
         toolbar.addSeparator()
 
-        # 마이그레이션 시작 액션
-        migrate_action = QAction("마이그레이션 시작", self)
+        # 마이그레이션 작업 설정 액션
+        migrate_action = QAction("마이그레이션 작업 설정", self)
         migrate_action.setShortcut("F5")
         migrate_action.triggered.connect(self.start_migration)
         toolbar.addAction(migrate_action)
@@ -165,8 +165,8 @@ class MainWindow(QMainWindow):
 
         layout.addLayout(button_layout)
 
-        # 마이그레이션 시작 버튼
-        self.migrate_btn = QPushButton("마이그레이션 시작")
+        # 마이그레이션 작업 설정 버튼
+        self.migrate_btn = QPushButton("마이그레이션 작업 설정")
         self.migrate_btn.clicked.connect(self.start_migration)
         self.migrate_btn.setEnabled(False)
         layout.addWidget(self.migrate_btn)

@@ -85,8 +85,8 @@ class TrayIconManager(QObject):
         # === 빠른 작업 ===
         quick_menu = menu.addMenu("빠른 작업")
 
-        # 마이그레이션 시작
-        start_action = QAction("새 마이그레이션 시작", self.app)
+        # 마이그레이션 작업 설정
+        start_action = QAction("마이그레이션 작업 설정", self.app)
         start_action.triggered.connect(self._quick_start_migration)
         quick_menu.addAction(start_action)
 
