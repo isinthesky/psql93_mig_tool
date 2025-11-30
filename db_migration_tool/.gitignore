@@ -175,9 +175,6 @@ cython_debug/
 .AppleDouble
 .LSOverride
 
-# macOS - Icon must end with two \r
-Icon
-
 # macOS - Thumbnails
 ._*
 
