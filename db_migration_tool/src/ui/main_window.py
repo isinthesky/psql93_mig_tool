@@ -150,15 +150,39 @@ class MainWindow(QMainWindow):
         button_layout = QHBoxLayout()
 
         self.new_btn = QPushButton("새 연결")
+        self.new_btn.setStyleSheet("""
+            QPushButton {
+                font-size: 16px;
+                padding: 12px 20px;
+                min-height: 45px;
+                font-weight: bold;
+            }
+        """)
         self.new_btn.clicked.connect(self.new_connection)
         button_layout.addWidget(self.new_btn)
 
         self.edit_btn = QPushButton("편집")
+        self.edit_btn.setStyleSheet("""
+            QPushButton {
+                font-size: 16px;
+                padding: 12px 20px;
+                min-height: 45px;
+                font-weight: bold;
+            }
+        """)
         self.edit_btn.clicked.connect(self.edit_connection)
         self.edit_btn.setEnabled(False)
         button_layout.addWidget(self.edit_btn)
 
         self.delete_btn = QPushButton("삭제")
+        self.delete_btn.setStyleSheet("""
+            QPushButton {
+                font-size: 16px;
+                padding: 12px 20px;
+                min-height: 45px;
+                font-weight: bold;
+            }
+        """)
         self.delete_btn.clicked.connect(self.delete_connection)
         self.delete_btn.setEnabled(False)
         button_layout.addWidget(self.delete_btn)
@@ -167,6 +191,14 @@ class MainWindow(QMainWindow):
 
         # 마이그레이션 작업 설정 버튼
         self.migrate_btn = QPushButton("마이그레이션 작업 설정")
+        self.migrate_btn.setStyleSheet("""
+            QPushButton {
+                font-size: 16px;
+                padding: 12px 20px;
+                min-height: 45px;
+                font-weight: bold;
+            }
+        """)
         self.migrate_btn.clicked.connect(self.start_migration)
         self.migrate_btn.setEnabled(False)
         layout.addWidget(self.migrate_btn)
@@ -198,6 +230,14 @@ class MainWindow(QMainWindow):
 
         # 새로고침 버튼
         refresh_btn = QPushButton("새로고침")
+        refresh_btn.setStyleSheet("""
+            QPushButton {
+                font-size: 16px;
+                padding: 12px 20px;
+                min-height: 45px;
+                font-weight: bold;
+            }
+        """)
         refresh_btn.clicked.connect(self.refresh_history)
         layout.addWidget(refresh_btn)
 
