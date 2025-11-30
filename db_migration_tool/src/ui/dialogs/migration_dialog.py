@@ -40,7 +40,10 @@ class MigrationDialog(QDialog):
         self.checkpoint_manager = CheckpointManager()
         self.worker = None
         self.history_id = None
+        self.worker = None
+        self.history_id = None
         self.is_running = False
+        self.all_partitions = []  # 전체 파티션 목록 저장
 
         self.setup_ui()
         self.check_incomplete_migration()
@@ -301,6 +304,7 @@ class MigrationDialog(QDialog):
     def update_partition_list(self, start_date: date, end_date: date):
         """파티션 목록 업데이트"""
         self.partition_list.clear()
+        self.all_partitions = []  # 초기화
 
         try:
             # 파티션 탐색
@@ -308,11 +312,29 @@ class MigrationDialog(QDialog):
             partitions = discovery.discover_partitions(start_date, end_date)
 
             if partitions:
-                for partition in partitions:
+                # 전체 파티션 목록 저장 (딕셔너리 형태)
+                self.all_partitions = partitions
+                
+                # UI에는 최대 100개까지만 표시
+                display_limit = 100
+                display_count = min(len(partitions), display_limit)
+                
+                for i in range(display_count):
+                    partition = partitions[i]
                     item_text = f"{partition['table_name']} ({partition['row_count']:,} rows)"
                     item = QListWidgetItem(item_text)
                     item.setData(Qt.UserRole, partition["table_name"])
                     self.partition_list.addItem(item)
+
+                # 100개 초과 시 요약 아이템 추가
+                if len(partitions) > display_limit:
+                    remaining = len(partitions) - display_limit
+                    summary_text = f"... 외 {remaining}개 파티션 (전체 {len(partitions)}개 포함됨)"
+                    summary_item = QListWidgetItem(summary_text)
+                    # 선택 불가능하게 설정하거나 스타일 적용
+                    summary_item.setFlags(summary_item.flags() & ~Qt.ItemIsSelectable)
+                    summary_item.setForeground(Qt.gray)
+                    self.partition_list.addItem(summary_item)
 
                 self.partition_count_label.setText(f"총 {len(partitions)}개 파티션")
                 self.add_log(f"파티션 {len(partitions)}개 발견", "INFO")
@@ -325,8 +347,25 @@ class MigrationDialog(QDialog):
                 while current <= end_date:
                     partition_name = f"point_history_{current.strftime('%y%m%d')}"
                     manual_partitions.append(partition_name)
-                    self.partition_list.addItem(partition_name)
                     current = date(current.year, current.month, current.day + 1)
+                
+                # 수동 생성된 파티션도 all_partitions에 저장 (형식 맞춤)
+                self.all_partitions = [{"table_name": name, "row_count": 0} for name in manual_partitions]
+
+                # UI 표시 (수동 생성은 보통 많지 않으므로 다 보여줘도 되지만 로직 통일)
+                display_limit = 100
+                display_count = min(len(manual_partitions), display_limit)
+
+                for i in range(display_count):
+                    partition_name = manual_partitions[i]
+                    self.partition_list.addItem(partition_name)
+                
+                if len(manual_partitions) > display_limit:
+                    remaining = len(manual_partitions) - display_limit
+                    summary_item = QListWidgetItem(f"... 외 {remaining}개 파티션")
+                    summary_item.setFlags(summary_item.flags() & ~Qt.ItemIsSelectable)
+                    summary_item.setForeground(Qt.gray)
+                    self.partition_list.addItem(summary_item)
 
                 self.partition_count_label.setText(f"총 {len(manual_partitions)}개 파티션 (수동)")
 
@@ -339,8 +378,12 @@ class MigrationDialog(QDialog):
             while current <= end_date:
                 partition_name = f"point_history_{current.strftime('%y%m%d')}"
                 manual_partitions.append(partition_name)
-                self.partition_list.addItem(partition_name)
                 current = date(current.year, current.month, current.day + 1)
+            
+            self.all_partitions = [{"table_name": name, "row_count": 0} for name in manual_partitions]
+            
+            for name in manual_partitions:
+                self.partition_list.addItem(name)
 
             self.partition_count_label.setText(f"총 {len(manual_partitions)}개 파티션 (수동)")
 
@@ -369,21 +412,37 @@ class MigrationDialog(QDialog):
             return
 
         # 파티션 목록 가져오기
+        # 파티션 목록 가져오기
         partitions = []
-        for i in range(self.partition_list.count()):
-            item = self.partition_list.item(i)
-            # UserRole에 저장된 실제 테이블 이름 가져오기
-            table_name = item.data(Qt.UserRole)
-            if table_name:
-                partitions.append(table_name)
-            else:
-                # fallback: 텍스트에서 테이블 이름 추출
-                text = item.text()
-                if " (" in text:
-                    table_name = text.split(" (")[0]
+        
+        # self.all_partitions가 있으면 그것을 사용
+        if self.all_partitions:
+            for p in self.all_partitions:
+                # p는 딕셔너리이거나 문자열일 수 있음 (수동 생성 시)
+                if isinstance(p, dict):
+                    partitions.append(p["table_name"])
                 else:
-                    table_name = text
-                partitions.append(table_name)
+                    partitions.append(p)  # 문자열인 경우
+        else:
+            # 기존 로직 유지 (fallback)
+            for i in range(self.partition_list.count()):
+                item = self.partition_list.item(i)
+                # 요약 아이템 건너뛰기
+                if item.text().startswith("... 외"):
+                    continue
+                    
+                # UserRole에 저장된 실제 테이블 이름 가져오기
+                table_name = item.data(Qt.UserRole)
+                if table_name:
+                    partitions.append(table_name)
+                else:
+                    # fallback: 텍스트에서 테이블 이름 추출
+                    text = item.text()
+                    if " (" in text:
+                        table_name = text.split(" (")[0]
+                    else:
+                        table_name = text
+                    partitions.append(table_name)
 
         if not partitions:
             QMessageBox.warning(self, "파티션 없음", "선택된 날짜 범위에 파티션이 없습니다.")
@@ -558,6 +617,8 @@ class MigrationDialog(QDialog):
         self.is_running = False
         self.update_timer.stop()
 
+        rows_processed = self._get_processed_rows()
+
         # 완료 후에는 다시 시작하지 못하도록 비활성화
         self.start_btn.setEnabled(False)
         self.pause_btn.setEnabled(False)
@@ -570,7 +631,9 @@ class MigrationDialog(QDialog):
 
         # 이력 상태 업데이트
         if self.history_id:
-            self.history_manager.update_history_status(self.history_id, "completed")
+            self.history_manager.update_history_status(
+                self.history_id, "completed", processed_rows=rows_processed
+            )
 
         self.add_log("마이그레이션이 완료되었습니다", "SUCCESS")
 
@@ -578,8 +641,9 @@ class MigrationDialog(QDialog):
         main_window = self.parent()
         if main_window and hasattr(main_window, "tray_icon") and main_window.tray_icon:
             # 처리된 총 행 수 계산
-            history = self.history_manager.get_history(self.history_id)
-            rows_processed = history.processed_rows if history else 0
+            if rows_processed == 0 and self.history_id:
+                history = self.history_manager.get_history(self.history_id)
+                rows_processed = history.processed_rows if history else 0
             main_window.tray_icon.set_migration_running(False)
             main_window.tray_icon.notify_migration_completed(self.profile.name, rows_processed)
 
@@ -595,6 +659,8 @@ class MigrationDialog(QDialog):
         self.is_running = False
         self.update_timer.stop()
 
+        rows_processed = self._get_processed_rows()
+
         # 오류 발생 후에도 다시 시작하지 못하도록 비활성화
         self.start_btn.setEnabled(False)
         self.pause_btn.setEnabled(False)
@@ -607,7 +673,9 @@ class MigrationDialog(QDialog):
 
         # 이력 상태 업데이트
         if self.history_id:
-            self.history_manager.update_history_status(self.history_id, "failed")
+            self.history_manager.update_history_status(
+                self.history_id, "failed", processed_rows=rows_processed
+            )
 
         self.add_log(f"오류 발생: {error_msg}", "ERROR")
 
@@ -670,6 +738,22 @@ class MigrationDialog(QDialog):
         # 경과 시간
         elapsed_time = stats.get("elapsed_time", "00:00:00")
         self.elapsed_label.setText(f"경과 시간: {elapsed_time}")
+
+    def _get_processed_rows(self) -> int:
+        """워커 또는 저장된 이력에서 처리된 행 수를 조회"""
+        if self.worker and hasattr(self.worker, "get_stats"):
+            try:
+                stats = self.worker.get_stats()
+                return int(stats.get("total_rows") or 0)
+            except Exception:
+                pass
+
+        if self.history_id:
+            history = self.history_manager.get_history(self.history_id)
+            if history:
+                return int(history.processed_rows or 0)
+
+        return 0
 
     def closeEvent(self, event):
         """다이얼로그 닫기 이벤트"""

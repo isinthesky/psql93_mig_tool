@@ -5,7 +5,10 @@
       "Bash(python3:*)",
       "Bash(source:*)",
       "Bash(pip install:*)",
-      "Bash(ls:*)"
+      "Bash(ls:*)",
+      "Bash(uv run:*)",
+      "Bash(uv sync:*)",
+      "Bash(python -m pytest:*)"
     ],
     "deny": []
   }

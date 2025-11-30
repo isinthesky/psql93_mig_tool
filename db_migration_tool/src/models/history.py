@@ -61,6 +61,10 @@ class CheckpointItem:
         status: str = "pending",
         rows_processed: int = 0,
         error_message: str = "",
+        last_path_id: Optional[int] = None,
+        last_issued_date: Optional[int] = None,
+        copy_method: str = "INSERT",
+        bytes_transferred: int = 0,
     ):
         self.id = id
         self.history_id = history_id
@@ -68,6 +72,10 @@ class CheckpointItem:
         self.status = status
         self.rows_processed = rows_processed
         self.error_message = error_message
+        self.last_path_id = last_path_id
+        self.last_issued_date = last_issued_date
+        self.copy_method = copy_method
+        self.bytes_transferred = bytes_transferred
 
     @classmethod
     def from_db_model(cls, db_checkpoint: Checkpoint) -> "CheckpointItem":
@@ -79,6 +87,10 @@ class CheckpointItem:
             status=db_checkpoint.status,
             rows_processed=db_checkpoint.rows_processed or 0,
             error_message=db_checkpoint.error_message or "",
+            last_path_id=db_checkpoint.last_path_id,
+            last_issued_date=db_checkpoint.last_issued_date,
+            copy_method=db_checkpoint.copy_method or "INSERT",
+            bytes_transferred=db_checkpoint.bytes_transferred or 0,
         )
 
 
@@ -161,7 +173,15 @@ class CheckpointManager:
         return [CheckpointItem.from_db_model(c) for c in db_checkpoints]
 
     def update_checkpoint_status(
-        self, checkpoint_id: int, status: str, rows_processed: int = None, error_message: str = None
+        self,
+        checkpoint_id: int,
+        status: str,
+        rows_processed: int = None,
+        error_message: str = None,
+        last_path_id: int = None,
+        last_issued_date: int = None,
+        copy_method: str = None,
+        bytes_transferred: int = None,
     ) -> bool:
         """체크포인트 상태 업데이트"""
         updates = {"status": status}
@@ -169,6 +189,14 @@ class CheckpointManager:
             updates["rows_processed"] = rows_processed
         if error_message is not None:
             updates["error_message"] = error_message
+        if last_path_id is not None:
+            updates["last_path_id"] = last_path_id
+        if last_issued_date is not None:
+            updates["last_issued_date"] = last_issued_date
+        if copy_method is not None:
+            updates["copy_method"] = copy_method
+        if bytes_transferred is not None:
+            updates["bytes_transferred"] = bytes_transferred
 
         return self.repo.update_by_id(checkpoint_id, **updates)
 

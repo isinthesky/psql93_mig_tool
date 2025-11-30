@@ -3,13 +3,18 @@ PostgreSQL 최적화 유틸리티
 - 세션 레벨 성능 파라미터 설정
 - COPY 명령 권한 확인
 - 연결 풀 관리
+- 버전 감지 및 버전별 최적화
 """
 
 import logging
+from io import StringIO
 from typing import Any
 
 import psycopg2
-from psycopg2 import sql
+
+from src.database.version_info import PgVersionFamily, PgVersionInfo, parse_version_string
+from src.database.version_params import get_params_for_version
+from src.database.version_sql import get_sql_for_version
 
 logger = logging.getLogger(__name__)
 
@@ -51,16 +56,23 @@ class PostgresOptimizer:
             # 최적화 실패는 치명적이지 않으므로 예외를 발생시키지 않음
 
     @staticmethod
-    def check_copy_permissions(connection, check_write: bool = True) -> tuple[bool, str]:
+    def check_copy_permissions(
+        connection,
+        check_write: bool = True,
+        version_info: PgVersionInfo | None = None,
+    ) -> tuple[bool, str]:
         """COPY 명령 실행 권한 확인
 
         Args:
             connection: psycopg2 연결 객체
             check_write: True면 COPY FROM 권한, False면 COPY TO 권한 확인
+            version_info: 연결 대상의 PostgreSQL 버전 정보
 
         Returns:
             (권한 여부, 오류 메시지)
         """
+        version_family = version_info.family if version_info else PgVersionFamily.UNKNOWN
+
         try:
             with connection.cursor() as cursor:
                 # 현재 사용자 확인
@@ -81,48 +93,41 @@ class PostgresOptimizer:
                 if is_superuser:
                     return True, ""
 
-                # pg_read_server_files, pg_write_server_files 역할 확인
-                if check_write:
-                    required_role = "pg_write_server_files"
-                else:
-                    required_role = "pg_read_server_files"
-
-                # PostgreSQL 11+ 에서만 이 역할들이 존재
-                cursor.execute(
-                    """
-                    SELECT 1
-                    FROM pg_roles r1
-                    JOIN pg_auth_members m ON r1.oid = m.roleid
-                    JOIN pg_roles r2 ON m.member = r2.oid
-                    WHERE r1.rolname = %s AND r2.rolname = %s
-                """,
-                    (required_role, current_user),
-                )
-
-                has_role = cursor.fetchone() is not None
-
-                if not has_role:
-                    # COPY 권한 직접 테스트 (임시 테이블 사용)
-                    try:
-                        cursor.execute("CREATE TEMP TABLE copy_test (id int)")
-                        if check_write:
-                            cursor.execute("COPY copy_test FROM STDIN WITH (FORMAT CSV)")
-                            cursor.copy_expert("COPY copy_test FROM STDIN", "1\n")
-                        else:
-                            cursor.execute("COPY copy_test TO STDOUT WITH (FORMAT CSV)")
-                        cursor.execute("DROP TABLE copy_test")
+                # 16에서는 서버 파일 역할을 확인, 9.3/UNKNOWN은 바로 프로빙
+                required_role = "pg_write_server_files" if check_write else "pg_read_server_files"
+                if version_family == PgVersionFamily.PG_16:
+                    cursor.execute(
+                        "SELECT pg_has_role(current_user, %s, 'MEMBER') OR rolsuper",
+                        (required_role,),
+                    )
+                    has_role = bool(cursor.fetchone()[0])
+                    if has_role:
                         return True, ""
-                    except psycopg2.Error:
-                        error_msg = (
-                            f"COPY 권한이 없습니다.\n"
-                            f"현재 사용자: {current_user}\n"
-                            f"필요한 권한: {required_role} 또는 SUPERUSER\n"
-                            f"DBA에게 다음 명령 실행을 요청하세요:\n"
-                            f"GRANT {required_role} TO {current_user};"
-                        )
-                        return False, error_msg
 
-                return True, ""
+                # COPY 권한 직접 테스트 (임시 테이블 사용)
+                success, probe_error = PostgresOptimizer._probe_copy_privilege(connection, check_write)
+                if success:
+                    return True, ""
+
+                # 실패 시 오류 메시지 구성
+                if version_family == PgVersionFamily.PG_16:
+                    error_msg = (
+                        f"COPY 권한이 없습니다.\n"
+                        f"현재 사용자: {current_user}\n"
+                        f"필요한 권한: {required_role} 또는 SUPERUSER\n"
+                        f"DBA에게 다음 명령 실행을 요청하세요:\n"
+                        f"GRANT {required_role} TO {current_user};"
+                    )
+                else:
+                    error_msg = (
+                        f"COPY 권한이 없습니다.\n"
+                        f"현재 사용자: {current_user}\n"
+                        "슈퍼유저 권한이 필요합니다."
+                    )
+
+                if probe_error:
+                    error_msg = f"{error_msg}\n오류: {probe_error}"
+                return False, error_msg
 
         except Exception as e:
             return False, f"권한 확인 중 오류 발생: {str(e)}"
@@ -219,8 +224,13 @@ class PostgresOptimizer:
         return connection
 
     @staticmethod
-    def estimate_table_size(connection, table_name: str) -> dict[str, Any]:
+    def estimate_table_size(
+        connection,
+        table_name: str,
+        version_info: PgVersionInfo | None = None,
+    ) -> dict[str, Any]:
         """테이블 크기 추정"""
+        effective_version = version_info or PostgresOptimizer.detect_version(connection)
         try:
             with connection.cursor() as cursor:
                 # 먼저 테이블 존재 여부 확인
@@ -245,20 +255,10 @@ class PostgresOptimizer:
                         "exists": False,
                     }
 
-                # 행 수
-                cursor.execute(
-                    sql.SQL("SELECT COUNT(*) FROM {}").format(sql.Identifier(table_name))
-                )
-                row_count = cursor.fetchone()[0]
-
-                # 테이블 크기 (bytes)
-                cursor.execute(
-                    """
-                    SELECT pg_total_relation_size(%s)
-                """,
-                    (table_name,),
-                )
-                total_size = cursor.fetchone()[0]
+                # 버전별 테이블 크기 추정 쿼리 사용
+                estimate_query = get_sql_for_version(effective_version, "estimate_size")
+                cursor.execute(estimate_query, (table_name, table_name))
+                row_count, total_size = cursor.fetchone()
 
                 # 평균 행 크기
                 avg_row_size = total_size / row_count if row_count > 0 else 0
@@ -285,3 +285,105 @@ class PostgresOptimizer:
                 "avg_row_size_bytes": 0,
                 "exists": False,
             }
+
+    @staticmethod
+    def detect_version(connection) -> PgVersionInfo:
+        """PostgreSQL 버전 감지
+
+        Args:
+            connection: psycopg2 연결 객체
+
+        Returns:
+            PgVersionInfo: 감지된 버전 정보
+        """
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT version()")
+                version_str = cursor.fetchone()[0]
+                return parse_version_string(version_str)
+        except Exception as e:
+            logger.error(f"버전 감지 실패: {e}")
+            return PgVersionInfo(0, 0, "unknown", PgVersionFamily.UNKNOWN)
+
+    @staticmethod
+    def resolve_effective_version(connection, compat_mode: str) -> PgVersionInfo:
+        """호환 모드를 고려한 유효 버전 결정
+
+        Args:
+            connection: psycopg2 연결 객체
+            compat_mode: 호환 모드 ("auto", "9.3", "16")
+
+        Returns:
+            PgVersionInfo: 유효 버전 정보
+        """
+        detected = PostgresOptimizer.detect_version(connection)
+
+        if compat_mode == "9.3":
+            return PgVersionInfo(9, 3, f"forced:9.3 (실제: {detected.full_version})", PgVersionFamily.PG_9_3)
+        if compat_mode == "16":
+            return PgVersionInfo(16, 0, f"forced:16 (실제: {detected.full_version})", PgVersionFamily.PG_16)
+
+        # auto: 감지된 버전 사용
+        return detected
+
+    @staticmethod
+    def apply_version_params(connection, version_info: PgVersionInfo) -> None:
+        """버전별 세션 파라미터 적용
+
+        Args:
+            connection: psycopg2 연결 객체
+            version_info: PostgreSQL 버전 정보
+        """
+        params = get_params_for_version(version_info)
+        PostgresOptimizer.apply_params(connection, params)
+
+    @staticmethod
+    def apply_params(connection, params: dict[str, str]) -> None:
+        """세션 파라미터 적용 (실패 시 무시)
+
+        Args:
+            connection: psycopg2 연결 객체
+            params: 파라미터 딕셔너리
+        """
+        try:
+            with connection.cursor() as cursor:
+                for param, value in params.items():
+                    try:
+                        cursor.execute(f"SET {param} = %s", (value,))
+                        logger.info(f"PostgreSQL 파라미터 설정: {param} = {value}")
+                    except psycopg2.Error as e:
+                        # 지원하지 않는 파라미터는 무시하고 계속
+                        connection.rollback()
+                        logger.warning(f"파라미터 설정 실패 (무시됨): {param} = {value}, 오류: {e}")
+                        continue
+
+                connection.commit()
+                logger.info("PostgreSQL 버전별 파라미터 적용 완료")
+
+        except Exception as e:
+            connection.rollback()
+            logger.error(f"파라미터 적용 실패: {e}")
+
+    @staticmethod
+    def _probe_copy_privilege(connection, check_write: bool) -> tuple[bool, str]:
+        """COPY 권한을 직접 프로빙 (임시 테이블 사용)"""
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute("CREATE TEMP TABLE copy_test (id int)")
+                if check_write:
+                    cursor.copy_expert(
+                        "COPY copy_test FROM STDIN WITH (FORMAT CSV)", StringIO("1\n")
+                    )
+                else:
+                    cursor.copy_expert(
+                        "COPY copy_test TO STDOUT WITH (FORMAT CSV)", StringIO()
+                    )
+                cursor.execute("DROP TABLE copy_test")
+            connection.commit()
+            return True, ""
+        except psycopg2.Error as e:
+            try:
+                connection.rollback()
+            except psycopg2.Error:
+                pass
+            return False, str(e)

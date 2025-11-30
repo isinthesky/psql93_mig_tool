@@ -5,7 +5,22 @@ ConnectionDialog에서 UI 위젯과 Dict 간 변환 로직을 중앙집중화합
 
 from typing import Any
 
-from PySide6.QtWidgets import QCheckBox, QLineEdit, QSpinBox
+from PySide6.QtWidgets import QCheckBox, QComboBox, QLineEdit, QSpinBox
+
+# 호환 모드 상수
+COMPAT_MODE_AUTO = "auto"
+COMPAT_MODE_9_3 = "9.3"
+COMPAT_MODE_16 = "16"
+
+# UI 표시용 호환 모드 매핑
+COMPAT_MODE_LABELS = {
+    COMPAT_MODE_AUTO: "자동 감지",
+    COMPAT_MODE_9_3: "PostgreSQL 9.3",
+    COMPAT_MODE_16: "PostgreSQL 16",
+}
+
+# UI 레이블 → 값 역매핑
+COMPAT_LABEL_TO_MODE = {v: k for k, v in COMPAT_MODE_LABELS.items()}
 
 
 class ConnectionMapper:
@@ -29,6 +44,7 @@ class ConnectionMapper:
         username: QLineEdit,
         password: QLineEdit,
         ssl: QCheckBox,
+        compat_mode: QComboBox | None = None,
     ) -> dict[str, Any]:
         """UI 위젯 → 프로필 저장용 Dict
 
@@ -39,17 +55,18 @@ class ConnectionMapper:
             username: 사용자명 입력 위젯
             password: 비밀번호 입력 위젯
             ssl: SSL 체크박스
+            compat_mode: 호환 모드 콤보박스 (선택)
 
         Returns:
             프로필 저장에 사용할 딕셔너리
 
         Examples:
             >>> config = ConnectionMapper.ui_to_profile_config(
-            ...     host, port, database, username, password, ssl
+            ...     host, port, database, username, password, ssl, compat_mode
             ... )
             >>> print(config['host'])  # 'localhost'
         """
-        return {
+        config = {
             "host": host.text().strip() or "localhost",
             "port": port.value(),
             "database": database.text().strip(),
@@ -57,6 +74,15 @@ class ConnectionMapper:
             "password": password.text(),
             "ssl": ssl.isChecked(),
         }
+
+        # 호환 모드 추가
+        if compat_mode is not None:
+            label = compat_mode.currentText()
+            config["compat_mode"] = COMPAT_LABEL_TO_MODE.get(label, COMPAT_MODE_AUTO)
+        else:
+            config["compat_mode"] = COMPAT_MODE_AUTO
+
+        return config
 
     @staticmethod
     def ui_to_psycopg_config(
@@ -128,18 +154,18 @@ class ConnectionMapper:
         }
 
     @staticmethod
-    def profile_config_to_ui(config: dict[str, Any]) -> tuple[str, int, str, str, str, bool]:
+    def profile_config_to_ui(config: dict[str, Any]) -> tuple[str, int, str, str, str, bool, str]:
         """프로필 Dict → UI 값 튜플
 
         Args:
             config: 프로필 설정 딕셔너리
 
         Returns:
-            (host, port, database, username, password, ssl) 튜플
+            (host, port, database, username, password, ssl, compat_mode) 튜플
 
         Examples:
             >>> config = {'host': 'localhost', 'port': 5432, ...}
-            >>> host, port, db, user, pwd, ssl = ConnectionMapper.profile_config_to_ui(config)
+            >>> host, port, db, user, pwd, ssl, compat = ConnectionMapper.profile_config_to_ui(config)
         """
         return (
             config.get("host", "localhost"),
@@ -148,6 +174,7 @@ class ConnectionMapper:
             config.get("username", ""),
             config.get("password", ""),
             config.get("ssl", False),
+            config.get("compat_mode", COMPAT_MODE_AUTO),
         )
 
     @staticmethod
@@ -159,6 +186,7 @@ class ConnectionMapper:
         username: QLineEdit,
         password: QLineEdit,
         ssl: QCheckBox,
+        compat_mode: QComboBox | None = None,
     ):
         """프로필 Dict → UI 위젯 설정
 
@@ -170,11 +198,12 @@ class ConnectionMapper:
             username: 사용자명 입력 위젯
             password: 비밀번호 입력 위젯
             ssl: SSL 체크박스
+            compat_mode: 호환 모드 콤보박스 (선택)
 
         Examples:
             >>> ConnectionMapper.set_ui_from_config(
             ...     profile.source_config,
-            ...     host_edit, port_spin, db_edit, user_edit, pwd_edit, ssl_check
+            ...     host_edit, port_spin, db_edit, user_edit, pwd_edit, ssl_check, compat_combo
             ... )
         """
         host.setText(config.get("host", "localhost"))
@@ -183,6 +212,14 @@ class ConnectionMapper:
         username.setText(config.get("username", ""))
         password.setText(config.get("password", ""))
         ssl.setChecked(config.get("ssl", False))
+
+        # 호환 모드 설정
+        if compat_mode is not None:
+            mode = config.get("compat_mode", COMPAT_MODE_AUTO)
+            label = COMPAT_MODE_LABELS.get(mode, COMPAT_MODE_LABELS[COMPAT_MODE_AUTO])
+            index = compat_mode.findText(label)
+            if index >= 0:
+                compat_mode.setCurrentIndex(index)
 
 
 class ConnectionWidgetSet:
@@ -197,6 +234,7 @@ class ConnectionWidgetSet:
         username: 사용자명 입력 위젯
         password: 비밀번호 입력 위젯
         ssl: SSL 체크박스
+        compat_mode: 호환 모드 콤보박스 (선택)
 
     Examples:
         >>> widgets = ConnectionWidgetSet(host_edit, port_spin, ...)
@@ -212,6 +250,7 @@ class ConnectionWidgetSet:
         username: QLineEdit,
         password: QLineEdit,
         ssl: QCheckBox,
+        compat_mode: QComboBox | None = None,
     ):
         """ConnectionWidgetSet 초기화
 
@@ -222,6 +261,7 @@ class ConnectionWidgetSet:
             username: 사용자명 입력 위젯
             password: 비밀번호 입력 위젯
             ssl: SSL 체크박스
+            compat_mode: 호환 모드 콤보박스 (선택)
         """
         self.host = host
         self.port = port
@@ -229,6 +269,7 @@ class ConnectionWidgetSet:
         self.username = username
         self.password = password
         self.ssl = ssl
+        self.compat_mode = compat_mode
 
     def to_profile_config(self) -> dict[str, Any]:
         """프로필 저장용 Dict 반환
@@ -237,7 +278,8 @@ class ConnectionWidgetSet:
             프로필 저장용 딕셔너리
         """
         return ConnectionMapper.ui_to_profile_config(
-            self.host, self.port, self.database, self.username, self.password, self.ssl
+            self.host, self.port, self.database, self.username, self.password, self.ssl,
+            self.compat_mode
         )
 
     def to_psycopg_config(self) -> dict[str, Any]:
@@ -267,5 +309,6 @@ class ConnectionWidgetSet:
             config: 프로필 설정 딕셔너리
         """
         ConnectionMapper.set_ui_from_config(
-            config, self.host, self.port, self.database, self.username, self.password, self.ssl
+            config, self.host, self.port, self.database, self.username, self.password, self.ssl,
+            self.compat_mode
         )

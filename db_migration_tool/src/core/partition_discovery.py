@@ -12,8 +12,10 @@ from psycopg import sql
 class PartitionDiscovery:
     """파티션 테이블 탐색 클래스"""
 
-    def __init__(self, connection_config: dict[str, Any]):
-        self.connection_config = connection_config
+    def __init__(self, connection_config: dict[str, Any], target_config: dict[str, Any] = None):
+        self.source_config = connection_config
+        self.target_config = target_config
+        self.connection_config = connection_config  # 하위 호환성을 위해 유지 (현재 활성 설정)
 
     def discover_partitions(self, start_date: date, end_date: date) -> list[dict[str, Any]]:
         """날짜 범위에 해당하는 파티션 탐색"""
@@ -75,10 +77,15 @@ class PartitionDiscovery:
 
         return partitions
 
-    def get_partition_info(self, partition_name: str) -> dict[str, Any]:
-        """특정 파티션 정보 조회"""
+    def get_partition_info(self, partition_name: str, is_target: bool = False) -> dict[str, Any]:
+        """특정 파티션 정보 조회
+
+        Args:
+            partition_name: 조회할 파티션 이름
+            is_target: True이면 대상 DB 구성으로 연결
+        """
         try:
-            conn = self._create_connection()
+            conn = self._create_connection(is_target=is_target)
 
             with conn.cursor() as cur:
                 # 파티션 정보 조회
@@ -138,12 +145,11 @@ class PartitionDiscovery:
         try:
             source_info = self.get_partition_info(source_partition)
 
-            # 대상 연결로 전환
-            target_conn = self._create_connection(is_target=True)
-            self.connection_config = self.target_config  # 임시 전환
-            target_info = self.get_partition_info(target_partition)
-            self.connection_config = self.source_config  # 복원
-            target_conn.close()
+            # 대상 정보 조회 (대상 설정이 없으면 비교 불가)
+            if not self.target_config:
+                return False
+
+            target_info = self.get_partition_info(target_partition, is_target=True)
 
             if not source_info or not target_info:
                 return False
@@ -159,7 +165,10 @@ class PartitionDiscovery:
 
     def _create_connection(self, is_target: bool = False) -> psycopg.Connection:
         """데이터베이스 연결 생성"""
-        config = self.connection_config
+        if is_target and self.target_config:
+            config = self.target_config
+        else:
+            config = self.connection_config
 
         conn_params = {
             "host": config["host"],

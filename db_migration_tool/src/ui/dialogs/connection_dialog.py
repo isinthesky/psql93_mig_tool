@@ -5,6 +5,7 @@
 import psycopg
 from PySide6.QtWidgets import (
     QCheckBox,
+    QComboBox,
     QDialog,
     QDialogButtonBox,
     QFormLayout,
@@ -19,11 +20,16 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from src.database.version_info import parse_version_string
 from src.models.profile import ConnectionProfile
 from src.utils.logger import logger
-from src.utils.validators import ConnectionValidator
+from src.utils.validators import ConnectionValidator, VersionValidator
 
-from .connection_mapper import ConnectionMapper
+from .connection_mapper import (
+    COMPAT_LABEL_TO_MODE,
+    COMPAT_MODE_LABELS,
+    ConnectionMapper,
+)
 
 
 class ConnectionDialog(QDialog):
@@ -118,6 +124,16 @@ class ConnectionDialog(QDialog):
         ssl_check = QCheckBox("SSL 연결 사용")
         layout.addRow("", ssl_check)
 
+        # 호환 모드
+        compat_combo = QComboBox()
+        compat_combo.addItems(list(COMPAT_MODE_LABELS.values()))
+        compat_combo.setToolTip(
+            "자동 감지: 연결 시 버전을 자동으로 감지합니다.\n"
+            "PostgreSQL 9.3: 9.3 호환 모드를 강제합니다.\n"
+            "PostgreSQL 16: 16 최적화 모드를 강제합니다."
+        )
+        layout.addRow("호환 모드:", compat_combo)
+
         # 위젯 참조 저장
         if db_type == "소스":
             self.source_host = host_edit
@@ -126,6 +142,7 @@ class ConnectionDialog(QDialog):
             self.source_username = username_edit
             self.source_password = password_edit
             self.source_ssl = ssl_check
+            self.source_compat_mode = compat_combo
         else:
             self.target_host = host_edit
             self.target_port = port_spin
@@ -133,6 +150,7 @@ class ConnectionDialog(QDialog):
             self.target_username = username_edit
             self.target_password = password_edit
             self.target_ssl = ssl_check
+            self.target_compat_mode = compat_combo
 
         return widget
 
@@ -152,6 +170,7 @@ class ConnectionDialog(QDialog):
             self.source_username,
             self.source_password,
             self.source_ssl,
+            self.source_compat_mode,
         )
 
         # 대상 설정 (ConnectionMapper 활용)
@@ -163,6 +182,7 @@ class ConnectionDialog(QDialog):
             self.target_username,
             self.target_password,
             self.target_ssl,
+            self.target_compat_mode,
         )
 
     def get_profile_data(self):
@@ -176,6 +196,7 @@ class ConnectionDialog(QDialog):
                 self.source_username,
                 self.source_password,
                 self.source_ssl,
+                self.source_compat_mode,
             ),
             "target_config": ConnectionMapper.ui_to_profile_config(
                 self.target_host,
@@ -184,6 +205,7 @@ class ConnectionDialog(QDialog):
                 self.target_username,
                 self.target_password,
                 self.target_ssl,
+                self.target_compat_mode,
             ),
         }
 
@@ -215,21 +237,28 @@ class ConnectionDialog(QDialog):
             # 버전 확인
             with conn.cursor() as cur:
                 cur.execute("SELECT version()")
-                version = cur.fetchone()[0]
+                version_str = cur.fetchone()[0]
 
-                # PostgreSQL 9.3 호환성 확인
-                if "PostgreSQL 9." not in version and "PostgreSQL 10." not in version:
+                # 버전 파싱 및 지원 여부 확인
+                version_info = parse_version_string(version_str)
+                from src.database.version_info import PgVersionFamily
+
+                if version_info.family == PgVersionFamily.UNKNOWN:
                     QMessageBox.warning(
                         self,
                         "버전 경고",
-                        f"PostgreSQL 버전이 9.3과 다릅니다:\n{version}\n\n"
-                        "호환성 문제가 발생할 수 있습니다.",
+                        f"지원 대상 버전(9.3, 16)이 아닙니다:\n{version_str}\n\n"
+                        "9.3 호환 모드로 처리됩니다.",
                     )
 
             conn.close()
 
             QMessageBox.information(
-                self, "연결 성공", f"{db_type} 데이터베이스 연결에 성공했습니다.\n\n{version}"
+                self,
+                "연결 성공",
+                f"{db_type} 데이터베이스 연결에 성공했습니다.\n\n"
+                f"버전: {version_info}\n"
+                f"원본: {version_str}",
             )
 
         except Exception as e:
@@ -262,6 +291,23 @@ class ConnectionDialog(QDialog):
         valid, msg = ConnectionValidator.validate_connection_config(target_config)
         if not valid:
             QMessageBox.warning(self, "대상 DB 오류", msg)
+            return
+
+        # 호환 모드 검증
+        source_compat = COMPAT_LABEL_TO_MODE.get(
+            self.source_compat_mode.currentText(), "auto"
+        )
+        valid, msg = VersionValidator.validate_compat_mode(source_compat)
+        if not valid:
+            QMessageBox.warning(self, "소스 DB 호환 모드 오류", msg)
+            return
+
+        target_compat = COMPAT_LABEL_TO_MODE.get(
+            self.target_compat_mode.currentText(), "auto"
+        )
+        valid, msg = VersionValidator.validate_compat_mode(target_compat)
+        if not valid:
+            QMessageBox.warning(self, "대상 DB 호환 모드 오류", msg)
             return
 
         logger.info(f"연결 프로필 저장: {name}")

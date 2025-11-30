@@ -4,18 +4,25 @@
 
 echo "🔧 DB Migration Tool 빌드 시작..."
 
-# 가상환경 활성화
-if [ -d "venv" ]; then
-    echo "📦 가상환경 활성화..."
+# 가상환경 활성화 (.venv 또는 venv)
+if [ -d ".venv" ]; then
+    echo "📦 가상환경 활성화 (.venv)..."
+    source .venv/bin/activate
+elif [ -d "venv" ]; then
+    echo "📦 가상환경 활성화 (venv)..."
     source venv/bin/activate
 else
-    echo "❌ 가상환경을 찾을 수 없습니다. 먼저 가상환경을 생성하세요."
+    echo "❌ 가상환경을 찾을 수 없습니다. 'uv sync' 또는 'python -m venv .venv'로 생성하세요."
     exit 1
 fi
 
 # 필요한 패키지 설치 확인
 echo "📋 의존성 확인..."
-pip install -r requirements.txt
+if command -v uv &> /dev/null; then
+    uv sync
+else
+    pip install -r requirements.txt
+fi
 
 # 이전 빌드 정리
 echo "🧹 이전 빌드 정리..."
