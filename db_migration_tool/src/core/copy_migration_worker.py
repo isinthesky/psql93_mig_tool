@@ -439,123 +439,123 @@ class CopyMigrationWorker(BaseMigrationWorker):
             if accumulated_rows:
                 self.performance_metrics.current_partition_rows = accumulated_rows
 
-        # 테이블 타입/컬럼 구성
-        table_type = self._detect_table_type(partition_name)
-        table_config = TABLE_TYPE_CONFIG[table_type]
-        columns_csv = ", ".join(table_config.columns)
-        key_column = table_config.columns[0]
-        date_column = table_config.date_column
-        is_timestamp_date = table_config.date_is_timestamp
+            # 테이블 타입/컬럼 구성
+            table_type = self._detect_table_type(partition_name)
+            table_config = TABLE_TYPE_CONFIG[table_type]
+            columns_csv = ", ".join(table_config.columns)
+            key_column = table_config.columns[0]
+            date_column = table_config.date_column
+            is_timestamp_date = table_config.date_is_timestamp
 
-        # 청크 단위 처리 루프
-        while self.is_running:
-            # WHERE 절 구성
-            where_clause = ""
-            if last_path_id is not None:
-                key_literal = self._format_literal(last_path_id, is_timestamp=False)
-                date_literal = self._format_literal(last_issued_date, is_timestamp_date)
-                where_clause = (
-                    f"WHERE {key_column} > {key_literal} OR "
-                    f"({key_column} = {key_literal} AND {date_column} > {date_literal})"
+            # 청크 단위 처리 루프
+            while self.is_running:
+                # WHERE 절 구성
+                where_clause = ""
+                if last_path_id is not None:
+                    key_literal = self._format_literal(last_path_id, is_timestamp=False)
+                    date_literal = self._format_literal(last_issued_date, is_timestamp_date)
+                    where_clause = (
+                        f"WHERE {key_column} > {key_literal} OR "
+                        f"({key_column} = {key_literal} AND {date_column} > {date_literal})"
+                    )
+
+                # LIMIT를 사용한 부분 쿼리
+                copy_to_query = f"""
+                    COPY (
+                        SELECT {columns_csv}
+                        FROM {partition_name}
+                        {where_clause}
+                        ORDER BY {key_column}, {date_column}
+                        LIMIT {self.batch_size}
+                    ) TO STDOUT WITH (FORMAT CSV, HEADER FALSE, NULL 'NULL')
+                """
+
+                copy_from_query = f"""
+                    COPY {partition_name} ({columns_csv})
+                    FROM STDIN WITH (FORMAT CSV, HEADER FALSE, NULL 'NULL')
+                """
+
+                stream_buffer = CopyStreamBuffer()
+
+                # 소스 → 대상 스트리밍 (큐 기반)
+                def copy_out():
+                    try:
+                        with self.source_conn.cursor() as source_cursor:
+                            source_cursor.copy_expert(copy_to_query, stream_buffer)
+                    except Exception as exc:
+                        stream_buffer.set_error(exc)
+                    finally:
+                        stream_buffer.close()
+
+                producer_thread = threading.Thread(target=copy_out, daemon=True)
+                producer_thread.start()
+
+                # 대상 COPY IN (stream_buffer.read 사용)
+                with self.target_conn.cursor() as target_cursor:
+                    try:
+                        target_cursor.copy_expert(copy_from_query, stream_buffer)
+                    except Exception as exc:
+                        stream_buffer.set_error(exc)
+                        raise
+
+                producer_thread.join()
+
+                if stream_buffer.error:
+                    raise stream_buffer.error
+
+                # COPY FROM 트랜잭션 커밋
+                self.target_conn.commit()
+
+                copied_rows = stream_buffer.row_count
+
+                # 데이터가 없으면 완료
+                if copied_rows == 0:
+                    break
+
+                # 트래커에서 마지막 키 값 가져오기
+                if stream_buffer.last_key is not None:
+                    last_path_id = stream_buffer.last_key
+                    last_issued_date = stream_buffer.last_date
+
+                # 누적 행 수 업데이트
+                accumulated_rows += copied_rows
+
+                # 성능 지표 업데이트
+                self.performance_metrics.update(copied_rows, stream_buffer.total_bytes)
+
+                # 체크포인트 업데이트 (중간 저장)
+                if checkpoint:
+                    self.checkpoint_manager.update_checkpoint_status(
+                        checkpoint.id,
+                        "running",
+                        rows_processed=accumulated_rows,
+                        last_path_id=last_path_id,
+                        last_issued_date=last_issued_date,
+                        copy_method="COPY",
+                        bytes_transferred=self.performance_metrics.total_bytes,
+                    )
+
+                    # 성능 지표 전송
+                    self._emit_performance_metrics()
+
+                    # 로그 (너무 빈번하지 않게)
+                    # self.log.emit(f"{partition_name} 배치 완료: {copied_rows:,}행", "DEBUG")
+
+                # 파티션 완료 처리
+                self.performance_metrics.complete_partition()
+                self._update_checkpoint_completed(
+                    checkpoint, accumulated_rows, last_path_id=last_path_id, last_issued_date=last_issued_date
                 )
 
-            # LIMIT를 사용한 부분 쿼리
-            copy_to_query = f"""
-                COPY (
-                    SELECT {columns_csv}
-                    FROM {partition_name}
-                    {where_clause}
-                    ORDER BY {key_column}, {date_column}
-                    LIMIT {self.batch_size}
-                ) TO STDOUT WITH (FORMAT CSV, HEADER FALSE, NULL 'NULL')
-            """
-
-            copy_from_query = f"""
-                COPY {partition_name} ({columns_csv})
-                FROM STDIN WITH (FORMAT CSV, HEADER FALSE, NULL 'NULL')
-            """
-
-            stream_buffer = CopyStreamBuffer()
-
-            # 소스 → 대상 스트리밍 (큐 기반)
-            def copy_out():
-                try:
-                    with self.source_conn.cursor() as source_cursor:
-                        source_cursor.copy_expert(copy_to_query, stream_buffer)
-                except Exception as exc:
-                    stream_buffer.set_error(exc)
-                finally:
-                    stream_buffer.close()
-
-            producer_thread = threading.Thread(target=copy_out, daemon=True)
-            producer_thread.start()
-
-            # 대상 COPY IN (stream_buffer.read 사용)
-            with self.target_conn.cursor() as target_cursor:
-                try:
-                    target_cursor.copy_expert(copy_from_query, stream_buffer)
-                except Exception as exc:
-                    stream_buffer.set_error(exc)
-                    raise
-
-            producer_thread.join()
-
-            if stream_buffer.error:
-                raise stream_buffer.error
-
-            # COPY FROM 트랜잭션 커밋
-            self.target_conn.commit()
-
-            copied_rows = stream_buffer.row_count
-
-            # 데이터가 없으면 완료
-            if copied_rows == 0:
-                break
-
-            # 트래커에서 마지막 키 값 가져오기
-            if stream_buffer.last_key is not None:
-                last_path_id = stream_buffer.last_key
-                last_issued_date = stream_buffer.last_date
-
-            # 누적 행 수 업데이트
-            accumulated_rows += copied_rows
-
-            # 성능 지표 업데이트
-            self.performance_metrics.update(copied_rows, stream_buffer.total_bytes)
-
-            # 체크포인트 업데이트 (중간 저장)
-            if checkpoint:
-                self.checkpoint_manager.update_checkpoint_status(
-                    checkpoint.id,
-                    "running",
-                    rows_processed=accumulated_rows,
-                    last_path_id=last_path_id,
-                    last_issued_date=last_issued_date,
-                    copy_method="COPY",
-                    bytes_transferred=self.performance_metrics.total_bytes,
+                # 로그 출력
+                self.log.emit(
+                    f"{partition_name} 완료: 총 {accumulated_rows:,}개 행",
+                    "SUCCESS",
                 )
-
-                # 성능 지표 전송
-                self._emit_performance_metrics()
-
-                # 로그 (너무 빈번하지 않게)
-                # self.log.emit(f"{partition_name} 배치 완료: {copied_rows:,}행", "DEBUG")
-
-            # 파티션 완료 처리
-            self.performance_metrics.complete_partition()
-            self._update_checkpoint_completed(
-                checkpoint, accumulated_rows, last_path_id=last_path_id, last_issued_date=last_issued_date
-            )
-
-            # 로그 출력
-            self.log.emit(
-                f"{partition_name} 완료: 총 {accumulated_rows:,}개 행",
-                "SUCCESS",
-            )
-            log_emitter.emit_log(
-                "SUCCESS",
-                f"{partition_name} COPY 완료: 총 {accumulated_rows:,}개 행",
-            )
+                log_emitter.emit_log(
+                    "SUCCESS",
+                    f"{partition_name} COPY 완료: 총 {accumulated_rows:,}개 행",
+                )
 
         except Exception as e:
             if checkpoint is None:
