@@ -96,8 +96,10 @@ class PostgresOptimizer:
                 # 16에서는 서버 파일 역할을 확인, 9.3/UNKNOWN은 바로 프로빙
                 required_role = "pg_write_server_files" if check_write else "pg_read_server_files"
                 if version_family == PgVersionFamily.PG_16:
+                    # NOTE: pg_has_role()만으로 역할 보유 여부를 확인한다.
+                    # (이 쿼리는 FROM 절이 없으므로 rolsuper 같은 컬럼을 참조하면 오류가 난다)
                     cursor.execute(
-                        "SELECT pg_has_role(current_user, %s, 'MEMBER') OR rolsuper",
+                        "SELECT pg_has_role(current_user, %s, 'MEMBER')",
                         (required_role,),
                     )
                     has_role = bool(cursor.fetchone()[0])
