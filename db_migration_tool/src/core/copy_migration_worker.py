@@ -150,6 +150,7 @@ class CopyMigrationWorker(BaseMigrationWorker):
     connection_checking = Signal()  # 연결 확인 시작
     source_connection_status = Signal(bool, str)  # 연결 성공 여부, 메시지
     target_connection_status = Signal(bool, str)  # 연결 성공 여부, 메시지
+    truncate_requested = Signal(str, int)  # 테이블명, 기존 행 수 (기존 데이터 경고/확인)
 
     def __init__(
         self,
@@ -176,6 +177,14 @@ class CopyMigrationWorker(BaseMigrationWorker):
         # 성능 지표 업데이트 타이머
         self.last_metric_update = 0
         self.metric_update_interval = 1.0  # 1초마다 업데이트
+
+        # 에러 처리 전략
+        # True: 파티션 단위 에러 발생 시 로그만 남기고 다음 파티션으로 진행
+        # False: 에러 즉시 중단
+        self.skip_on_error: bool = False
+
+        # 기존 데이터(TRUNCATE) 처리: UI가 응답을 넣어주는 필드
+        self.truncate_permission = None  # None|True|False
 
     def _execute_migration(self):
         """COPY 기반 마이그레이션 실행"""
@@ -224,7 +233,20 @@ class CopyMigrationWorker(BaseMigrationWorker):
                     continue
 
                 # 파티션 마이그레이션
-                self._migrate_partition_with_copy(partition, checkpoint)
+                try:
+                    self._migrate_partition_with_copy(partition, checkpoint)
+                except Exception as e:
+                    if self.skip_on_error and self.is_running:
+                        self.log.emit(
+                            f"{partition} - 오류 발생, 건너뛰고 계속 진행: {str(e)}",
+                            "WARNING",
+                        )
+                        log_emitter.emit_log(
+                            "WARNING",
+                            f"{partition} - 오류 발생, 건너뛰고 계속 진행: {str(e)}",
+                        )
+                        continue
+                    raise
 
             # 연결 종료
             self.source_conn.close()
@@ -451,6 +473,9 @@ class CopyMigrationWorker(BaseMigrationWorker):
 
             # 청크 단위 처리 루프
             while self.is_running:
+                # 일시정지 확인 (배치 경계에서만 반영)
+                self._check_pause()
+
                 # WHERE 절 구성
                 where_clause = ""
                 if last_path_id is not None:
@@ -543,21 +568,27 @@ class CopyMigrationWorker(BaseMigrationWorker):
                     # 로그 (너무 빈번하지 않게)
                     # self.log.emit(f"{partition_name} 배치 완료: {copied_rows:,}행", "DEBUG")
 
-                # 파티션 완료 처리
-                self.performance_metrics.complete_partition()
-                self._update_checkpoint_completed(
-                    checkpoint, accumulated_rows, last_path_id=last_path_id, last_issued_date=last_issued_date
-                )
+                # 다음 배치로 계속 (완료 처리는 루프 종료 후 한 번만 수행)
+                continue
 
-                # 로그 출력
-                self.log.emit(
-                    f"{partition_name} 완료: 총 {accumulated_rows:,}개 행",
-                    "SUCCESS",
-                )
-                log_emitter.emit_log(
-                    "SUCCESS",
-                    f"{partition_name} COPY 완료: 총 {accumulated_rows:,}개 행",
-                )
+            # 파티션 완료 처리 (데이터 소진 후)
+            if not self.is_running:
+                return
+
+            self.performance_metrics.complete_partition()
+            self._update_checkpoint_completed(
+                checkpoint,
+                accumulated_rows,
+                last_path_id=last_path_id,
+                last_issued_date=last_issued_date,
+            )
+
+            # 로그 출력
+            self.log.emit(f"{partition_name} 완료: 총 {accumulated_rows:,}개 행", "SUCCESS")
+            log_emitter.emit_log(
+                "SUCCESS",
+                f"{partition_name} COPY 완료: 총 {accumulated_rows:,}개 행",
+            )
 
         except Exception as e:
             if checkpoint is None:
@@ -576,10 +607,40 @@ class CopyMigrationWorker(BaseMigrationWorker):
             raise Exception(f"{partition_name} COPY 실패: {str(e)}")
 
     def _prepare_target_table(self, partition_name: str):
-        """대상 테이블 준비"""
-        # TableCreator를 사용하여 테이블 준비 (자동 TRUNCATE 모드)
+        """대상 테이블 준비
+
+        정책:
+        - 테이블이 없으면 생성
+        - 테이블이 있고 row_count=0이면 그대로 진행
+        - 테이블이 있고 row_count>0이면 UI에 확인을 요청한 뒤 TRUNCATE 여부 결정
+        """
+
+        def confirm_truncate(table: str, row_count: int) -> bool:
+            # 워커 스레드에서 UI를 직접 띄울 수 없으므로 시그널로 위임
+            self.log.emit(
+                f"{table} 테이블에 {row_count:,}개의 기존 데이터가 있습니다",
+                "WARNING",
+            )
+            log_emitter.emit_log(
+                "WARNING",
+                f"{table} 테이블에 {row_count:,}개의 기존 데이터가 있습니다",
+            )
+
+            self.truncate_permission = None
+            self.truncate_requested.emit(table, row_count)
+
+            # UI 응답 대기
+            while self.is_running and self.truncate_permission is None:
+                time.sleep(0.1)
+
+            return bool(self.truncate_permission)
+
         creator = TableCreator(self.source_conn, self.target_conn)
-        created, row_count = creator.ensure_partition_ready(partition_name, truncate_mode="auto")
+        created, row_count = creator.ensure_partition_ready(
+            partition_name,
+            truncate_mode="ask",
+            confirm_callback=confirm_truncate,
+        )
 
         # 결과에 따른 로그 출력
         if created:

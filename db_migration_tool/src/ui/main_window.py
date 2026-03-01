@@ -24,7 +24,7 @@ from PySide6.QtWidgets import (
 
 from src.ui.dialogs.connection_dialog import ConnectionDialog
 from src.ui.dialogs.log_viewer_dialog import LogViewerDialog
-from src.ui.dialogs.migration_dialog import MigrationDialog
+from src.ui.dialogs.migration_wizard_dialog import MigrationWizardDialog
 from src.ui.viewmodels.main_viewmodel import MainViewModel
 
 
@@ -377,7 +377,7 @@ class MainWindow(QMainWindow):
             return
 
         # 마이그레이션 다이얼로그 표시
-        dialog = MigrationDialog(self, self.vm.current_profile)
+        dialog = MigrationWizardDialog(self, self.vm.current_profile)
         dialog.exec()
 
         # 완료 후 이력 새로고침
