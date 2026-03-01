@@ -56,7 +56,9 @@ class LoggerConfig:
         filename = filename_pattern.format(date=datetime.now().strftime("%Y%m%d"))
         log_file = log_dir / filename
 
-        handler = logging.FileHandler(log_file, encoding=encoding)
+        # delay=True: 파일은 실제 로그 기록 시점에 열립니다.
+        # (테스트/윈도우 환경에서 임시 디렉토리 정리 시 파일 잠금 이슈 완화)
+        handler = logging.FileHandler(log_file, encoding=encoding, delay=True)
         handler.setLevel(level)
         handler.setFormatter(logging.Formatter(LoggerConfig.DEFAULT_FORMAT))
         return handler
@@ -113,7 +115,14 @@ class LoggerConfig:
         logger.setLevel(level)
 
         # 기존 핸들러 제거 (중복 방지)
+        # NOTE: Windows에서는 열린 FileHandler 때문에 임시 디렉토리 정리가 실패할 수 있어,
+        # 기존 핸들러는 clear 전에 close() 해준다.
         if clear_existing:
+            for h in list(logger.handlers):
+                try:
+                    h.close()
+                except Exception:
+                    pass
             logger.handlers.clear()
 
         for handler in handlers:
