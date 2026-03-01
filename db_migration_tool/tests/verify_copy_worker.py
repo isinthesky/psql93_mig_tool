@@ -25,7 +25,7 @@ class MockBaseMigrationWorker:
         self.profile = profile
         self.partitions = partitions
         self.history_id = history_id
-        self.resume = resume
+        self.should_resume = resume
         self.checkpoint_manager = MagicMock()
         self.log = MagicMock()
         self.progress = MagicMock()

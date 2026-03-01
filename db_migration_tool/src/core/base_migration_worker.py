@@ -51,7 +51,8 @@ class BaseMigrationWorker(QThread, metaclass=QThreadABCMeta):
         self.profile = profile
         self.partitions = partitions
         self.history_id = history_id
-        self.resume = resume
+        # NOTE: `resume` 속성명은 resume() 메서드와 충돌하므로 다른 이름을 사용한다.
+        self.should_resume = resume
 
         # 공통 상태 필드
         self.is_running = False

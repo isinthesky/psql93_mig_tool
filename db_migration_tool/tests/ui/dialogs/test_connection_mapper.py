@@ -144,7 +144,7 @@ class TestConnectionMapper:
             "ssl": True,
         }
 
-        host, port, db, user, pwd, ssl = ConnectionMapper.profile_config_to_ui(config)
+        host, port, db, user, pwd, ssl, compat = ConnectionMapper.profile_config_to_ui(config)
 
         assert host == "192.168.1.1"
         assert port == 5433
@@ -152,12 +152,13 @@ class TestConnectionMapper:
         assert user == "admin"
         assert pwd == "secret"
         assert ssl is True
+        assert compat == "auto"  # 기본 호환 모드
 
     def test_profile_config_to_ui_with_defaults(self):
         """기본값 적용 테스트"""
         config = {}  # 빈 설정
 
-        host, port, db, user, pwd, ssl = ConnectionMapper.profile_config_to_ui(config)
+        host, port, db, user, pwd, ssl, compat = ConnectionMapper.profile_config_to_ui(config)
 
         assert host == "localhost"
         assert port == 5432
@@ -165,6 +166,7 @@ class TestConnectionMapper:
         assert user == ""
         assert pwd == ""
         assert ssl is False
+        assert compat == "auto"
 
     def test_set_ui_from_config(self, mock_widgets):
         """프로필 Dict → UI 위젯 설정 테스트"""
