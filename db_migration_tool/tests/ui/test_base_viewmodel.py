@@ -36,7 +36,10 @@ class TestBaseViewModel:
         # Given: 초기 상태가 False
         # When/Then: 동일한 값(False)으로 설정 시 시그널 미발행
         # waitSignal이 타임아웃될 것으로 예상
-        with pytest.raises(TimeoutError):
+        # pytest-qt는 자체 TimeoutError를 던집니다.
+        from pytestqt.exceptions import TimeoutError as QtTimeoutError
+
+        with pytest.raises(QtTimeoutError):
             with qtbot.waitSignal(viewmodel.loading_changed, timeout=100):
                 viewmodel.is_loading = False
 

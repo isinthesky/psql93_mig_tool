@@ -185,6 +185,12 @@ class CopyMigrationWorker(BaseMigrationWorker):
             return
 
         try:
+            # 체크포인트를 딕셔너리로 캐싱 (성능 개선)
+            # NOTE: 연결 생성 전에 캐싱을 수행해, 연결 설정 오류가 있더라도
+            # 체크포인트 조회/캐싱 로직은 독립적으로 동작하도록 한다.
+            checkpoints_list = self.checkpoint_manager.get_checkpoints(self.history_id)
+            checkpoints_dict = {cp.partition_name: cp for cp in checkpoints_list}
+
             # psycopg2 연결 생성 (COPY 명령용)
             self.log.emit("PostgreSQL 연결 생성 중...", "INFO")
             log_emitter.emit_log("INFO", "COPY 기반 마이그레이션 시작")
@@ -200,10 +206,6 @@ class CopyMigrationWorker(BaseMigrationWorker):
 
             # 성능 지표 초기화
             self.performance_metrics.total_partitions = len(self.partitions)
-
-            # 체크포인트를 딕셔너리로 캐싱 (성능 개선)
-            checkpoints_list = self.checkpoint_manager.get_checkpoints(self.history_id)
-            checkpoints_dict = {cp.partition_name: cp for cp in checkpoints_list}
 
             # 각 파티션 처리
             for i, partition in enumerate(self.partitions):
