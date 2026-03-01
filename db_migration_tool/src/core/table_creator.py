@@ -58,7 +58,7 @@ class TableCreator:
             # partition_table_info에 추가
             self._add_partition_info(partition_name, partition_info)
 
-            print(f"✓ 파티션 테이블 생성 완료: {partition_name}")
+            print(f"[OK] 파티션 테이블 생성 완료: {partition_name}")
             return True
 
         except Exception as e:
@@ -323,16 +323,16 @@ class TableCreator:
                     cur.execute(f"""
                         CLUSTER {partition_name} USING {partition_name}_pkey
                     """)
-                    print(f"  ✓ 클러스터링 완료: {partition_name}")
+                    print(f"  [OK] 클러스터링 완료: {partition_name}")
                 except psycopg.errors.UndefinedObject:
                     # 인덱스가 없는 경우 (정상)
-                    print(f"  ⚠ 클러스터링 스킵: {partition_name} - PRIMARY KEY 인덱스가 없음")
+                    print(f"  [WARN] 클러스터링 스킵: {partition_name} - PRIMARY KEY 인덱스가 없음")
                 except psycopg.errors.InsufficientPrivilege:
                     # 권한 부족 (경고)
-                    print(f"  ⚠ 클러스터링 실패: {partition_name} - 권한 부족")
+                    print(f"  [WARN] 클러스터링 실패: {partition_name} - 권한 부족")
                 except Exception as e:
                     # 기타 예외 (로깅만)
-                    print(f"  ⚠ 클러스터링 실패: {partition_name} - {type(e).__name__}: {e}")
+                    print(f"  [WARN] 클러스터링 실패: {partition_name} - {type(e).__name__}: {e}")
 
             self.target_conn.commit()
 
@@ -603,7 +603,7 @@ class TableCreator:
 
             cursor.execute(rule_sql)
         else:
-            print(f"  ⚠ RULE 생성을 건너뜀(날짜 범위 없음): {partition_name}")
+            print(f"  [WARN] RULE 생성을 건너뜀(날짜 범위 없음): {partition_name}")
 
     def _create_indexes(self, cursor, statements: list[str]):
         """IF NOT EXISTS가 없는 환경(9.3)에서도 안전하게 인덱스 생성"""
@@ -612,8 +612,8 @@ class TableCreator:
                 cursor.execute(stmt)
             except psycopg.errors.DuplicateObject:
                 # 이미 존재하는 경우 무시
-                print(f"  ⚠ 인덱스 생성 스킵(이미 존재): {stmt.split()[2]}")
+                print(f"  [WARN] 인덱스 생성 스킵(이미 존재): {stmt.split()[2]}")
             except psycopg.errors.InsufficientPrivilege:
-                print(f"  ⚠ 인덱스 생성 실패(권한 부족): {stmt}")
+                print(f"  [WARN] 인덱스 생성 실패(권한 부족): {stmt}")
             except Exception as exc:
-                print(f"  ⚠ 인덱스 생성 실패: {stmt} - {type(exc).__name__}: {exc}")
+                print(f"  [WARN] 인덱스 생성 실패: {stmt} - {type(exc).__name__}: {exc}")
