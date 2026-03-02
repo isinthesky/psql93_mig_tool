@@ -765,6 +765,11 @@ class MigrationWizardDialog(QDialog):
         # 재개 모드에서는 옵션 변경 불가
         self._lock_options_for_resume()
 
+        # 재개 시 server copy 강제 해제
+        self.server_copy_check.setChecked(False)
+        self.copy_mode = "python"
+        self.server_copy_warning.setVisible(False)
+
         pending = self.checkpoint_manager.get_pending_checkpoints(self.history_id)
         pending_names = [cp.partition_name for cp in pending]
 
