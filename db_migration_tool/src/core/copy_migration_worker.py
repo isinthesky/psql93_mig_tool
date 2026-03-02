@@ -2,12 +2,14 @@
 PostgreSQL COPY 명령 기반 고성능 마이그레이션 워커
 """
 
+import os
 import threading
 import time
 from queue import Empty, Queue
 from typing import Any, Union
 
 import psycopg2
+from psycopg2 import sql
 from PySide6.QtCore import Signal
 
 from src.core.base_migration_worker import BaseMigrationWorker
@@ -159,9 +161,11 @@ class CopyMigrationWorker(BaseMigrationWorker):
         history_id: int,
         resume: bool = False,
         batch_size: int = 100000,
+        copy_mode: str = "python",
     ):
         super().__init__(profile, partitions, history_id, resume)
         self.batch_size = batch_size
+        self.copy_mode = copy_mode  # "python" | "server"
 
         # COPY 워커 전용 필드
         self.performance_metrics = PerformanceMetrics()
@@ -234,7 +238,10 @@ class CopyMigrationWorker(BaseMigrationWorker):
 
                 # 파티션 마이그레이션
                 try:
-                    self._migrate_partition_with_copy(partition, checkpoint)
+                    if self.copy_mode == "server":
+                        self._migrate_partition_server_copy(partition, checkpoint)
+                    else:
+                        self._migrate_partition_with_copy(partition, checkpoint)
                 except Exception as e:
                     if self.skip_on_error and self.is_running:
                         self.log.emit(
@@ -609,6 +616,167 @@ class CopyMigrationWorker(BaseMigrationWorker):
                 )
             raise Exception(f"{partition_name} COPY 실패: {str(e)}")
 
+    def _migrate_partition_server_copy(self, partition_name: str, checkpoint: Any):
+        """서버사이드 COPY를 사용한 파티션 마이그레이션 (os.pipe 직접 스트리밍)
+
+        벤치마크(bench_server_copy_ph_3days.py)에서 검증된 패턴을 그대로 포팅.
+        - TEXT 포맷 (tab-delimited, NULL=\\N) → 크로스 버전 안전
+        - 파티션 통짜 스트리밍이라 배치 단위 체크포인트(재개) 불가
+        - 중단 시 해당 파티션은 처음부터 다시 복사해야 함
+        """
+        self.log.emit(f"{partition_name} Server-side COPY 시작", "INFO")
+        log_emitter.emit_log("INFO", f"{partition_name} Server-side COPY 시작")
+
+        try:
+            # 1. 테이블 크기 추정
+            table_info = PostgresOptimizer.estimate_table_size(
+                self.source_conn, partition_name, self.source_version
+            )
+
+            if not table_info.get("exists", True):
+                self.log.emit(
+                    f"{partition_name} - 소스 테이블이 존재하지 않음, 건너뛰기", "WARNING"
+                )
+                log_emitter.emit_log("WARNING", f"{partition_name} - 소스 테이블이 존재하지 않음")
+                self.performance_metrics.completed_partitions += 1
+                self._update_checkpoint_completed(checkpoint, 0)
+                return
+
+            total_rows = table_info["row_count"]
+            total_mb = table_info["total_size_mb"]
+
+            if total_rows == 0:
+                self.log.emit(f"{partition_name} - 데이터 없음", "WARNING")
+                self._update_checkpoint_completed(checkpoint, 0)
+                self.performance_metrics.completed_partitions += 1
+                return
+
+            self.log.emit(f"{partition_name} - {total_rows:,}개 행, {total_mb:.1f}MB", "INFO")
+
+            # 2. 성능 지표 시작
+            self.performance_metrics.start_partition(partition_name, total_rows)
+
+            # 3. 대상 테이블 준비 (서버 모드는 항상 full restart → resume_expected=False)
+            self._prepare_target_table(partition_name, checkpoint=checkpoint, resume_expected=False)
+
+            # 4. 체크포인트 생성/갱신 → "running"
+            if not checkpoint:
+                checkpoint = self.checkpoint_manager.create_checkpoint(
+                    self.history_id, partition_name
+                )
+            self.checkpoint_manager.update_checkpoint_status(
+                checkpoint.id,
+                "running",
+                copy_method="COPY_SRV",
+            )
+
+            # 5. 테이블 타입/컬럼 구성
+            table_type = self._detect_table_type(partition_name)
+            table_config = TABLE_TYPE_CONFIG[table_type]
+            cols = table_config.columns
+
+            cols_sql = sql.SQL(", ").join(map(sql.Identifier, cols))
+            tbl = sql.Identifier(partition_name)
+
+            copy_to = sql.SQL(
+                "COPY (SELECT {cols} FROM {tbl}) "
+                "TO STDOUT WITH (FORMAT text, DELIMITER E'\\t', NULL '\\N')"
+            ).format(cols=cols_sql, tbl=tbl)
+
+            copy_from = sql.SQL(
+                "COPY {tbl} ({cols}) FROM STDIN WITH (FORMAT text, DELIMITER E'\\t', NULL '\\N')"
+            ).format(tbl=tbl, cols=cols_sql)
+
+            # 6. os.pipe → producer thread(source COPY TO) + consumer(target COPY FROM)
+            rfd, wfd = os.pipe()
+            try:
+                rfile = os.fdopen(rfd, "rb", closefd=True)
+            except Exception:
+                os.close(rfd)
+                os.close(wfd)
+                raise
+            try:
+                wfile = os.fdopen(wfd, "wb", closefd=True)
+            except Exception:
+                rfile.close()
+                os.close(wfd)
+                raise
+
+            errors: list[Exception] = []
+
+            def _pump_source():
+                try:
+                    with self.source_conn.cursor() as cur:
+                        cur.copy_expert(copy_to.as_string(self.source_conn), wfile)
+                except Exception as e:
+                    errors.append(e)
+                finally:
+                    try:
+                        wfile.close()
+                    except Exception:
+                        pass
+
+            producer = threading.Thread(target=_pump_source, daemon=True)
+            producer.start()
+
+            try:
+                with self.target_conn.cursor() as target_cursor:
+                    target_cursor.copy_expert(copy_from.as_string(self.target_conn), rfile)
+                    copied_rows = target_cursor.rowcount
+            finally:
+                try:
+                    rfile.close()
+                except Exception:
+                    pass
+                producer.join(timeout=60)
+
+            # 7. producer 완료 확인 및 errors 체크
+            if producer.is_alive():
+                raise Exception(f"{partition_name} producer 스레드가 시간 내 종료되지 않음")
+            if errors:
+                raise errors[0]
+
+            # 8. target_conn.commit()
+            self.target_conn.commit()
+
+            # 9. 성능 지표 업데이트 (1회)
+            estimated_bytes = int(total_mb * 1024 * 1024)
+            self.performance_metrics.update(copied_rows, estimated_bytes)
+            self._emit_performance_metrics()
+
+            # 10. 파티션 완료
+            self.performance_metrics.complete_partition()
+            self._update_checkpoint_completed(checkpoint, copied_rows)
+
+            self.log.emit(
+                f"{partition_name} Server-side COPY 완료: {copied_rows:,}개 행", "SUCCESS"
+            )
+            log_emitter.emit_log(
+                "SUCCESS",
+                f"{partition_name} Server-side COPY 완료: {copied_rows:,}개 행",
+            )
+
+        except Exception as e:
+            # rollback
+            try:
+                self.target_conn.rollback()
+            except Exception:
+                pass
+
+            if checkpoint is None:
+                checkpoint = self.checkpoint_manager.create_checkpoint(
+                    self.history_id, partition_name
+                )
+            if checkpoint:
+                self.checkpoint_manager.update_checkpoint_status(
+                    checkpoint.id,
+                    "failed",
+                    error_message=str(e),
+                    copy_method="COPY_SRV",
+                    bytes_transferred=self.performance_metrics.total_bytes,
+                )
+            raise Exception(f"{partition_name} Server-side COPY 실패: {str(e)}")
+
     def _prepare_target_table(
         self,
         partition_name: str,
@@ -686,11 +854,12 @@ class CopyMigrationWorker(BaseMigrationWorker):
     ):
         """체크포인트 완료 업데이트"""
         if checkpoint:
+            method = "COPY_SRV" if self.copy_mode == "server" else "COPY"
             self.checkpoint_manager.update_checkpoint_status(
                 checkpoint.id,
                 "completed",
                 rows_processed=rows,
-                copy_method="COPY",
+                copy_method=method,
                 bytes_transferred=self.performance_metrics.total_bytes,
                 last_path_id=last_path_id,
                 last_issued_date=last_issued_date,

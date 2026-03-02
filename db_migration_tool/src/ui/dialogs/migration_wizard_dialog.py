@@ -185,6 +185,7 @@ class MigrationWizardDialog(QDialog):
         self.error_strategy = "stop"  # stop|skip
         # COPY 청크(배치) 크기 기본값: 250k (대용량 환경 튜닝 결과)
         self.batch_size = 250000
+        self.copy_mode = "python"  # "python" | "server"
 
         # 탐색 결과
         self.discovered_partitions: list[PartitionSummary] = []
@@ -412,6 +413,16 @@ class MigrationWizardDialog(QDialog):
         self.batch_size_spin.setSuffix(" rows")
         self.batch_size_spin.setToolTip("COPY 청크 단위 LIMIT (1,000 ~ 500,000)")
         row_opts.addWidget(self.batch_size_spin)
+
+        row_opts.addSpacing(20)
+        self.server_copy_check = QCheckBox("Server-side COPY (실험적, ~3x 빠름)")
+        self.server_copy_check.setToolTip(
+            "OS 파이프를 통한 서버 간 직접 스트리밍.\n"
+            "파티션 단위 체크포인트만 지원 (배치 단위 재개 불가).\n"
+            "중단 시 해당 파티션은 처음부터 다시 시작합니다."
+        )
+        self.server_copy_check.toggled.connect(self._on_copy_mode_changed)
+        row_opts.addWidget(self.server_copy_check)
 
         row_opts.addStretch(1)
         layout.addLayout(row_opts)
@@ -726,6 +737,7 @@ class MigrationWizardDialog(QDialog):
         self.stop_on_error_radio.setEnabled(False)
         self.skip_on_error_radio.setEnabled(False)
         self.batch_size_spin.setEnabled(False)
+        self.server_copy_check.setEnabled(False)
         self.start_date_edit.setEnabled(False)
         self.end_date_edit.setEnabled(False)
         self.discover_btn.setEnabled(False)
@@ -803,6 +815,10 @@ class MigrationWizardDialog(QDialog):
 
     def _on_error_strategy_changed(self, _checked: bool):
         self.error_strategy = "stop" if self.stop_on_error_radio.isChecked() else "skip"
+
+    def _on_copy_mode_changed(self, checked: bool):
+        self.copy_mode = "server" if checked else "python"
+        self.batch_size_spin.setEnabled(not checked)  # 서버 모드면 배치 크기 무의미
 
     def _set_preset_days(self, days: int, yesterday: bool = False):
         today = datetime.now().date()
@@ -1090,6 +1106,7 @@ class MigrationWizardDialog(QDialog):
             self.history_id,
             resume=self.resume_mode,
             batch_size=self.batch_size,
+            copy_mode=self.copy_mode,
         )
 
         # 에러 처리 전략
@@ -1112,8 +1129,9 @@ class MigrationWizardDialog(QDialog):
         self.pause_btn.setEnabled(True)
         self.close_btn.setEnabled(False)
 
+        mode_label = "Server-side" if self.copy_mode == "server" else "COPY"
         self.add_log(
-            f"마이그레이션 시작(COPY) - 파티션 {len(partitions)}개, 배치 {self.batch_size:,}",
+            f"마이그레이션 시작({mode_label}) - 파티션 {len(partitions)}개, 배치 {self.batch_size:,}",
             "INFO",
         )
 
