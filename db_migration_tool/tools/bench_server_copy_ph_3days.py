@@ -50,44 +50,22 @@ class Conn:
 PH_COLS = TABLE_TYPE_CONFIG[TableType.POINT_HISTORY].columns
 
 
-def _copy_sql_text_select(partition: str, cols: list[str], where_sql: str, limit: int | None) -> str:
-    cols_sql = sql.SQL(", ").join(map(sql.Identifier, cols))
-    tbl = sql.Identifier(partition)
+def stream_copy_full(src_conn, tgt_conn, partition: str, cols: list[str]):
+    """서버사이드 COPY 스트리밍(전체 테이블).
 
-    base = sql.SQL(
-        "COPY (SELECT {cols} FROM {tbl} {where} ORDER BY issued_date, path_id {limit}) "
-        "TO STDOUT WITH (DELIMITER E'\\t', NULL '\\N')"
-    ).format(
-        cols=cols_sql,
-        tbl=tbl,
-        where=sql.SQL(where_sql),
-        limit=sql.SQL("") if limit is None else sql.SQL("LIMIT %s") % sql.Literal(limit),
-    )
+    source: COPY (SELECT cols FROM partition ORDER BY issued_date, path_id) TO STDOUT
+    target: COPY partition (cols) FROM STDIN
 
-    return base.as_string(psycopg2.connect(""))  # dummy connection for quoting
+    TEXT 포맷을 사용해 PG 9.3 -> 16 간 호환성을 확보한다.
+    """
 
-
-def stream_copy_batch(
-    src_conn,
-    tgt_conn,
-    partition: str,
-    cols: list[str],
-    where_sql: str,
-    limit: int | None,
-):
-    # Build COPY commands using *real* connections for as_string (safe quoting)
     cols_sql = sql.SQL(", ").join(map(sql.Identifier, cols))
     tbl = sql.Identifier(partition)
 
     copy_to = sql.SQL(
-        "COPY (SELECT {cols} FROM {tbl} {where} ORDER BY issued_date, path_id {limit}) "
+        "COPY (SELECT {cols} FROM {tbl} ORDER BY issued_date, path_id) "
         "TO STDOUT WITH (DELIMITER E'\\t', NULL '\\N')"
-    ).format(
-        cols=cols_sql,
-        tbl=tbl,
-        where=sql.SQL(where_sql),
-        limit=sql.SQL("") if limit is None else sql.SQL("LIMIT %s") % sql.Literal(limit),
-    )
+    ).format(cols=cols_sql, tbl=tbl)
 
     copy_from = sql.SQL(
         "COPY {tbl} ({cols}) FROM STDIN WITH (DELIMITER E'\\t', NULL '\\N')"
@@ -148,18 +126,14 @@ def main():
         help="comma-separated partition table names",
     )
 
-    ap.add_argument("--batch-size", type=int, default=250_000)
     ap.add_argument("--sync-commit-off", action="store_true", default=True)
-
     ap.add_argument("--out", default="bench_results/server_copy.json")
 
     args = ap.parse_args()
 
     pw = os.environ.get(args.password_env)
     if not pw:
-        raise SystemExit(
-            f"Missing password env var: {args.password_env} (set it before running)"
-        )
+        raise SystemExit(f"Missing password env var: {args.password_env} (set it before running)")
 
     src = Conn(args.src_host, args.src_port, args.src_db, args.user, pw)
     tgt = Conn(args.tgt_host, args.tgt_port, args.tgt_db, args.user, pw)
@@ -173,10 +147,18 @@ def main():
     per: dict[str, float] = {}
 
     src_conn = psycopg2.connect(
-        host=src.host, port=src.port, database=src.db, user=src.user, password=src.password
+        host=src.host,
+        port=src.port,
+        database=src.db,
+        user=src.user,
+        password=src.password,
     )
     tgt_conn = psycopg2.connect(
-        host=tgt.host, port=tgt.port, database=tgt.db, user=tgt.user, password=tgt.password
+        host=tgt.host,
+        port=tgt.port,
+        database=tgt.db,
+        user=tgt.user,
+        password=tgt.password,
     )
 
     try:
@@ -189,30 +171,12 @@ def main():
         for p in partitions:
             t1 = time.monotonic()
 
-            # Make sure table exists and is empty (auto truncates if has data)
+            # 대상 테이블 + partition_table_info 준비 (기존 데이터 있으면 TRUNCATE)
             creator.ensure_partition_ready(p, truncate_mode="auto")
 
-            # Single batch loop: repeat until empty
-            where_sql = ""
-            while True:
-                before = time.monotonic()
-                # copy 1 chunk
-                stream_copy_batch(
-                    src_conn,
-                    tgt_conn,
-                    p,
-                    PH_COLS,
-                    where_sql=where_sql,
-                    limit=args.batch_size,
-                )
-                tgt_conn.commit()
-
-                # Heuristic: if chunk took almost no time, assume empty
-                if (time.monotonic() - before) < 0.2:
-                    break
-
-                # NOTE: for a real resumable version we would update where_sql based on last key.
-                # For pure benchmark we keep it simple and rely on COPY-to-STDOUT returning 0 rows at the end.
+            # 전체 테이블 서버사이드 COPY
+            stream_copy_full(src_conn, tgt_conn, p, PH_COLS)
+            tgt_conn.commit()
 
             per[p] = time.monotonic() - t1
             print(f"PART_DONE {p} sec={per[p]:.1f}", flush=True)
@@ -224,7 +188,7 @@ def main():
             "elapsed_sec": elapsed,
             "partitions": partitions,
             "per_partition_sec": per,
-            "note": "server-side copy_expert (text) with pipe; benchmark mode (not resumable).",
+            "note": "server-side copy_expert (text) with pipe; full-table copy.",
         }
         out_path.write_text(json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8")
         print(f"SERVER_COPY_DONE total_sec={elapsed:.1f} out={out_path}", flush=True)
