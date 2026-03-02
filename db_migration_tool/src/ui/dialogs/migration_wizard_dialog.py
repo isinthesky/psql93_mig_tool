@@ -1097,9 +1097,13 @@ class MigrationWizardDialog(QDialog):
         # 기존 데이터 처리(C): row_count>0이면 UI에서 확인
         self.worker.truncate_requested.connect(self.on_truncate_requested)
 
+        self._worker_had_error = False
+
         self.worker.progress.connect(self.on_progress)
         self.worker.log.connect(self.add_log)
-        self.worker.finished.connect(self.on_finished)
+        # QThread.finished는 "스레드 종료" 의미(성공/중단/오류 모두)라서,
+        # 여기서는 종료 이벤트로 받고, 성공 여부는 worker.is_running / _worker_had_error로 판정한다.
+        self.worker.finished.connect(self.on_worker_thread_finished)
         self.worker.error.connect(self.on_error)
         self.worker.performance.connect(self.on_performance_update)
 
@@ -1192,13 +1196,46 @@ class MigrationWizardDialog(QDialog):
         self.eta_label.setText(f"예상 완료: {stats.get('eta_time', '계산중...')}")
         self.elapsed_label.setText(f"경과 시간: {stats.get('elapsed_time', '00:00:00')}")
 
-    def on_finished(self):
+    def on_worker_thread_finished(self):
+        """워커 스레드 종료 핸들러
+
+        주의: QThread.finished는 "완료"가 아니라 "종료"이므로,
+        - 오류: on_error에서 처리
+        - 사용자 중단/취소: worker.is_running == False
+        - 정상 완료: worker.is_running == True
+        로 판정한다.
+        """
+
         self.pause_btn.setEnabled(False)
         self.cancel_btn.setEnabled(False)
         self.close_btn.setEnabled(True)
 
+        # 오류 케이스는 on_error에서 status=failed 처리하므로 여기선 건드리지 않는다.
+        if getattr(self, "_worker_had_error", False):
+            self._update_nav_state()
+            return
+
+        if not self.worker:
+            self._update_nav_state()
+            return
+
+        rows_processed = self._get_processed_rows()
+
+        # 중단/취소: 재개 가능해야 하므로 completed로 마킹하지 않는다.
+        if not getattr(self.worker, "is_running", True):
+            if self.history_id:
+                self.history_manager.update_history_status(
+                    self.history_id, "running", processed_rows=rows_processed
+                )
+            self.add_log(
+                "마이그레이션이 중단되었습니다. 나중에 '이어서 진행'으로 재개할 수 있습니다.",
+                "WARNING",
+            )
+            self._update_nav_state()
+            return
+
+        # 정상 완료
         if self.history_id:
-            rows_processed = self._get_processed_rows()
             self.history_manager.update_history_status(
                 self.history_id, "completed", processed_rows=rows_processed
             )
@@ -1208,6 +1245,8 @@ class MigrationWizardDialog(QDialog):
         self._update_nav_state()
 
     def on_error(self, error_msg: str):
+        self._worker_had_error = True
+
         self.pause_btn.setEnabled(False)
         self.cancel_btn.setEnabled(False)
         self.close_btn.setEnabled(True)

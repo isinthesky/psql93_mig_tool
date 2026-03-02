@@ -713,9 +713,20 @@ class MigrationDialog(QDialog):
             self.elapsed_label.setText(f"경과 시간: {hours:02d}:{minutes:02d}:{seconds:02d}")
 
     def on_finished(self):
-        """마이그레이션 완료"""
+        """워커 스레드 종료
+
+        Qt의 QThread.finished는 "정상 완료"가 아니라 "스레드 종료" 이벤트다.
+        - 오류: on_error에서 처리
+        - 사용자 중단/취소: worker.is_running == False
+        - 정상 완료: worker.is_running == True
+        """
+
         self.is_running = False
         self.update_timer.stop()
+
+        # 오류 케이스: on_error에서 status=failed 처리. 여기서는 덮어쓰지 않는다.
+        if getattr(self, "_worker_had_error", False):
+            return
 
         rows_processed = self._get_processed_rows()
 
@@ -724,10 +735,24 @@ class MigrationDialog(QDialog):
         self.apply_batch_btn.setEnabled(False)
 
         if self.worker:
+            was_stopped = not getattr(self.worker, "is_running", True)
             self.worker.deleteLater()
             self.worker = None
+        else:
+            was_stopped = False
 
         if self.history_id:
+            if was_stopped:
+                # 재개 가능하도록 completed로 마킹하지 않는다.
+                self.history_manager.update_history_status(
+                    self.history_id, "running", processed_rows=rows_processed
+                )
+                self.add_log(
+                    "마이그레이션이 중단되었습니다. 나중에 이어서 진행할 수 있습니다.",
+                    "WARNING",
+                )
+                return
+
             self.history_manager.update_history_status(
                 self.history_id, "completed", processed_rows=rows_processed
             )
@@ -751,6 +776,8 @@ class MigrationDialog(QDialog):
 
     def on_error(self, error_msg: str):
         """오류 발생"""
+        self._worker_had_error = True
+
         self.is_running = False
         self.update_timer.stop()
 
