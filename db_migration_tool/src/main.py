@@ -13,9 +13,9 @@ if sys.platform != "win32":  # Windows가 아닌 경우에만
     os.environ["LANG"] = "en_US.UTF-8"
 
 import qdarkstyle
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QSharedMemory, Qt
 from PySide6.QtGui import QIcon
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QMessageBox
 
 from src.database.local_db import LocalDatabase
 from src.ui.main_window import MainWindow
@@ -68,6 +68,19 @@ def main():
     # 애플리케이션 초기화
     app = initialize_application()
 
+    # --- 싱글 인스턴스 가드 ---
+    shared_mem = QSharedMemory("DBMigrationTool_SingleInstance")
+    if not shared_mem.create(1):
+        QMessageBox.warning(
+            None,
+            "중복 실행",
+            "DB 마이그레이션 도구가 이미 실행 중입니다.\n"
+            "기존 창을 확인해 주세요.",
+        )
+        return 0
+    # shared_mem은 프로세스 종료 시 OS가 자동 해제 (Windows)
+    # --------------------------
+
     # 트레이 아이콘 사용 시 윈도우 닫힘으로 종료 방지
     app.setQuitOnLastWindowClosed(False)
 
@@ -75,8 +88,6 @@ def main():
     try:
         initialize_database()
     except Exception as e:
-        from PySide6.QtWidgets import QMessageBox
-
         QMessageBox.critical(
             None, "초기화 오류", f"데이터베이스 초기화 중 오류가 발생했습니다:\n{str(e)}"
         )
