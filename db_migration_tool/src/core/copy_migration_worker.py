@@ -423,16 +423,15 @@ class CopyMigrationWorker(BaseMigrationWorker):
             # 성능 지표 시작
             self.performance_metrics.start_partition(partition_name, total_rows)
 
-            # 대상 테이블 준비
-            self._prepare_target_table(partition_name)
-
-            # 재개 지점 결정
+            # 재개 지점 결정 (대상 테이블 준비 전에 판단해야, resume 시 TRUNCATE를 피할 수 있음)
+            resume_expected = False
             if checkpoint:
                 # 체크포인트 필드 우선 사용
                 if checkpoint.last_path_id is not None:
                     last_path_id = checkpoint.last_path_id
                     last_issued_date = checkpoint.last_issued_date
                     accumulated_rows = checkpoint.rows_processed
+                    resume_expected = True
                     self.log.emit(
                         f"재개 지점 (DB): path_id={last_path_id}, issued_date={last_issued_date}",
                         "INFO",
@@ -446,12 +445,16 @@ class CopyMigrationWorker(BaseMigrationWorker):
                         last_path_id = data.get("last_path_id")
                         last_issued_date = data.get("last_issued_date")
                         accumulated_rows = checkpoint.rows_processed
+                        resume_expected = True
                         self.log.emit(
                             f"재개 지점 (JSON): path_id={last_path_id}, issued_date={last_issued_date}",
                             "INFO",
                         )
                     except (json.JSONDecodeError, KeyError, TypeError):
                         pass
+
+            # 대상 테이블 준비
+            self._prepare_target_table(partition_name, checkpoint=checkpoint, resume_expected=resume_expected)
 
             # 체크포인트가 없으면 생성하여 진행 중 상태를 기록할 수 있게 함
             if not checkpoint:
@@ -606,13 +609,20 @@ class CopyMigrationWorker(BaseMigrationWorker):
                 )
             raise Exception(f"{partition_name} COPY 실패: {str(e)}")
 
-    def _prepare_target_table(self, partition_name: str):
+    def _prepare_target_table(
+        self,
+        partition_name: str,
+        checkpoint: Any | None = None,
+        resume_expected: bool = False,
+    ) -> tuple[bool, int]:
         """대상 테이블 준비
 
         정책:
         - 테이블이 없으면 생성
         - 테이블이 있고 row_count=0이면 그대로 진행
-        - 테이블이 있고 row_count>0이면 UI에 확인을 요청한 뒤 TRUNCATE 여부 결정
+        - 테이블이 있고 row_count>0이면:
+          - 일반 모드: UI 확인 후 TRUNCATE 여부 결정 (ask)
+          - 재개(resume) 모드: 기존 데이터가 "정상"이므로 TRUNCATE하지 않음 (keep)
         """
 
         def confirm_truncate(table: str, row_count: int) -> bool:
@@ -636,10 +646,19 @@ class CopyMigrationWorker(BaseMigrationWorker):
             return bool(self.truncate_permission)
 
         creator = TableCreator(self.source_conn, self.target_conn)
+
+        if resume_expected and checkpoint is not None and (checkpoint.rows_processed or 0) > 0:
+            # 재개 모드: 부분 데이터가 이미 들어있을 수 있으므로 keep
+            truncate_mode = "keep"
+            cb = None
+        else:
+            truncate_mode = "ask"
+            cb = confirm_truncate
+
         created, row_count = creator.ensure_partition_ready(
             partition_name,
-            truncate_mode="ask",
-            confirm_callback=confirm_truncate,
+            truncate_mode=truncate_mode,
+            confirm_callback=cb,
         )
 
         # 결과에 따른 로그 출력
@@ -647,8 +666,16 @@ class CopyMigrationWorker(BaseMigrationWorker):
             self.log.emit(f"{partition_name} 테이블 생성 완료", "SUCCESS")
             log_emitter.emit_log("SUCCESS", f"{partition_name} 테이블 생성 완료")
         elif row_count > 0:
-            self.log.emit(f"{partition_name} 기존 데이터 삭제 완료", "INFO")
-            log_emitter.emit_log("INFO", f"{partition_name} 기존 데이터 삭제 완료")
+            if truncate_mode == "keep":
+                self.log.emit(
+                    f"{partition_name} 재개 모드: 기존 데이터 유지 (rows={row_count:,})",
+                    "INFO",
+                )
+            else:
+                self.log.emit(f"{partition_name} 기존 데이터 삭제 완료", "INFO")
+                log_emitter.emit_log("INFO", f"{partition_name} 기존 데이터 삭제 완료")
+
+        return created, row_count
 
     def _update_checkpoint_completed(
         self,

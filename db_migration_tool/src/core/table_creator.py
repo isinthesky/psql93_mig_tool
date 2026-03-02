@@ -397,7 +397,10 @@ class TableCreator:
 
         Args:
             partition_name: 파티션 테이블 이름
-            truncate_mode: 'auto' (자동 TRUNCATE), 'ask' (사용자 확인)
+            truncate_mode:
+                - 'auto': 데이터가 있으면 자동 TRUNCATE
+                - 'ask': 데이터가 있으면 사용자 확인 후 TRUNCATE
+                - 'keep': 데이터가 있어도 TRUNCATE 하지 않고 그대로 진행(재개/스모크 용)
             confirm_callback: 사용자 확인 콜백 함수 (truncate_mode='ask'일 때)
                              함수 시그니처: callback(partition_name: str, row_count: int) -> bool
 
@@ -442,6 +445,10 @@ class TableCreator:
                     if confirm_callback is None:
                         raise ValueError("confirm_callback required for 'ask' mode")
                     should_truncate = confirm_callback(partition_name, row_count)
+                elif truncate_mode == "keep":
+                    # 재개(resume) 등에서 부분 데이터가 이미 존재하는 상황
+                    # (TRUNCATE하지 않고 그대로 진행)
+                    should_truncate = False
                 else:
                     raise ValueError(f"Invalid truncate_mode: {truncate_mode}")
 
@@ -449,7 +456,9 @@ class TableCreator:
                     cursor.execute(f"TRUNCATE TABLE {partition_name} RESTART IDENTITY")
                     self.target_conn.commit()
                 else:
-                    raise Exception(f"기존 데이터 처리가 취소되었습니다: {partition_name}")
+                    # keep 모드는 예외 없이 진행
+                    if truncate_mode != "keep":
+                        raise Exception(f"기존 데이터 처리가 취소되었습니다: {partition_name}")
 
             return (False, row_count)
 
