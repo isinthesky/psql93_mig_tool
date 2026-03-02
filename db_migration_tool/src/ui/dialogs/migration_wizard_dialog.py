@@ -183,7 +183,8 @@ class MigrationWizardDialog(QDialog):
         self.selected_table_types: list[TableType] = [TableType.POINT_HISTORY]
         self.table_type_checkboxes: dict[TableType, QCheckBox] = {}
         self.error_strategy = "stop"  # stop|skip
-        self.batch_size = 100000
+        # COPY 청크(배치) 크기 기본값: 250k (대용량 환경 튜닝 결과)
+        self.batch_size = 250000
 
         # 탐색 결과
         self.discovered_partitions: list[PartitionSummary] = []
