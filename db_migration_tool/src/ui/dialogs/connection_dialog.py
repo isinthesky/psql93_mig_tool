@@ -79,19 +79,15 @@ class ConnectionDialog(QDialog):
 
         # 연결 테스트 버튼 추가
         self.test_source_btn = QPushButton("소스 테스트")
-        self.test_source_btn.setStyleSheet("""
-            QPushButton {
-                font-size: 16px;
-                padding: 10px 18px;
-                min-height: 40px;
-                font-weight: bold;
-            }
-        """)
         self.test_source_btn.clicked.connect(lambda: self.test_connection("source"))
         button_box.addButton(self.test_source_btn, QDialogButtonBox.ActionRole)
 
         self.test_target_btn = QPushButton("대상 테스트")
-        self.test_target_btn.setStyleSheet("""
+        self.test_target_btn.clicked.connect(lambda: self.test_connection("target"))
+        button_box.addButton(self.test_target_btn, QDialogButtonBox.ActionRole)
+
+        # 모든 버튼 동일 크기로 통일
+        button_box.setStyleSheet("""
             QPushButton {
                 font-size: 16px;
                 padding: 10px 18px;
@@ -99,8 +95,6 @@ class ConnectionDialog(QDialog):
                 font-weight: bold;
             }
         """)
-        self.test_target_btn.clicked.connect(lambda: self.test_connection("target"))
-        button_box.addButton(self.test_target_btn, QDialogButtonBox.ActionRole)
 
         layout.addWidget(button_box)
 

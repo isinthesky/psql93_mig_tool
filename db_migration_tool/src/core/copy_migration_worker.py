@@ -197,6 +197,17 @@ class CopyMigrationWorker(BaseMigrationWorker):
             self._check_connections()
             return
 
+        # 방어: server-side COPY는 재개 모드 미지원 → Python COPY로 자동 전환
+        if self.copy_mode == "server" and self.should_resume:
+            self.log.emit(
+                "Server-side COPY는 재개 모드 미지원. Python COPY로 전환합니다.",
+                "WARNING",
+            )
+            log_emitter.emit_log(
+                "WARNING", "Server-side COPY → Python COPY 자동 전환 (resume)"
+            )
+            self.copy_mode = "python"
+
         try:
             # 체크포인트를 딕셔너리로 캐싱 (성능 개선)
             # NOTE: 연결 생성 전에 캐싱을 수행해, 연결 설정 오류가 있더라도
@@ -818,6 +829,10 @@ class CopyMigrationWorker(BaseMigrationWorker):
         if resume_expected and checkpoint is not None and (checkpoint.rows_processed or 0) > 0:
             # 재개 모드: 부분 데이터가 이미 들어있을 수 있으므로 keep
             truncate_mode = "keep"
+            cb = None
+        elif self.copy_mode == "server":
+            # 서버 모드는 항상 full restart → 파티션별 프롬프트 없이 자동 truncate
+            truncate_mode = "auto"
             cb = None
         else:
             truncate_mode = "ask"
