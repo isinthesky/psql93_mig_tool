@@ -264,6 +264,18 @@ class HistoryRepository(BaseRepository[MigrationHistory]):
         """
         return self.get_all(order_by=MigrationHistory.started_at.desc())
 
+    def get_completed_by_profile(self, profile_id: int) -> list[MigrationHistory]:
+        """프로필의 완료된 이력 조회"""
+        with self._session_scope() as session:
+            results = (
+                session.query(MigrationHistory)
+                .filter_by(profile_id=profile_id, status="completed")
+                .all()
+            )
+            for obj in results:
+                session.expunge(obj)
+            return results
+
 
 class CheckpointRepository(BaseRepository[Checkpoint]):
     """Checkpoint 전용 리포지토리"""
@@ -288,6 +300,21 @@ class CheckpointRepository(BaseRepository[Checkpoint]):
             체크포인트 리스트
         """
         return self.get_many_by(history_id=history_id, order_by=Checkpoint.partition_name)
+
+    def get_completed_names_by_history_ids(self, history_ids: list[int]) -> list[Checkpoint]:
+        """여러 이력의 완료 체크포인트 조회"""
+        if not history_ids:
+            return []
+        with self._session_scope() as session:
+            results = (
+                session.query(Checkpoint)
+                .filter(Checkpoint.history_id.in_(history_ids))
+                .filter(Checkpoint.status == "completed")
+                .all()
+            )
+            for obj in results:
+                session.expunge(obj)
+            return results
 
     def get_pending_by_history(self, history_id: int) -> list[Checkpoint]:
         """미완료 체크포인트 조회
