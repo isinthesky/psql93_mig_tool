@@ -319,3 +319,15 @@ node_modules/
 # poetry.lock
 # package-lock.json
 # yarn.lock
+# Local bench/smoke scripts and artifacts (do not commit)
+bench_results/
+bench_*.py
+wizard_*.py
+*_smoke*.py
+smoke_run_*.py
+migtool_*smoke*.py
+migtool_pw.txt
+e2e_profile_id.txt
+_print_env.py
+quote_test.py
+db_init_debug.py
