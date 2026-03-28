@@ -26,33 +26,29 @@ def ms_to_date(ms: int):
     return datetime.fromtimestamp(ms / 1000).date()
 
 
-def pick_smallest_consecutive_window(parts: list[Part], days: int) -> list[Part]:
-    parts = sorted(parts, key=lambda p: p.day)
-    by_day = {p.day: p for p in parts}
-    days_list = sorted(by_day.keys())
+def pick_smallest_adjacent_window(parts: list[Part], count: int) -> list[Part]:
+    """Pick an adjacent window in time order with the smallest (approx) row sum.
+
+    Works for both daily partitions(PH) and monthly partitions(TH/ED/RT).
+    """
+    parts_sorted = sorted(parts, key=lambda p: p.from_ms)
 
     best_parts: list[Part] | None = None
     best_sum: int | None = None
 
-    for i in range(0, len(days_list) - days + 1):
-        window_days = days_list[i : i + days]
-
-        # consecutive check
-        if any((window_days[j] - window_days[j - 1]).days != 1 for j in range(1, len(window_days))):
-            continue
-
-        window_parts = [by_day[d] for d in window_days]
-        s = sum(max(0, int(p.approx_rows or 0)) for p in window_parts)
+    for i in range(0, len(parts_sorted) - count + 1):
+        window = parts_sorted[i : i + count]
+        s = sum(max(0, int(p.approx_rows or 0)) for p in window)
         if s <= 0:
             continue
-
         if best_sum is None or s < best_sum:
             best_sum = s
-            best_parts = window_parts
+            best_parts = window
 
     if not best_parts:
-        raise RuntimeError("Could not find a consecutive non-empty window")
+        raise RuntimeError("Could not find a non-empty window")
     return best_parts
+
 
 
 def load_profile_bms93_to_bms30():
@@ -82,7 +78,7 @@ def load_profile_bms93_to_bms30():
     return candidates[0]
 
 
-def discover_ph_parts(profile, limit: int = 180) -> list[Part]:
+def discover_parts(profile, table_data: str, limit: int = 180) -> list[Part]:
     sc = profile.source_config
     conn = psycopg.connect(
         host=sc["host"],
@@ -98,13 +94,13 @@ def discover_ph_parts(profile, limit: int = 180) -> list[Part]:
             """
             SELECT p.table_name, p.from_date, p.to_date, COALESCE(c.reltuples::bigint, 0) AS approx_rows
             FROM partition_table_info p
-            LEFT JOIN pg_class c ON c.relname = p.table_name
-            WHERE p.table_data = 'PH'
+            JOIN pg_class c ON c.relname = p.table_name
+            WHERE p.table_data = %s
               AND p.use_flag = true
             ORDER BY p.from_date DESC
             LIMIT %s
             """,
-            (limit,),
+            (table_data, limit),
         )
         rows = cur.fetchall()
 
@@ -161,7 +157,7 @@ def verify_counts(profile, table_names: list[str]) -> tuple[bool, list[dict]]:
     return ok_all, results
 
 
-def run_once(profile, partitions: list[str], start_day: str, end_day: str, copy_mode: str, batch_size: int) -> dict:
+def run_once(profile, partitions: list[str], start_day: str, end_day: str, bench_tag: str, copy_mode: str, batch_size: int) -> dict:
     hm = HistoryManager()
     cm = CheckpointManager()
 
@@ -169,8 +165,8 @@ def run_once(profile, partitions: list[str], start_day: str, end_day: str, copy_
         profile_id=profile.id,
         start_date=start_day,
         end_date=end_day,
-        source_status=f"(bench) {copy_mode}",
-        target_status=f"(bench) {copy_mode}",
+        source_status=f"(bench) {bench_tag}:{copy_mode}",
+        target_status=f"(bench) {bench_tag}:{copy_mode}",
     )
     history_id = hist.id
 
@@ -215,6 +211,7 @@ def run_once(profile, partitions: list[str], start_day: str, end_day: str, copy_
         hm.update_history_status(history_id, "running", processed_rows=processed_rows)
 
     return {
+        "bench_tag": bench_tag,
         "copy_mode": copy_mode,
         "history_id": history_id,
         "elapsed_sec": elapsed,
@@ -226,56 +223,68 @@ def run_once(profile, partitions: list[str], start_day: str, end_day: str, copy_
 
 
 def main():
-    days = int(os.environ.get("BENCH_DAYS", "2"))
+    default_count = int(os.environ.get("BENCH_COUNT", os.environ.get("BENCH_DAYS", "2")))
     batch_size = int(os.environ.get("BENCH_BATCH", "50000"))
 
-    # Order matters: run python first (creates baseline), then server (will TRUNCATE), then auto.
+    # Order matters: run python first (baseline), then server, then auto
     modes = os.environ.get("BENCH_MODES", "python,server,auto").split(",")
     modes = [m.strip() for m in modes if m.strip()]
 
     profile = load_profile_bms93_to_bms30()
     print(f"[PROFILE] id={profile.id} name={profile.name}")
 
-    parts = discover_ph_parts(profile)
-    window = pick_smallest_consecutive_window(parts, days=days)
+    table_data_list = os.environ.get("BENCH_TABLE_DATA", "PH").split(",")
+    table_data_list = [t.strip().upper() for t in table_data_list if t.strip()]
 
-    start_day = window[0].day.strftime("%Y-%m-%d")
-    end_day = window[-1].day.strftime("%Y-%m-%d")
-    partitions = [p.name for p in window]
+    for table_data in table_data_list:
+        count = int(os.environ.get(f"BENCH_COUNT_{table_data}", str(default_count)))
 
-    print(f"[RANGE] days={days} {start_day} ~ {end_day}")
-    for p in window:
-        print(f"  - {p.name} day={p.day} approx_rows={p.approx_rows:,}")
-    print(f"[RANGE_SUM] approx_rows_sum={sum(p.approx_rows for p in window):,}")
+        print()
+        print()
+        print("############################")
+        print(f"# TABLE_DATA={table_data} count={count}")
+        print("############################")
+        print()
 
-    results = []
-    for mode in modes:
-        print(f"\n=== RUN: {mode} ===")
-        r = run_once(profile, partitions, start_day, end_day, mode, batch_size)
-        print(f"[RESULT] {r}")
+        parts = discover_parts(profile, table_data)
+        try:
+            window = pick_smallest_adjacent_window(parts, count=count)
+        except RuntimeError as e:
+            print(f"[SKIP] table_data={table_data}: {e}")
+            continue
 
-        # verify after each run
-        v0 = time.time()
-        ok, detail = verify_counts(profile, partitions)
-        v_elapsed = time.time() - v0
-        print(f"[VERIFY] ok={ok} elapsed={v_elapsed:.2f}s")
-        for d in detail:
-            print(f"  - {d['table']}: source={d['source']:,} target={d['target']:,} ok={d['ok']}")
+        start_day = window[0].day.strftime("%Y-%m-%d")
+        end_day = window[-1].day.strftime("%Y-%m-%d")
+        partitions = [p.name for p in window]
 
-        r["verify_ok"] = ok
-        r["verify_elapsed_sec"] = v_elapsed
-        results.append(r)
+        print(f"[RANGE] table_data={table_data} count={count} {start_day} ~ {end_day}")
+        for part in window:
+            print(f"  - {part.name} day={part.day} approx_rows={part.approx_rows:,}")
+        print(f"[RANGE_SUM] approx_rows_sum={sum(p.approx_rows for p in window):,}")
 
-    print("\n=== SUMMARY ===")
-    # print as simple table
-    for r in results:
-        rows = int(r["processed_rows"] or 0)
-        sec = float(r["elapsed_sec"] or 0)
-        speed = rows / sec if sec > 0 else 0
-        print(
-            f"- {r['copy_mode']:>6}: elapsed={sec:7.1f}s  rows={rows:,}  speed={speed:,.0f} rows/sec  verify_ok={r['verify_ok']}"
-        )
+        results = []
+        for mode in modes:
+            print(f"\n=== RUN: {mode} ===")
+            r = run_once(profile, partitions, start_day, end_day, table_data, mode, batch_size)
+            print(f"[RESULT] {r}")
 
+            v0 = time.time()
+            ok, detail = verify_counts(profile, partitions)
+            v_elapsed = time.time() - v0
+            print(f"[VERIFY] ok={ok} elapsed={v_elapsed:.2f}s")
+            for d in detail:
+                print(f"  - {d['table']}: source={d['source']:,} target={d['target']:,} ok={d['ok']}")
+
+            r["verify_ok"] = ok
+            r["verify_elapsed_sec"] = v_elapsed
+            results.append(r)
+
+        print("\n=== SUMMARY ===")
+        for r in results:
+            rows = int(r.get("processed_rows") or 0)
+            sec = float(r.get("elapsed_sec") or 0)
+            speed = rows / sec if sec > 0 else 0
+            print(f"- {r['copy_mode']:>6}: elapsed={sec:7.1f}s  rows={rows:,}  speed={speed:,.0f} rows/sec  verify_ok={r['verify_ok']}")
 
 if __name__ == "__main__":
     main()
