@@ -165,7 +165,10 @@ class CopyMigrationWorker(BaseMigrationWorker):
     ):
         super().__init__(profile, partitions, history_id, resume)
         self.batch_size = batch_size
-        self.copy_mode = copy_mode  # "python" | "server"
+        self.copy_mode = copy_mode  # "python" | "server" | "auto"
+
+        # auto 모드: server-side COPY 가능 여부를 1회 확인 후 캐시
+        self._auto_server_copy_ok: bool | None = None
 
         # COPY 워커 전용 필드
         self.performance_metrics = PerformanceMetrics()
@@ -198,7 +201,7 @@ class CopyMigrationWorker(BaseMigrationWorker):
             return
 
         # 방어: server-side COPY는 재개 모드 미지원 → Python COPY로 자동 전환
-        if self.copy_mode == "server" and self.should_resume:
+        if self.copy_mode in ("server", "auto") and self.should_resume:
             self.log.emit(
                 "Server-side COPY는 재개 모드 미지원. Python COPY로 전환합니다.",
                 "WARNING",
@@ -251,6 +254,32 @@ class CopyMigrationWorker(BaseMigrationWorker):
                 try:
                     if self.copy_mode == "server":
                         self._migrate_partition_server_copy(partition, checkpoint)
+                    elif self.copy_mode == "auto":
+                        # auto: server-side 가능 여부를 1회 확인 후 캐시
+                        if self._auto_server_copy_ok is False:
+                            self._migrate_partition_with_copy(partition, checkpoint)
+                        else:
+                            try:
+                                self._migrate_partition_server_copy(partition, checkpoint)
+                                self._auto_server_copy_ok = True
+                            except Exception as e:
+                                self._auto_server_copy_ok = False
+                                self._log(
+                                    f"{partition} - Server-side COPY 실패 → Python COPY로 전환: {e}",
+                                    "WARNING",
+                                )
+                                if checkpoint:
+                                    try:
+                                        self.checkpoint_manager.update_checkpoint_status(
+                                            checkpoint.id,
+                                            "pending",
+                                            error_message="",
+                                            rows_processed=0,
+                                            bytes_transferred=0,
+                                        )
+                                    except Exception:
+                                        pass
+                                self._migrate_partition_with_copy(partition, checkpoint)
                     else:
                         self._migrate_partition_with_copy(partition, checkpoint)
                 except Exception as e:
@@ -391,123 +420,191 @@ class CopyMigrationWorker(BaseMigrationWorker):
         """값을 SQL 리터럴로 변환 (재개 조건용)"""
         if value is None:
             return "NULL"
+
+        # 숫자(bigint 등)
         if not is_timestamp:
             try:
                 int_val = int(value)
                 return str(int_val)
             except (TypeError, ValueError):
                 pass
-        safe = str(value).replace("'", "''")
+
+        # timestamp(예: energy_display.issued_date)
         if is_timestamp:
+            try:
+                import datetime as _dt
+                if isinstance(value, (_dt.datetime, _dt.date)):
+                    safe = value.isoformat(sep=" ")
+                else:
+                    safe = str(value)
+            except Exception:
+                safe = str(value)
+
+            safe = safe.replace("T", " ")
+            safe = safe.replace("'", "''")
             return f"'{safe}'::timestamp"
+
+        safe = str(value).replace("'", "''")
         return f"'{safe}'"
 
-    def _migrate_partition_with_copy(self, partition_name: str, checkpoint: Any):
-        """COPY 명령을 사용한 파티션 마이그레이션 (청크 단위 처리)"""
-        self.log.emit(f"{partition_name} COPY 마이그레이션 시작 (배치 크기: {self.batch_size:,})", "INFO")
-        log_emitter.emit_log("INFO", f"{partition_name} COPY 마이그레이션 시작")
+    def _get_target_last_key(self, partition_name: str, key_column: str, date_column: str):
+        """대상 테이블에서 마지막 키(재개 SSOT) 조회
 
+        Returns:
+            (last_key, last_date) 또는 None
+        """
+        if not self.target_conn:
+            return None
+
+        with self.target_conn.cursor() as cur:
+            q = sql.SQL(
+                "SELECT {k}, {d} FROM {t} ORDER BY {k} DESC, {d} DESC LIMIT 1"
+            ).format(
+                k=sql.Identifier(key_column),
+                d=sql.Identifier(date_column),
+                t=sql.Identifier(partition_name),
+            )
+            try:
+                cur.execute(q)
+                row = cur.fetchone()
+            except Exception:
+                return None
+
+        if not row:
+            return None
+        return row[0], row[1]
+
+
+    def _migrate_partition_with_copy(self, partition_name: str, checkpoint: Any):
+        """COPY 명령을 사용한 파티션 마이그레이션 (청크 단위 처리)
+        정합성(중복 방지) 정책:
+        - resume 모드에서는 checkpoint보다 **대상 테이블의 마지막 키**를 SSOT로 삼아 이어서 진행한다.
+        """
+        self._log(f"{partition_name} COPY 마이그레이션 시작 (배치 크기: {self.batch_size:,})")
         accumulated_rows = 0
         last_path_id = None
         last_issued_date = None
-
+        last_issued_date_text = None
+        # 테이블 타입/컬럼 구성 (resume 판단에도 필요)
+        table_type = self._detect_table_type(partition_name)
+        table_config = TABLE_TYPE_CONFIG[table_type]
+        columns_csv = ", ".join(table_config.columns)
+        key_column = table_config.columns[0]
+        date_column = table_config.date_column
+        is_timestamp_date = table_config.date_is_timestamp
         try:
             # 테이블 크기 추정
             table_info = PostgresOptimizer.estimate_table_size(
                 self.source_conn, partition_name, self.source_version
             )
-
             # 테이블이 존재하지 않는 경우
             if not table_info.get("exists", True):
-                self.log.emit(
+                self._log(
                     f"{partition_name} - 소스 테이블이 존재하지 않음, 건너뛰기", "WARNING"
                 )
-                log_emitter.emit_log("WARNING", f"{partition_name} - 소스 테이블이 존재하지 않음")
                 self.performance_metrics.completed_partitions += 1
-                self._update_checkpoint_completed(checkpoint, 0)
+                self._update_checkpoint_completed(checkpoint, 0, copy_method="COPY")
                 return
-
             total_rows = table_info["row_count"]
             total_mb = table_info["total_size_mb"]
-
             if total_rows == 0:
-                self.log.emit(f"{partition_name} - 데이터 없음", "WARNING")
-                self._update_checkpoint_completed(checkpoint, 0)
+                self._log(f"{partition_name} - 데이터 없음", "WARNING")
+                self._update_checkpoint_completed(checkpoint, 0, copy_method="COPY")
                 self.performance_metrics.completed_partitions += 1
                 return
-
-            self.log.emit(f"{partition_name} - {total_rows:,}개 행, {total_mb:.1f}MB", "INFO")
-
+            self._log(f"{partition_name} - {total_rows:,}개 행, {total_mb:.1f}MB")
             # 성능 지표 시작
             self.performance_metrics.start_partition(partition_name, total_rows)
-
-            # 재개 지점 결정 (대상 테이블 준비 전에 판단해야, resume 시 TRUNCATE를 피할 수 있음)
-            resume_expected = False
+            # --- checkpoint 기반(보조) 재개 지점 로드 ---
             if checkpoint:
-                # 체크포인트 필드 우선 사용
                 if checkpoint.last_path_id is not None:
                     last_path_id = checkpoint.last_path_id
-                    last_issued_date = checkpoint.last_issued_date
-                    accumulated_rows = checkpoint.rows_processed
-                    resume_expected = True
-                    self.log.emit(
-                        f"재개 지점 (DB): path_id={last_path_id}, issued_date={last_issued_date}",
-                        "INFO",
+                    if is_timestamp_date:
+                        last_issued_date_text = getattr(checkpoint, "last_issued_date_text", None)
+                        if last_issued_date_text is None and checkpoint.last_issued_date is not None:
+                            last_issued_date_text = str(checkpoint.last_issued_date)
+                    else:
+                        last_issued_date = checkpoint.last_issued_date
+                    accumulated_rows = int(checkpoint.rows_processed or 0)
+                    self._log(
+                        f"재개 지점 (DB checkpoint): key={last_path_id}, issued_date={last_issued_date_text or last_issued_date}",
                     )
-                # 하위 호환성: error_message JSON 파싱
                 elif checkpoint.rows_processed > 0 and checkpoint.error_message:
                     import json
-
                     try:
                         data = json.loads(checkpoint.error_message)
                         last_path_id = data.get("last_path_id")
-                        last_issued_date = data.get("last_issued_date")
-                        accumulated_rows = checkpoint.rows_processed
-                        resume_expected = True
-                        self.log.emit(
-                            f"재개 지점 (JSON): path_id={last_path_id}, issued_date={last_issued_date}",
-                            "INFO",
+                        if is_timestamp_date:
+                            last_issued_date_text = data.get("last_issued_date")
+                        else:
+                            last_issued_date = data.get("last_issued_date")
+                        accumulated_rows = int(checkpoint.rows_processed or 0)
+                        self._log(
+                            f"재개 지점 (JSON): key={last_path_id}, issued_date={last_issued_date_text or last_issued_date}",
                         )
                     except (json.JSONDecodeError, KeyError, TypeError):
                         pass
-
-            # 대상 테이블 준비
-            self._prepare_target_table(partition_name, checkpoint=checkpoint, resume_expected=resume_expected)
-
-            # 체크포인트가 없으면 생성하여 진행 중 상태를 기록할 수 있게 함
+            # --- 대상 테이블 준비 ---
+            resume_expected = bool(self.should_resume)
+            _created, target_row_count = self._prepare_target_table(
+                partition_name, checkpoint=checkpoint, resume_expected=resume_expected
+            )
+            if resume_expected and target_row_count and accumulated_rows < int(target_row_count):
+                accumulated_rows = int(target_row_count)
             if not checkpoint:
                 checkpoint = self.checkpoint_manager.create_checkpoint(
                     self.history_id, partition_name
                 )
-
-            # 진행률 계산이 재개 지점부터 시작되도록 반영
             if accumulated_rows:
                 self.performance_metrics.current_partition_rows = accumulated_rows
-
-            # 테이블 타입/컬럼 구성
-            table_type = self._detect_table_type(partition_name)
-            table_config = TABLE_TYPE_CONFIG[table_type]
-            columns_csv = ", ".join(table_config.columns)
-            key_column = table_config.columns[0]
-            date_column = table_config.date_column
-            is_timestamp_date = table_config.date_is_timestamp
-
+            # --- resume SSOT: 대상 테이블 마지막 키 조회 ---
+            if resume_expected:
+                anchor = self._get_target_last_key(partition_name, key_column, date_column)
+                if anchor:
+                    anchor_key, anchor_date = anchor
+                    try:
+                        last_path_id = int(anchor_key)
+                    except Exception:
+                        last_path_id = anchor_key
+                    if is_timestamp_date:
+                        last_issued_date_text = str(anchor_date)
+                        last_issued_date = None
+                    else:
+                        try:
+                            last_issued_date = int(anchor_date)
+                        except Exception:
+                            last_issued_date = anchor_date
+                        last_issued_date_text = None
+                    self._log(
+                        f"재개 SSOT(대상): key={last_path_id}, issued_date={last_issued_date_text or last_issued_date}",
+                        "INFO",
+                    )
+                    self.checkpoint_manager.update_checkpoint_status(
+                        checkpoint.id,
+                        "running",
+                        rows_processed=accumulated_rows,
+                        last_path_id=last_path_id,
+                        last_issued_date=last_issued_date,
+                        last_issued_date_text=last_issued_date_text,
+                        copy_method="COPY",
+                    )
+                else:
+                    last_path_id = None
+                    last_issued_date = None
+                    last_issued_date_text = None
+                    self._log("재개 모드: 대상 테이블에 기존 데이터 없음 → 처음부터 진행", "INFO")
             # 청크 단위 처리 루프
             while self.is_running:
-                # 일시정지 확인 (배치 경계에서만 반영)
                 self._check_pause()
-
-                # WHERE 절 구성
                 where_clause = ""
-                if last_path_id is not None:
+                if last_path_id is not None and (last_issued_date_text is not None or last_issued_date is not None):
                     key_literal = self._format_literal(last_path_id, is_timestamp=False)
-                    date_literal = self._format_literal(last_issued_date, is_timestamp_date)
+                    date_val = last_issued_date_text if is_timestamp_date else last_issued_date
+                    date_literal = self._format_literal(date_val, is_timestamp_date)
                     where_clause = (
                         f"WHERE {key_column} > {key_literal} OR "
                         f"({key_column} = {key_literal} AND {date_column} > {date_literal})"
                     )
-
-                # LIMIT를 사용한 부분 쿼리
                 copy_to_query = f"""
                     COPY (
                         SELECT {columns_csv}
@@ -517,15 +614,11 @@ class CopyMigrationWorker(BaseMigrationWorker):
                         LIMIT {self.batch_size}
                     ) TO STDOUT WITH (FORMAT CSV, HEADER FALSE, NULL 'NULL')
                 """
-
                 copy_from_query = f"""
                     COPY {partition_name} ({columns_csv})
                     FROM STDIN WITH (FORMAT CSV, HEADER FALSE, NULL 'NULL')
                 """
-
                 stream_buffer = CopyStreamBuffer()
-
-                # 소스 → 대상 스트리밍 (큐 기반)
                 def copy_out():
                     try:
                         with self.source_conn.cursor() as source_cursor:
@@ -534,97 +627,75 @@ class CopyMigrationWorker(BaseMigrationWorker):
                         stream_buffer.set_error(exc)
                     finally:
                         stream_buffer.close()
-
                 producer_thread = threading.Thread(target=copy_out, daemon=True)
                 producer_thread.start()
-
-                # 대상 COPY IN (stream_buffer.read 사용)
                 with self.target_conn.cursor() as target_cursor:
                     try:
                         target_cursor.copy_expert(copy_from_query, stream_buffer)
                     except Exception as exc:
                         stream_buffer.set_error(exc)
                         raise
-
                 producer_thread.join()
-
                 if stream_buffer.error:
                     raise stream_buffer.error
-
-                # COPY FROM 트랜잭션 커밋
                 self.target_conn.commit()
-
-                copied_rows = stream_buffer.row_count
-
-                # 데이터가 없으면 완료
+                copied_rows = int(stream_buffer.row_count or 0)
                 if copied_rows == 0:
                     break
-
-                # 트래커에서 마지막 키 값 가져오기
                 if stream_buffer.last_key is not None:
-                    last_path_id = stream_buffer.last_key
-                    last_issued_date = stream_buffer.last_date
-
-                # 누적 행 수 업데이트
+                    try:
+                        last_path_id = int(stream_buffer.last_key)
+                    except Exception:
+                        last_path_id = stream_buffer.last_key
+                if stream_buffer.last_date is not None:
+                    if is_timestamp_date:
+                        last_issued_date_text = str(stream_buffer.last_date)
+                        last_issued_date = None
+                    else:
+                        try:
+                            last_issued_date = int(stream_buffer.last_date)
+                        except Exception:
+                            last_issued_date = stream_buffer.last_date
+                        last_issued_date_text = None
                 accumulated_rows += copied_rows
-
-                # 성능 지표 업데이트
                 self.performance_metrics.update(copied_rows, stream_buffer.total_bytes)
-
-                # 체크포인트 업데이트 (중간 저장)
-                if checkpoint:
-                    self.checkpoint_manager.update_checkpoint_status(
-                        checkpoint.id,
-                        "running",
-                        rows_processed=accumulated_rows,
-                        last_path_id=last_path_id,
-                        last_issued_date=last_issued_date,
-                        copy_method="COPY",
-                        bytes_transferred=self.performance_metrics.total_bytes,
-                    )
-
-                    # 성능 지표 전송
-                    self._emit_performance_metrics()
-
-                    # 로그 (너무 빈번하지 않게)
-                    # self.log.emit(f"{partition_name} 배치 완료: {copied_rows:,}행", "DEBUG")
-
-                # 다음 배치로 계속 (완료 처리는 루프 종료 후 한 번만 수행)
-                continue
-
-            # 파티션 완료 처리 (데이터 소진 후)
+                self.checkpoint_manager.update_checkpoint_status(
+                    checkpoint.id,
+                    "running",
+                    rows_processed=accumulated_rows,
+                    last_path_id=last_path_id,
+                    last_issued_date=last_issued_date,
+                    last_issued_date_text=last_issued_date_text,
+                    copy_method="COPY",
+                    bytes_transferred=self.performance_metrics.total_bytes,
+                )
+                self._emit_performance_metrics()
             if not self.is_running:
                 return
-
             self.performance_metrics.complete_partition()
             self._update_checkpoint_completed(
                 checkpoint,
                 accumulated_rows,
                 last_path_id=last_path_id,
                 last_issued_date=last_issued_date,
+                last_issued_date_text=last_issued_date_text,
+                copy_method="COPY",
             )
-
-            # 로그 출력
-            self.log.emit(f"{partition_name} 완료: 총 {accumulated_rows:,}개 행", "SUCCESS")
-            log_emitter.emit_log(
-                "SUCCESS",
-                f"{partition_name} COPY 완료: 총 {accumulated_rows:,}개 행",
-            )
-
+            self._log(f"{partition_name} COPY 완료: 총 {accumulated_rows:,}개 행", "SUCCESS")
         except Exception as e:
             if checkpoint is None:
                 checkpoint = self.checkpoint_manager.create_checkpoint(self.history_id, partition_name)
-            if checkpoint:
-                self.checkpoint_manager.update_checkpoint_status(
-                    checkpoint.id,
-                    "failed",
-                    rows_processed=accumulated_rows,
-                    error_message=str(e),
-                    last_path_id=last_path_id,
-                    last_issued_date=last_issued_date,
-                    copy_method="COPY",
-                    bytes_transferred=self.performance_metrics.total_bytes,
-                )
+            self.checkpoint_manager.update_checkpoint_status(
+                checkpoint.id,
+                "failed",
+                rows_processed=accumulated_rows,
+                error_message=str(e),
+                last_path_id=last_path_id,
+                last_issued_date=last_issued_date,
+                last_issued_date_text=last_issued_date_text,
+                copy_method="COPY",
+                bytes_transferred=self.performance_metrics.total_bytes,
+            )
             raise Exception(f"{partition_name} COPY 실패: {str(e)}")
 
     def _migrate_partition_server_copy(self, partition_name: str, checkpoint: Any):
@@ -757,7 +828,7 @@ class CopyMigrationWorker(BaseMigrationWorker):
 
             # 10. 파티션 완료
             self.performance_metrics.complete_partition()
-            self._update_checkpoint_completed(checkpoint, copied_rows)
+            self._update_checkpoint_completed(checkpoint, copied_rows, copy_method="COPY_SRV")
 
             self.log.emit(
                 f"{partition_name} Server-side COPY 완료: {copied_rows:,}개 행", "SUCCESS"
@@ -866,10 +937,12 @@ class CopyMigrationWorker(BaseMigrationWorker):
         rows: int,
         last_path_id: int | None = None,
         last_issued_date: int | None = None,
+        last_issued_date_text: str | None = None,
+        copy_method: str | None = None,
     ):
         """체크포인트 완료 업데이트"""
         if checkpoint:
-            method = "COPY_SRV" if self.copy_mode == "server" else "COPY"
+            method = copy_method or ("COPY_SRV" if self.copy_mode == "server" else "COPY")
             self.checkpoint_manager.update_checkpoint_status(
                 checkpoint.id,
                 "completed",
@@ -878,6 +951,7 @@ class CopyMigrationWorker(BaseMigrationWorker):
                 bytes_transferred=self.performance_metrics.total_bytes,
                 last_path_id=last_path_id,
                 last_issued_date=last_issued_date,
+                last_issued_date_text=last_issued_date_text,
             )
 
     def _emit_performance_metrics(self):

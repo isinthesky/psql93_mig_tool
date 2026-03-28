@@ -60,6 +60,8 @@ class Checkpoint(Base):
     # 새 필드: COPY 방식 재개를 위한 마지막 처리 키
     last_path_id = Column(Integer)
     last_issued_date = Column(Integer)
+    # timestamp 타입(예: energy_display)의 재개를 위해 문자열 컬럼을 추가
+    last_issued_date_text = Column(Text)
     copy_method = Column(String(10), default="INSERT")  # COPY or INSERT
     bytes_transferred = Column(Integer, default=0)
 
@@ -148,6 +150,7 @@ class LocalDatabase:
                 migrations = [
                     "ALTER TABLE checkpoints ADD COLUMN last_path_id INTEGER",
                     "ALTER TABLE checkpoints ADD COLUMN last_issued_date INTEGER",
+                    "ALTER TABLE checkpoints ADD COLUMN last_issued_date_text TEXT",
                     "ALTER TABLE checkpoints ADD COLUMN copy_method VARCHAR(10) DEFAULT 'INSERT'",
                     "ALTER TABLE checkpoints ADD COLUMN bytes_transferred INTEGER DEFAULT 0",
                     # migration_history 테이블에 연결 상태 컬럼 추가

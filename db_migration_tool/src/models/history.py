@@ -63,6 +63,7 @@ class CheckpointItem:
         error_message: str = "",
         last_path_id: Optional[int] = None,
         last_issued_date: Optional[int] = None,
+        last_issued_date_text: Optional[str] = None,
         copy_method: str = "INSERT",
         bytes_transferred: int = 0,
     ):
@@ -74,6 +75,7 @@ class CheckpointItem:
         self.error_message = error_message
         self.last_path_id = last_path_id
         self.last_issued_date = last_issued_date
+        self.last_issued_date_text = last_issued_date_text
         self.copy_method = copy_method
         self.bytes_transferred = bytes_transferred
 
@@ -89,6 +91,7 @@ class CheckpointItem:
             error_message=db_checkpoint.error_message or "",
             last_path_id=db_checkpoint.last_path_id,
             last_issued_date=db_checkpoint.last_issued_date,
+            last_issued_date_text=getattr(db_checkpoint, "last_issued_date_text", None),
             copy_method=db_checkpoint.copy_method or "INSERT",
             bytes_transferred=db_checkpoint.bytes_transferred or 0,
         )
@@ -153,6 +156,11 @@ class HistoryManager:
             return MigrationHistoryItem.from_db_model(db_history)
         return None
 
+    def get_completed_histories(self, profile_id: int) -> list[MigrationHistoryItem]:
+        """프로필의 완료된 이력 목록 조회"""
+        db_histories = self.repo.get_completed_by_profile(profile_id)
+        return [MigrationHistoryItem.from_db_model(h) for h in db_histories]
+
 
 class CheckpointManager:
     """체크포인트 관리자 클래스 (CheckpointRepository 활용)"""
@@ -180,6 +188,7 @@ class CheckpointManager:
         error_message: str = None,
         last_path_id: int = None,
         last_issued_date: int = None,
+        last_issued_date_text: str = None,
         copy_method: str = None,
         bytes_transferred: int = None,
     ) -> bool:
@@ -193,6 +202,8 @@ class CheckpointManager:
             updates["last_path_id"] = last_path_id
         if last_issued_date is not None:
             updates["last_issued_date"] = last_issued_date
+        if last_issued_date_text is not None:
+            updates["last_issued_date_text"] = last_issued_date_text
         if copy_method is not None:
             updates["copy_method"] = copy_method
         if bytes_transferred is not None:
@@ -204,3 +215,10 @@ class CheckpointManager:
         """미완료 체크포인트 조회"""
         db_checkpoints = self.repo.get_pending_by_history(history_id)
         return [CheckpointItem.from_db_model(c) for c in db_checkpoints]
+
+    def get_completed_partition_names(self, history_ids: list[int]) -> set[str]:
+        """여러 이력에서 완료된 파티션 이름 집합 반환"""
+        if not history_ids:
+            return set()
+        checkpoints = self.repo.get_completed_names_by_history_ids(history_ids)
+        return {c.partition_name for c in checkpoints}
