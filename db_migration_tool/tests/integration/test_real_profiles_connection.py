@@ -23,7 +23,8 @@ def test_saved_profiles_bms93_bms30_can_connect():
         pytest -k saved_profiles -m integration
     """
 
-    if os.environ.get("DBMIG_RUN_REAL_PROFILE_TESTS") != "1":
+    flag = (os.environ.get("DBMIG_RUN_REAL_PROFILE_TESTS") or "").strip().lower()
+    if flag not in ("1", "true", "yes"):  # allow cmd/powershell quirks
         pytest.skip("Set DBMIG_RUN_REAL_PROFILE_TESTS=1 to run real DB connection test")
 
     appdata = os.environ.get("APPDATA")
