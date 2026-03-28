@@ -81,15 +81,14 @@ class BaseMigrationWorker(QThread, metaclass=QThreadABCMeta):
         try:
             # 하위 클래스 구현 실행
             self._execute_migration()
-
-            # 정상 완료
-            if self.is_running:
-                self.finished.emit()
-
         except Exception as e:
             error_msg = str(e)
-            log_emitter.emit_log("ERROR", f"마이그레이션 오류: {error_msg}")
+            self._log(f"마이그레이션 오류: {error_msg}", "ERROR")
             self.error.emit(error_msg)
+        finally:
+            # 정상 완료·취소·오류 모두 finished를 발행하여 UI 핸들러가 확실히 호출되도록 한다.
+            # 완료 유형 판정은 handler 측에서 is_running 스냅샷으로 수행한다.
+            self.finished.emit()
 
     @abstractmethod
     def _execute_migration(self):
@@ -101,24 +100,25 @@ class BaseMigrationWorker(QThread, metaclass=QThreadABCMeta):
         """
         pass
 
+    def _log(self, message: str, level: str = "INFO"):
+        """UI 로그 시그널 발행 (파일/DB 로깅은 UI 측 add_log에서 자동 수행)"""
+        self.log.emit(message, level)
+
     def pause(self):
         """마이그레이션 일시정지"""
         self.is_paused = True
-        self.log.emit("마이그레이션 일시정지", "INFO")
-        log_emitter.emit_log("INFO", "마이그레이션 일시정지")
+        self._log("마이그레이션 일시정지")
 
     def resume(self):
         """마이그레이션 재개"""
         self.is_paused = False
-        self.log.emit("마이그레이션 재개", "INFO")
-        log_emitter.emit_log("INFO", "마이그레이션 재개")
+        self._log("마이그레이션 재개")
 
     def stop(self):
         """마이그레이션 중지"""
         self.is_running = False
         self.is_paused = False
-        self.log.emit("마이그레이션 중지 요청", "WARNING")
-        log_emitter.emit_log("WARNING", "마이그레이션 중지 요청")
+        self._log("마이그레이션 중지 요청", "WARNING")
 
     def _check_pause(self):
         """일시정지 상태 확인

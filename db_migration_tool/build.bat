@@ -1,4 +1,5 @@
 @echo off
+chcp 65001 >nul
 echo ==========================================
 echo DB Migration Tool - Build Script (uv)
 echo ==========================================
@@ -63,7 +64,7 @@ echo.
 echo ==========================================
 echo [INFO] 빌드를 시작합니다...
 echo ==========================================
-python -m PyInstaller db_migration_tool.spec --clean
+python -m PyInstaller DBMigrationTool.spec --clean
 
 REM 빌드 결과 확인
 echo.

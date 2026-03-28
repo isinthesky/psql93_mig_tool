@@ -12,8 +12,6 @@ from PySide6.QtCore import Signal
 from src.core.base_migration_worker import BaseMigrationWorker
 from src.core.table_creator import TableCreator
 from src.models.profile import ConnectionProfile
-from src.utils.enhanced_logger import log_emitter
-
 
 class MigrationWorker(BaseMigrationWorker):
     """INSERT 기반 마이그레이션 워커
@@ -67,8 +65,7 @@ class MigrationWorker(BaseMigrationWorker):
                 checkpoint = checkpoints_dict.get(partition)
 
                 if checkpoint and checkpoint.status == "completed":
-                    self.log.emit(f"{partition} - 이미 완료됨, 건너뛰기", "INFO")
-                    log_emitter.emit_log("INFO", f"{partition} - 이미 완료됨, 건너뛰기")
+                    self._log(f"{partition} - 이미 완료됨, 건너뛰기")
                     continue
 
                 # 파티션 마이그레이션
@@ -79,10 +76,10 @@ class MigrationWorker(BaseMigrationWorker):
             target_conn.close()
 
             if self.is_running:  # 정상 완료
-                log_emitter.emit_log("SUCCESS", "마이그레이션이 정상적으로 완료되었습니다")
+                self._log("마이그레이션이 정상적으로 완료되었습니다", "SUCCESS")
 
         except Exception as e:
-            log_emitter.emit_log("ERROR", f"마이그레이션 오류: {str(e)}")
+            self._log(f"마이그레이션 오류: {str(e)}", "ERROR")
             raise
 
     def _create_connection(self, config: dict[str, Any]) -> psycopg.Connection:
@@ -108,8 +105,7 @@ class MigrationWorker(BaseMigrationWorker):
         checkpoint: Any,
     ):
         """단일 파티션 마이그레이션"""
-        self.log.emit(f"{partition_name} 마이그레이션 시작", "INFO")
-        log_emitter.emit_log("INFO", f"{partition_name} 마이그레이션 시작")
+        self._log(f"{partition_name} 마이그레이션 시작")
 
         try:
             # 소스에서 총 행 수 확인
@@ -120,8 +116,7 @@ class MigrationWorker(BaseMigrationWorker):
                 total_rows = cur.fetchone()[0]
 
             if total_rows == 0:
-                self.log.emit(f"{partition_name} - 데이터 없음", "WARNING")
-                log_emitter.emit_log("WARNING", f"{partition_name} - 데이터 없음")
+                self._log(f"{partition_name} - 데이터 없음", "WARNING")
                 if checkpoint:
                     self.checkpoint_manager.update_checkpoint_status(checkpoint.id, "completed", 0)
                 return
@@ -184,10 +179,7 @@ class MigrationWorker(BaseMigrationWorker):
                 except psycopg.errors.InsufficientResources:
                     # 메모리 부족 시 배치 크기 감소
                     current_batch_size = max(int(current_batch_size * 0.5), self.min_batch_size)
-                    self.log.emit(f"메모리 부족, 배치 크기 조정: {current_batch_size:,}", "WARNING")
-                    log_emitter.emit_log(
-                        "WARNING", f"메모리 부족, 배치 크기 조정: {current_batch_size:,}"
-                    )
+                    self._log(f"메모리 부족, 배치 크기 조정: {current_batch_size:,}", "WARNING")
                     continue
 
             # 파티션 완료
@@ -196,8 +188,7 @@ class MigrationWorker(BaseMigrationWorker):
                     self.checkpoint_manager.update_checkpoint_status(
                         checkpoint.id, "completed", total_rows
                     )
-                self.log.emit(f"{partition_name} 완료 ({total_rows:,} rows)", "SUCCESS")
-                log_emitter.emit_log("SUCCESS", f"{partition_name} 완료 ({total_rows:,} rows)")
+                self._log(f"{partition_name} 완료 ({total_rows:,} rows)", "SUCCESS")
 
         except Exception as e:
             if checkpoint:
@@ -211,11 +202,8 @@ class MigrationWorker(BaseMigrationWorker):
 
         def confirm_truncate(partition_name: str, row_count: int) -> bool:
             """사용자에게 TRUNCATE 확인 요청"""
-            self.log.emit(
+            self._log(
                 f"{partition_name} 테이블에 {row_count:,}개의 기존 데이터가 있습니다", "WARNING"
-            )
-            log_emitter.emit_log(
-                "WARNING", f"{partition_name} 테이블에 {row_count:,}개의 기존 데이터가 있습니다"
             )
             self.truncate_requested.emit(partition_name, row_count)
 
@@ -237,11 +225,9 @@ class MigrationWorker(BaseMigrationWorker):
 
             # 결과에 따른 로그 출력
             if created:
-                self.log.emit(f"{partition_name} 테이블 생성 완료", "SUCCESS")
-                log_emitter.emit_log("SUCCESS", f"{partition_name} 테이블 생성 완료")
+                self._log(f"{partition_name} 테이블 생성 완료", "SUCCESS")
             elif row_count > 0:
-                self.log.emit(f"{partition_name} 테이블 데이터 삭제 완료", "SUCCESS")
-                log_emitter.emit_log("SUCCESS", f"{partition_name} 테이블 데이터 삭제 완료")
+                self._log(f"{partition_name} 테이블 데이터 삭제 완료", "SUCCESS")
 
         finally:
             # 권한 초기화
@@ -298,8 +284,7 @@ class MigrationWorker(BaseMigrationWorker):
                         target_conn.commit()
 
         except Exception as e:
-            self.log.emit(f"배치 복사 오류: {str(e)}", "ERROR")
-            log_emitter.emit_log("ERROR", f"배치 복사 오류: {str(e)}")
+            self._log(f"배치 복사 오류: {str(e)}", "ERROR")
             raise
 
         return rows_copied

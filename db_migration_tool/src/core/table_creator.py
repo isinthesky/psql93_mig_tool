@@ -336,8 +336,23 @@ class TableCreator:
 
             self.target_conn.commit()
 
+    def _sync_partition_info(self, partition_name: str):
+        """소스 DB의 partition_table_info를 대상 DB에 동기화"""
+        with self.source_conn.cursor() as cur:
+            cur.execute(
+                "SELECT table_data, from_date, to_date FROM partition_table_info WHERE table_name = %s",
+                (partition_name,),
+            )
+            row = cur.fetchone()
+        if row:
+            self._add_partition_info(partition_name, {
+                'table_data': row[0],
+                'from_date': row[1],
+                'to_date': row[2],
+            })
+
     def _add_partition_info(self, partition_name: str, partition_info: Dict[str, Any]):
-        """partition_table_info에 정보 추가"""
+        """partition_table_info에 정보 추가 또는 갱신 (upsert)"""
         with self.target_conn.cursor() as cur:
             # partition_table_info 테이블 존재 확인
             cur.execute("""
@@ -364,14 +379,27 @@ class TableCreator:
 
             # 기존 레코드 확인
             cur.execute(
-                """
-                SELECT 1 FROM partition_table_info
-                WHERE table_name = %s
-            """,
+                "SELECT 1 FROM partition_table_info WHERE table_name = %s",
                 (partition_name,),
             )
 
-            if not cur.fetchone():
+            now = datetime.now()
+            if cur.fetchone():
+                # 기존 레코드 갱신
+                cur.execute(
+                    """
+                    UPDATE partition_table_info
+                    SET table_data = %s, from_date = %s, to_date = %s,
+                        use_flag = %s, save_date = %s, cluster_index = %s
+                    WHERE table_name = %s
+                """, (
+                    partition_info['table_data'],
+                    partition_info['from_date'],
+                    partition_info['to_date'],
+                    True, now, True,
+                    partition_name,
+                ))
+            else:
                 # 새 레코드 추가
                 cur.execute(
                     """
@@ -383,9 +411,7 @@ class TableCreator:
                     partition_info['table_data'],
                     partition_info['from_date'],
                     partition_info['to_date'],
-                    True,
-                    datetime.now(),
-                    True
+                    True, now, True,
                 ))
 
             self.target_conn.commit()
@@ -429,9 +455,12 @@ class TableCreator:
             table_exists = cursor.fetchone()[0]
 
             if not table_exists:
-                # 테이블 생성
+                # 테이블 생성 (partition_table_info 동기화 포함)
                 self.create_partition_table(partition_name)
                 return (True, 0)
+
+            # 테이블이 이미 존재해도 partition_table_info 동기화
+            self._sync_partition_info(partition_name)
 
             # 기존 데이터 확인
             cursor.execute(f"SELECT COUNT(*) FROM {partition_name}")
