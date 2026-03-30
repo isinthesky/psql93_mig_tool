@@ -9,7 +9,14 @@ from datetime import datetime
 
 import psycopg
 
-from .table_types import TableType, get_table_type, TABLE_TYPE_CONFIG
+from .table_types import (
+    TableType,
+    get_table_type,
+    TABLE_TYPE_CONFIG,
+    infer_partition_range,
+    get_partition_primary_key_columns,
+    should_cluster_partition_by_pkey,
+)
 
 
 class TableCreator:
@@ -84,7 +91,7 @@ class TableCreator:
 
             row = cur.fetchone()
             if row:
-                table_data_code = row[0]  # 'PH', 'TH', 'ED', 'RT'
+                table_data_code = row[0]  # e.g. 'PH', 'PS', 'TH', 'ED', 'RT'
 
                 # TableType enum으로 변환
                 try:
@@ -111,21 +118,13 @@ class TableCreator:
             except Exception:
                 table_type = TableType.POINT_HISTORY
 
-            if len(parts) >= 3 and len(parts[-1]) == 6:
-                # yymmdd 형태
-                date_str = parts[-1]  # 예: 221026
-                year = 2000 + int(date_str[:2])
-                month = int(date_str[2:4])
-                day = int(date_str[4:6])
-
-                from_date = datetime(year, month, day, 0, 0, 0)
-                to_date = datetime(year, month, day, 23, 59, 59, 999000)
-
+            inferred_from, inferred_to = infer_partition_range(table_type, partition_name)
+            if inferred_from is not None and inferred_to is not None:
                 return {
                     'table_data': table_type.value,
                     'table_type': table_type,
-                    'from_date': int(from_date.timestamp() * 1000),
-                    'to_date': int(to_date.timestamp() * 1000)
+                    'from_date': inferred_from,
+                    'to_date': inferred_to
                 }
 
             # 날짜 파싱이 안 되는 경우라도 테이블 타입만 설정해 반환
@@ -267,29 +266,13 @@ class TableCreator:
 
             # 테이블 타입별 constraint 추가
             constraints = []
-
-            if table_type == TableType.POINT_HISTORY:
-                # PH: PRIMARY KEY 추가
+            pk_columns = get_partition_primary_key_columns(table_type)
+            if pk_columns:
                 constraints.append(
-                    f"CONSTRAINT {partition_name}_pkey PRIMARY KEY(path_id, issued_date)"
+                    f"CONSTRAINT {partition_name}_pkey PRIMARY KEY({', '.join(pk_columns)})"
                 )
-                if date_check:
-                    constraints.append(f"CONSTRAINT {partition_name}_issued_date_check {date_check}")
-
-            elif table_type == TableType.TREND_HISTORY:
-                # TH: CHECK만
-                if date_check:
-                    constraints.append(f"CONSTRAINT {partition_name}_issued_date_check {date_check}")
-
-            elif table_type == TableType.ENERGY_DISPLAY:
-                # ED: CHECK만 (timestamp 타입)
-                if date_check:
-                    constraints.append(f"CONSTRAINT {partition_name}_issued_date_check {date_check}")
-
-            elif table_type == TableType.RUNNING_TIME_HISTORY:
-                # RT: CHECK만
-                if date_check:
-                    constraints.append(f"CONSTRAINT {partition_name}_issued_date_check {date_check}")
+            if date_check:
+                constraints.append(f"CONSTRAINT {partition_name}_issued_date_check {date_check}")
 
             # CREATE TABLE 문 생성
             if constraints:
@@ -317,21 +300,27 @@ class TableCreator:
                     cur
                 )
 
-            # 클러스터링 (PRIMARY KEY가 있는 경우만)
-            if table_type == TableType.POINT_HISTORY:
+            # RT는 historical DDL 관례상 partition-level 보조 인덱스를 추가로 생성
+            if table_type == TableType.RUNNING_TIME_HISTORY:
+                self._create_indexes(
+                    cur,
+                    [
+                        f"CREATE INDEX {partition_name}_idx ON {partition_name} USING btree (path_id, issued_date)",
+                    ],
+                )
+
+            # historical DDL 관례상 일부 타입은 partition PK로 CLUSTER
+            if should_cluster_partition_by_pkey(table_type):
                 try:
                     cur.execute(f"""
                         CLUSTER {partition_name} USING {partition_name}_pkey
                     """)
                     print(f"  [OK] 클러스터링 완료: {partition_name}")
                 except psycopg.errors.UndefinedObject:
-                    # 인덱스가 없는 경우 (정상)
                     print(f"  [WARN] 클러스터링 스킵: {partition_name} - PRIMARY KEY 인덱스가 없음")
                 except psycopg.errors.InsufficientPrivilege:
-                    # 권한 부족 (경고)
                     print(f"  [WARN] 클러스터링 실패: {partition_name} - 권한 부족")
                 except Exception as e:
-                    # 기타 예외 (로깅만)
                     print(f"  [WARN] 클러스터링 실패: {partition_name} - {type(e).__name__}: {e}")
 
             self.target_conn.commit()
@@ -493,7 +482,7 @@ class TableCreator:
 
     def _create_trigger_based_partitioning(self, parent_table: str, table_type: TableType, cursor):
         """
-        TRIGGER 기반 파티셔닝 설정 (point_history용)
+        TRIGGER 기반 파티셔닝 설정 (point_history / point_sec_history용)
 
         Args:
             parent_table: 부모 테이블 이름
@@ -549,8 +538,8 @@ class TableCreator:
             cursor: 데이터베이스 커서
         """
         # 테이블 타입별 인덱스 (9.3 호환: IF NOT EXISTS 미지원 → 중복은 예외 무시)
-        if table_type == TableType.POINT_HISTORY or table_type == TableType.TREND_HISTORY:
-            # PH, TH: path_id + issued_date 인덱스
+        if table_type in (TableType.POINT_HISTORY, TableType.POINT_SEC_HISTORY, TableType.TREND_HISTORY):
+            # PH, PS, TH: path_id + issued_date 인덱스
             self._create_indexes(
                 cursor,
                 [

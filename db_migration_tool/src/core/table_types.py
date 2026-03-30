@@ -7,12 +7,15 @@ supported by the migration tool.
 
 from enum import Enum
 from dataclasses import dataclass
-from typing import List, Tuple
+from datetime import datetime
+import calendar
+from typing import List, Tuple, Optional
 
 
 class TableType(str, Enum):
     """Supported partition table types"""
     POINT_HISTORY = "PH"
+    POINT_SEC_HISTORY = "PS"
     TREND_HISTORY = "TH"
     ENERGY_DISPLAY = "ED"
     RUNNING_TIME_HISTORY = "RT"
@@ -52,6 +55,11 @@ class TableType(str, Enum):
         """Get the list of column names"""
         return TABLE_TYPE_CONFIG[self].columns
 
+    @property
+    def partition_suffix(self) -> str:
+        """daily | monthly"""
+        return TABLE_TYPE_CONFIG[self].partition_suffix
+
 
 @dataclass
 class TableTypeConfig:
@@ -64,6 +72,7 @@ class TableTypeConfig:
     date_is_timestamp: bool  # True for timestamp, False for bigint
     columns: List[str]
     description: str
+    partition_suffix: str  # daily | monthly
 
 
 # Table type configurations
@@ -76,7 +85,20 @@ TABLE_TYPE_CONFIG = {
         date_column="issued_date",
         date_is_timestamp=False,  # bigint (Unix timestamp ms)
         columns=["path_id", "issued_date", "changed_value", "connection_status"],
-        description="Point history data with TRIGGER-based partitioning"
+        description="Point history data with TRIGGER-based partitioning",
+        partition_suffix="daily",
+    ),
+
+    TableType.POINT_SEC_HISTORY: TableTypeConfig(
+        table_name="point_sec_history",
+        display_name="Point Sec History",
+        uses_trigger=True,
+        uses_rules=False,
+        date_column="issued_date",
+        date_is_timestamp=False,  # bigint (Unix timestamp ms)
+        columns=["path_id", "issued_date", "changed_value", "connection_status"],
+        description="Point second history data with TRIGGER-based partitioning",
+        partition_suffix="daily",
     ),
 
     TableType.TREND_HISTORY: TableTypeConfig(
@@ -87,7 +109,8 @@ TABLE_TYPE_CONFIG = {
         date_column="issued_date",
         date_is_timestamp=False,  # bigint (Unix timestamp ms)
         columns=["path_id", "issued_date", "changed_value", "connection_status"],
-        description="Trend history data with RULE-based partitioning"
+        description="Trend history data with RULE-based partitioning",
+        partition_suffix="monthly",
     ),
 
     TableType.ENERGY_DISPLAY: TableTypeConfig(
@@ -98,7 +121,8 @@ TABLE_TYPE_CONFIG = {
         date_column="issued_date",
         date_is_timestamp=True,  # timestamp without time zone
         columns=["sensor_id", "issued_date", "station_id", "value", "co2", "cost"],
-        description="Energy display data with RULE-based partitioning (timestamp)"
+        description="Energy display data with RULE-based partitioning (timestamp)",
+        partition_suffix="monthly",
     ),
 
     TableType.RUNNING_TIME_HISTORY: TableTypeConfig(
@@ -113,7 +137,8 @@ TABLE_TYPE_CONFIG = {
             "running_time", "accu_time", "running_count",
             "eng_value", "eng_accu_value", "previous_weight_value"
         ],
-        description="Running time history data with RULE-based partitioning"
+        description="Running time history data with RULE-based partitioning",
+        partition_suffix="monthly",
     ),
 }
 
@@ -138,15 +163,7 @@ def get_table_type(table_name: str) -> TableType:
 
 
 def get_table_name(table_type: TableType) -> str:
-    """
-    Get database table name from TableType
-
-    Args:
-        table_type: TableType enum
-
-    Returns:
-        Database table name
-    """
+    """Get database table name from TableType"""
     return TABLE_TYPE_CONFIG[table_type].table_name
 
 
@@ -158,6 +175,65 @@ def get_all_table_types() -> List[TableType]:
 def get_all_table_names() -> List[str]:
     """Get list of all supported table names"""
     return [config.table_name for config in TABLE_TYPE_CONFIG.values()]
+
+
+def infer_partition_range(table_type: TableType, partition_name: str) -> Tuple[Optional[int], Optional[int]]:
+    """Infer partition [from_ms, to_ms] from partition suffix.
+
+    - daily: point_history_YYMMDD / point_sec_history_YYMMDD
+    - monthly: trend_history_YYMM / energy_display_YYMM / running_time_history_YYMM
+    """
+    config = TABLE_TYPE_CONFIG[table_type]
+    prefix = f"{config.table_name}_"
+    if not partition_name.startswith(prefix):
+        return None, None
+
+    suffix = partition_name[len(prefix):]
+    try:
+        if config.partition_suffix == "daily":
+            if len(suffix) != 6:
+                return None, None
+            year = 2000 + int(suffix[:2])
+            month = int(suffix[2:4])
+            day = int(suffix[4:6])
+            start = datetime(year, month, day, 0, 0, 0)
+            end = datetime(year, month, day, 23, 59, 59, 999000)
+            return int(start.timestamp() * 1000), int(end.timestamp() * 1000)
+
+        if config.partition_suffix == "monthly":
+            if len(suffix) != 4:
+                return None, None
+            year = 2000 + int(suffix[:2])
+            month = int(suffix[2:4])
+            last_day = calendar.monthrange(year, month)[1]
+            start = datetime(year, month, 1, 0, 0, 0)
+            end = datetime(year, month, last_day, 23, 59, 59, 999000)
+            return int(start.timestamp() * 1000), int(end.timestamp() * 1000)
+    except Exception:
+        return None, None
+
+    return None, None
+
+
+def get_partition_primary_key_columns(table_type: TableType) -> List[str]:
+    """Return per-partition PK columns based on historical DDL conventions."""
+    if table_type in (TableType.POINT_HISTORY, TableType.POINT_SEC_HISTORY, TableType.TREND_HISTORY):
+        return ["path_id", "issued_date"]
+    if table_type == TableType.ENERGY_DISPLAY:
+        return ["sensor_id", "issued_date"]
+    if table_type == TableType.RUNNING_TIME_HISTORY:
+        return ["path_id", "issued_date", "save_type"]
+    return []
+
+
+def should_cluster_partition_by_pkey(table_type: TableType) -> bool:
+    """Whether created partitions should CLUSTER on their PK."""
+    return table_type in (
+        TableType.POINT_HISTORY,
+        TableType.POINT_SEC_HISTORY,
+        TableType.TREND_HISTORY,
+        TableType.ENERGY_DISPLAY,
+    )
 
 
 # Default table type for backward compatibility

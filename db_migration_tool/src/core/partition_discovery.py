@@ -8,7 +8,7 @@ from typing import Any, Optional
 import psycopg
 from psycopg import sql
 
-from .table_types import TableType, DEFAULT_TABLE_TYPE
+from .table_types import TableType, DEFAULT_TABLE_TYPE, infer_partition_range
 
 
 class PartitionDiscovery:
@@ -38,23 +38,22 @@ class PartitionDiscovery:
         """
         partitions = []
 
-        # 기본값 설정 (backward compatibility)
         if table_types is None:
             table_types = [DEFAULT_TABLE_TYPE]
 
-        # 빈 리스트 검증
         if not table_types:
             raise ValueError("최소 1개의 테이블 타입을 지정해야 합니다.")
 
-        # TableType enum을 문자열로 변환
         table_type_codes = [tt.value for tt in table_types]
+        selected_by_code = {tt.value: tt for tt in table_types}
+        selected_names = {tt.table_name: tt for tt in table_types}
+        seen_names: set[str] = set()
 
         try:
-            # 연결 생성
             conn = self._create_connection()
 
             with conn.cursor() as cur:
-                # partition_table_info 테이블에서 날짜 범위에 해당하는 파티션 조회
+                # 1) partition_table_info 기반 조회 (기본)
                 placeholders = ', '.join(['%s'] * len(table_type_codes))
                 query = f"""
                     SELECT
@@ -81,40 +80,78 @@ class PartitionDiscovery:
                 for row in cur.fetchall():
                     table_name, table_data, from_date, to_date, use_flag = row
 
-                    # 날짜 범위 확인
                     partition_start = self._timestamp_to_date(from_date)
                     partition_end = self._timestamp_to_date(to_date)
 
-                    # 선택된 날짜 범위와 겹치는지 확인
                     if partition_start <= end_date and partition_end >= start_date:
-                        # 테이블 존재 여부 확인
                         if self._check_table_exists(cur, table_name):
-                            # 행 수 조회
-                            row_count = self._get_row_count(cur, table_name)
-
-                            # TableType enum으로 변환
-                            try:
-                                table_type = TableType(table_data)
-                            except ValueError:
-                                # 알 수 없는 타입은 건너뜀
+                            table_type = selected_by_code.get(table_data)
+                            if not table_type:
+                                parent_table = '_'.join(table_name.split('_')[:-1])
+                                table_type = selected_names.get(parent_table)
+                            if not table_type:
                                 continue
 
+                            row_count = self._get_row_count(cur, table_name)
                             partitions.append({
                                 'table_name': table_name,
                                 'table_type': table_type,
-                                'table_type_code': table_data,
+                                'table_type_code': table_type.value,
                                 'start_date': partition_start,
                                 'end_date': partition_end,
                                 'row_count': row_count,
                                 'from_timestamp': from_date,
                                 'to_timestamp': to_date
                             })
+                            seen_names.add(table_name)
+
+                # 2) fallback: 물리 테이블 패턴 기반 조회
+                # partition_table_info가 비어 있거나 코드가 예상과 다를 때를 대비
+                for table_type in table_types:
+                    prefix = f"{table_type.table_name}_%"
+                    cur.execute(
+                        """
+                        SELECT table_name
+                        FROM information_schema.tables
+                        WHERE table_schema = 'public'
+                          AND table_name LIKE %s
+                        ORDER BY table_name
+                        """,
+                        (prefix,),
+                    )
+                    physical_names = [row[0] for row in cur.fetchall()]
+                    for table_name in physical_names:
+                        if table_name in seen_names:
+                            continue
+
+                        from_ts, to_ts = infer_partition_range(table_type, table_name)
+                        if from_ts is None or to_ts is None:
+                            continue
+
+                        partition_start = self._timestamp_to_date(from_ts)
+                        partition_end = self._timestamp_to_date(to_ts)
+                        if partition_start > end_date or partition_end < start_date:
+                            continue
+
+                        row_count = self._get_row_count(cur, table_name)
+                        partitions.append({
+                            'table_name': table_name,
+                            'table_type': table_type,
+                            'table_type_code': table_type.value,
+                            'start_date': partition_start,
+                            'end_date': partition_end,
+                            'row_count': row_count,
+                            'from_timestamp': from_ts,
+                            'to_timestamp': to_ts,
+                        })
+                        seen_names.add(table_name)
 
             conn.close()
 
         except Exception as e:
             raise Exception(f"파티션 탐색 오류: {str(e)}")
 
+        partitions.sort(key=lambda p: (p['table_type_code'], p['from_timestamp'] or 0))
         return partitions
 
     def get_partition_info(self, partition_name: str, is_target: bool = False) -> dict[str, Any]:
@@ -128,7 +165,6 @@ class PartitionDiscovery:
             conn = self._create_connection(is_target=is_target)
 
             with conn.cursor() as cur:
-                # 파티션 정보 조회
                 cur.execute(
                     """
                     SELECT
@@ -147,8 +183,6 @@ class PartitionDiscovery:
                     return None
 
                 table_name, from_date, to_date, use_flag = row
-
-                # 테이블 정보
                 info = {
                     "table_name": table_name,
                     "from_date": self._timestamp_to_date(from_date),
@@ -158,10 +192,7 @@ class PartitionDiscovery:
                 }
 
                 if info["exists"]:
-                    # 행 수 조회
                     info["row_count"] = self._get_row_count(cur, table_name)
-
-                    # 컬럼 정보 조회
                     cur.execute(
                         """
                         SELECT column_name, data_type
@@ -171,7 +202,6 @@ class PartitionDiscovery:
                     """,
                         (table_name,),
                     )
-
                     info["columns"] = [{"name": col[0], "type": col[1]} for col in cur.fetchall()]
 
             conn.close()
@@ -184,20 +214,15 @@ class PartitionDiscovery:
         """소스와 대상 파티션 구조 비교"""
         try:
             source_info = self.get_partition_info(source_partition)
-
-            # 대상 정보 조회 (대상 설정이 없으면 비교 불가)
             if not self.target_config:
                 return False
 
             target_info = self.get_partition_info(target_partition, is_target=True)
-
             if not source_info or not target_info:
                 return False
 
-            # 컬럼 비교
             source_cols = {(c["name"], c["type"]) for c in source_info.get("columns", [])}
             target_cols = {(c["name"], c["type"]) for c in target_info.get("columns", [])}
-
             return source_cols == target_cols
 
         except Exception:
