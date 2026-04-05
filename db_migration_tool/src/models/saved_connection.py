@@ -24,7 +24,16 @@ class SavedConnectionManager:
         key_file = AppPaths.get_app_data_dir() / ".encryption_key"
         if key_file.exists():
             return Fernet(key_file.read_bytes().strip())
-        return Fernet(b"ZmDfcTF7_60GrrY167zsiPd67pEvs0aGOv2oasOM1Pg=")
+        # 키 파일이 없으면 새로 생성 (하드코딩 키 사용 금지)
+        key = Fernet.generate_key()
+        key_file.parent.mkdir(parents=True, exist_ok=True)
+        key_file.write_bytes(key)
+        try:
+            import os
+            os.chmod(key_file, 0o600)
+        except (OSError, AttributeError):
+            pass
+        return Fernet(key)
 
     def _encrypt(self, text: str) -> str:
         return self._cipher.encrypt(text.encode()).decode()

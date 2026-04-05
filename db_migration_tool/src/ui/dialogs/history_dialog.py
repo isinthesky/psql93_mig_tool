@@ -64,6 +64,7 @@ class HistoryDialog(QDialog):
         return self._profile_name_cache[profile_id]
 
     def refresh(self):
+        self._profile_name_cache.clear()
         histories = self.history_manager.get_all_history()
         self.table.setRowCount(0)
 

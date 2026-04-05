@@ -389,27 +389,34 @@ class ConnectionDialog(QDialog):
         )
 
         try:
-            conn = psycopg.connect(**psycopg_config, connect_timeout=7)
-            with conn.cursor() as cur:
-                cur.execute("SELECT version()")
-                version_str = cur.fetchone()[0]
-                version_info = parse_version_string(version_str)
-            conn.close()
-
-            self._save_preset_on_success(side)
-            QMessageBox.information(
-                self,
-                "연결 성공",
-                f"{endpoint_title} PostgreSQL 연결에 성공했습니다.\n\n"
-                f"버전: {version_info}\n"
-                f"원본: {version_str}",
-            )
+            with psycopg.connect(**psycopg_config, connect_timeout=7) as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT version()")
+                    version_str = cur.fetchone()[0]
+                    version_info = parse_version_string(version_str)
         except Exception as e:
             QMessageBox.critical(
                 self,
                 "연결 실패",
                 f"{endpoint_title} 연결에 실패했습니다:\n\n{str(e)}",
             )
+            return
+
+        reply = QMessageBox.question(
+            self,
+            "연결 성공",
+            f"{endpoint_title} PostgreSQL 연결에 성공했습니다.\n\n"
+            f"버전: {version_info}\n"
+            f"원본: {version_str}\n\n"
+            "이 연결 정보를 프리셋으로 저장하시겠습니까?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes,
+        )
+        if reply == QMessageBox.Yes:
+            try:
+                self._save_preset_on_success(side)
+            except Exception:
+                pass
 
     def accept(self):
         name = self.name_edit.text().strip()

@@ -333,6 +333,9 @@ class MainWindow(QMainWindow):
             dialog = FileArchiveMigrationDialog(self, profile)
         dialog.exec()
 
+        if self.history_dialog and not self.history_dialog.isHidden():
+            self.history_dialog.refresh()
+
     def show_history_dialog(self):
         """작업 이력 다이얼로그 표시 (modeless 싱글톤)"""
         if self.history_dialog is None:
