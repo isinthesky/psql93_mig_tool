@@ -43,6 +43,7 @@ class MigrationWorker(BaseMigrationWorker):
 
     def _execute_migration(self):
         """INSERT 기반 마이그레이션 실행"""
+        target_conn = None
         try:
             # 체크포인트를 딕셔너리로 캐싱 (성능 개선)
             # NOTE: 연결 생성 전에 캐싱을 수행해, 연결 설정 오류가 있더라도
@@ -71,16 +72,20 @@ class MigrationWorker(BaseMigrationWorker):
                 # 파티션 마이그레이션
                 self._migrate_partition(self.source_conn, target_conn, partition, checkpoint)
 
-            # 연결 종료
-            self.source_conn.close()
-            target_conn.close()
-
             if self.is_running:  # 정상 완료
                 self._log("마이그레이션이 정상적으로 완료되었습니다", "SUCCESS")
 
         except Exception as e:
             self._log(f"마이그레이션 오류: {str(e)}", "ERROR")
             raise
+        finally:
+            # 연결 종료 (성공/실패/취소 모두 확실히 닫기)
+            for conn in (self.source_conn, target_conn):
+                if conn is not None:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
 
     def _create_connection(self, config: dict[str, Any]) -> psycopg.Connection:
         """데이터베이스 연결 생성"""

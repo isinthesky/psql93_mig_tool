@@ -5,6 +5,7 @@
 
 import random
 import re
+import threading
 import time
 from datetime import datetime
 from queue import Queue
@@ -82,7 +83,8 @@ class DatabaseLoggerMixin:
         """DB 로거 믹스인 초기화"""
         import os
 
-        self.session_id: Optional[str] = None
+        # 스레드별 session_id 격리 (동시 워커 간 세션 혼선 방지)
+        self._session_local = threading.local()
         self.db_queue = Queue()
         self.is_running = True
         self.db_thread: Optional[Thread] = None
@@ -164,7 +166,7 @@ class DatabaseLoggerMixin:
 
         log_data = {
             "timestamp": datetime.now(),
-            "session_id": self.session_id,
+            "session_id": getattr(self._session_local, "session_id", None) or self.session_id,
             "level": level,
             "logger_name": logger_name,
             "message": message,
@@ -176,8 +178,17 @@ class DatabaseLoggerMixin:
         except Exception:
             pass  # 큐가 가득 찬 경우 무시
 
+    @property
+    def session_id(self) -> Optional[str]:
+        """현재 스레드의 세션 ID (thread-local)"""
+        return getattr(self._session_local, "session_id", None)
+
+    @session_id.setter
+    def session_id(self, value: Optional[str]):
+        self._session_local.session_id = value
+
     def generate_session_id(self) -> str:
-        """세션 ID 생성
+        """세션 ID 생성 (현재 스레드 전용)
 
         Returns:
             생성된 세션 ID (형식: YYYYMMDD_HHMMSS_XXXX)
@@ -189,11 +200,12 @@ class DatabaseLoggerMixin:
         """
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         random_suffix = "".join(random.choices("0123456789ABCDEF", k=4))
-        self.session_id = f"{timestamp}_{random_suffix}"
-        return self.session_id
+        sid = f"{timestamp}_{random_suffix}"
+        self._session_local.session_id = sid
+        return sid
 
     def set_session_id(self, session_id: str):
-        """세션 ID 설정
+        """세션 ID 설정 (현재 스레드 전용)
 
         Args:
             session_id: 세션 ID
@@ -202,7 +214,7 @@ class DatabaseLoggerMixin:
             >>> mixin = DatabaseLoggerMixin()
             >>> mixin.set_session_id('custom_session_123')
         """
-        self.session_id = session_id
+        self._session_local.session_id = session_id
 
     def close(self):
         """로거 종료 및 스레드 정리

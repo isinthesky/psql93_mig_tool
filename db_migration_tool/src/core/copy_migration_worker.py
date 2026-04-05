@@ -295,10 +295,6 @@ class CopyMigrationWorker(BaseMigrationWorker):
                         continue
                     raise
 
-            # 연결 종료
-            self.source_conn.close()
-            self.target_conn.close()
-
             if self.is_running:  # 정상 완료
                 final_stats = self.performance_metrics.get_stats()
                 self.log.emit(
@@ -314,6 +310,14 @@ class CopyMigrationWorker(BaseMigrationWorker):
             self.log.emit(f"마이그레이션 오류: {str(e)}", "ERROR")
             log_emitter.emit_log("ERROR", f"마이그레이션 오류: {str(e)}")
             raise
+        finally:
+            # 연결 종료 (성공/실패/취소 모두 확실히 닫기)
+            for conn in (self.source_conn, self.target_conn):
+                if conn is not None:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
 
     def _create_psycopg2_connection(self, config: dict[str, Any]) -> psycopg2.extensions.connection:
         """psycopg2 연결 생성 (COPY 명령용)

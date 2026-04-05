@@ -2,6 +2,7 @@
 로컬 SQLite 데이터베이스 관리
 """
 
+import threading
 from contextlib import contextmanager
 from datetime import datetime
 
@@ -172,14 +173,18 @@ class LocalDatabase:
             pass
 
 
-# 전역 데이터베이스 인스턴스
+# 전역 데이터베이스 인스턴스 (스레드 안전 초기화)
 _db_instance = None
+_db_lock = threading.Lock()
 
 
 def get_db():
-    """데이터베이스 인스턴스 반환"""
+    """데이터베이스 인스턴스 반환 (스레드 안전)"""
     global _db_instance
     if _db_instance is None:
-        _db_instance = LocalDatabase()
-        _db_instance.initialize()
+        with _db_lock:
+            if _db_instance is None:
+                db = LocalDatabase()
+                db.initialize()
+                _db_instance = db
     return _db_instance

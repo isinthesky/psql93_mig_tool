@@ -160,6 +160,7 @@ class PostgresOptimizer:
         if config.get("ssl"):
             conn_params["sslmode"] = "require"
 
+        conn = None
         try:
             # psycopg3를 사용하여 연결 시도
             conn = psycopg.connect(**conn_params)
@@ -169,7 +170,6 @@ class PostgresOptimizer:
                 cursor.execute("SELECT 1")
                 cursor.fetchone()
 
-            conn.close()
             return True, "연결 성공"
 
         except psycopg.OperationalError as e:
@@ -197,6 +197,12 @@ class PostgresOptimizer:
 
         except Exception as e:
             return False, f"예상치 못한 오류: {str(e)}"
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
 
     @staticmethod
     def create_optimized_connection(config: dict[str, Any]) -> psycopg2.extensions.connection:

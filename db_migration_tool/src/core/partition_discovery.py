@@ -49,6 +49,7 @@ class PartitionDiscovery:
         selected_names = {tt.table_name: tt for tt in table_types}
         seen_names: set[str] = set()
 
+        conn = None
         try:
             conn = self._create_connection()
 
@@ -146,10 +147,14 @@ class PartitionDiscovery:
                         })
                         seen_names.add(table_name)
 
-            conn.close()
-
         except Exception as e:
             raise Exception(f"파티션 탐색 오류: {str(e)}")
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
 
         partitions.sort(key=lambda p: (p['table_type_code'], p['from_timestamp'] or 0))
         return partitions
@@ -161,6 +166,7 @@ class PartitionDiscovery:
             partition_name: 조회할 파티션 이름
             is_target: True이면 대상 DB 구성으로 연결
         """
+        conn = None
         try:
             conn = self._create_connection(is_target=is_target)
 
@@ -204,11 +210,16 @@ class PartitionDiscovery:
                     )
                     info["columns"] = [{"name": col[0], "type": col[1]} for col in cur.fetchall()]
 
-            conn.close()
             return info
 
         except Exception as e:
             raise Exception(f"파티션 정보 조회 오류: {str(e)}")
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
 
     def verify_partition_structure(self, source_partition: str, target_partition: str) -> bool:
         """소스와 대상 파티션 구조 비교"""
