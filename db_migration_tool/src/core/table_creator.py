@@ -5,7 +5,7 @@
 테이블 타입에 따라 TRIGGER 또는 RULE을 생성합니다.
 """
 import re
-from typing import Dict, Any, Tuple
+from typing import Dict, Any, Optional, Tuple
 from datetime import datetime
 
 import psycopg
@@ -21,6 +21,18 @@ from .table_types import (
 
 # 안전한 식별자 패턴: 영문자, 숫자, 언더스코어만 허용
 _SAFE_IDENTIFIER_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
+_SAFE_DATA_TYPE_RE = re.compile(r"^[a-zA-Z_ ]+$")
+_SAFE_DEFAULT_RE = re.compile(
+    r"^(?:"
+    r"NULL|"
+    r"'[^']*'(?:\:\:[a-zA-Z_ ]+)?|"
+    r"[0-9.eE+-]+|"
+    r"(?:now|current_timestamp|current_date)\(\)|"
+    r"nextval\('[a-zA-Z0-9_]+'::regclass\)|"
+    r"false|true"
+    r")$",
+    re.IGNORECASE,
+)
 
 
 def _validate_identifier(name: str) -> str:
@@ -28,6 +40,52 @@ def _validate_identifier(name: str) -> str:
     if not _SAFE_IDENTIFIER_RE.match(name):
         raise ValueError(f"안전하지 않은 식별자: {name!r}")
     return name
+
+
+def _validate_data_type_declaration(data_type: str) -> str:
+    """information_schema 기반 타입 선언을 안전한 문자열로 검증한다."""
+    normalized = str(data_type or '').strip()
+    if not normalized or not _SAFE_DATA_TYPE_RE.match(normalized):
+        raise ValueError(f"안전하지 않은 데이터 타입: {data_type!r}")
+    return normalized
+
+
+def _sanitize_column_default(default: Any) -> Optional[str]:
+    """DEFAULT 표현식은 허용된 리터럴/함수만 통과시킨다."""
+    if default is None:
+        return None
+
+    normalized = str(default).strip()
+    if not normalized:
+        return None
+
+    if _SAFE_DEFAULT_RE.match(normalized):
+        return normalized
+    return None
+
+
+def _build_column_definition(column: Dict[str, Any]) -> str:
+    """information_schema/manifest 공용 컬럼 정의 생성기."""
+    col_name = column['name']
+    data_type = _validate_data_type_declaration(column['data_type'])
+    max_length = column.get('character_maximum_length')
+    is_nullable = column.get('is_nullable')
+    original_default = column.get('column_default')
+    safe_default = _sanitize_column_default(original_default)
+
+    _validate_identifier(col_name)
+
+    col_def = f"    {col_name} {data_type}"
+    if max_length:
+        col_def += f"({int(max_length)})"
+    if is_nullable == 'NO':
+        col_def += ' NOT NULL'
+    if safe_default:
+        col_def += f" DEFAULT {safe_default}"
+    elif original_default:
+        print(f"  [WARN] 안전하지 않은 DEFAULT 값 스킵: {col_name} = {original_default}")
+
+    return col_def
 
 
 class TableCreator:
@@ -203,41 +261,17 @@ class TableCreator:
         column_defs = []
 
         for col in columns:
-            col_name, data_type, max_length, is_nullable, default = col
-
-            _validate_identifier(col_name)
-            # data_type은 information_schema에서 오므로 안전하지만 방어적으로 검증
-            if not re.match(r"^[a-zA-Z_ ]+$", data_type):
-                raise ValueError(f"안전하지 않은 데이터 타입: {data_type!r}")
-
-            col_def = f"    {col_name} {data_type}"
-
-            if max_length:
-                col_def += f"({int(max_length)})"
-
-            if is_nullable == 'NO':
-                col_def += " NOT NULL"
-
-            # column_default는 임의 SQL 표현식일 수 있으므로 엄격한 패턴만 허용
-            if default:
-                safe_default = re.match(
-                    r"^(?:"
-                    r"NULL|"                                              # NULL
-                    r"'[^']*'(?:::[a-zA-Z_ ]+)?|"                        # 문자열 리터럴 (캐스트 포함)
-                    r"[0-9.eE+-]+|"                                      # 숫자 리터럴
-                    r"(?:now|current_timestamp|current_date)\(\)|"        # 인자 없는 시간 함수만
-                    r"nextval\('[a-zA-Z0-9_]+'::regclass\)|"             # nextval (엄격: 식별자만)
-                    r"false|true"                                         # 불리언
-                    r")$",
-                    default,
-                    re.IGNORECASE,
+            column_defs.append(
+                _build_column_definition(
+                    {
+                        'name': col[0],
+                        'data_type': col[1],
+                        'character_maximum_length': col[2],
+                        'is_nullable': col[3],
+                        'column_default': col[4],
+                    }
                 )
-                if safe_default:
-                    col_def += f" DEFAULT {default}"
-                else:
-                    print(f"  [WARN] 안전하지 않은 DEFAULT 값 스킵: {col_name} = {default}")
-
-            column_defs.append(col_def)
+            )
 
         create_sql = f"CREATE TABLE IF NOT EXISTS {parent_table} (\n"
         create_sql += ",\n".join(column_defs) + "\n)"

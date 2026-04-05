@@ -731,6 +731,7 @@ class FileArchiveMigrationDialog(QDialog):
             self.worker.truncate_requested.connect(self.on_truncate_requested)
 
         self._worker_had_error = False
+        self.worker.skip_on_error = self.error_strategy == "skip"
         self.worker.progress.connect(self.on_progress)
         self.worker.log.connect(self.add_log)
         self.worker.error.connect(self.on_error)
@@ -756,7 +757,7 @@ class FileArchiveMigrationDialog(QDialog):
         if self.worker:
             self.worker.truncate_permission = reply == QMessageBox.Yes
             if reply == QMessageBox.No and self.error_strategy == "stop":
-                self.worker.stop()
+                self.worker.stop(reason="user_cancel_existing_data")
 
     def pause_migration(self):
         if not self.worker:
@@ -779,7 +780,7 @@ class FileArchiveMigrationDialog(QDialog):
                 QMessageBox.Yes | QMessageBox.No,
             )
             if reply == QMessageBox.Yes:
-                self.worker.stop()
+                self.worker.stop(reason="user_cancel")
                 self.add_log("사용자가 작업을 취소했습니다", "WARNING")
         else:
             self.reject()

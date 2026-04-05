@@ -57,6 +57,7 @@ class BaseMigrationWorker(QThread, metaclass=QThreadABCMeta):
         # 공통 상태 필드
         self.is_running = False
         self.is_paused = False
+        self.stop_reason = None
         self.current_partition_index = 0
         self.total_rows_processed = 0
         self.start_time = None
@@ -114,11 +115,16 @@ class BaseMigrationWorker(QThread, metaclass=QThreadABCMeta):
         self.is_paused = False
         self._log("마이그레이션 재개")
 
-    def stop(self):
-        """마이그레이션 중지"""
+    def stop(self, reason: str = "user_stop"):
+        """마이그레이션 중지
+
+        Args:
+            reason: 중지 사유 식별자 (예: user_cancel, app_stop, network_interrupt)
+        """
         self.is_running = False
         self.is_paused = False
-        self._log("마이그레이션 중지 요청", "WARNING")
+        self.stop_reason = reason
+        self._log(f"마이그레이션 중지 요청 ({reason})", "WARNING")
 
     def _check_pause(self):
         """일시정지 상태 확인

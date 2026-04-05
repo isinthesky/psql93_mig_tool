@@ -2,17 +2,20 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
-from dataclasses import asdict, dataclass, field
+import os
+from dataclasses import asdict, dataclass, field, fields
 from datetime import date, datetime
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 from src.core.table_types import TableType, infer_partition_range
 
 ARCHIVE_FORMAT_NAME = "psql93-migration-archive"
-ARCHIVE_FORMAT_VERSION = 1
+ARCHIVE_FORMAT_VERSION = 2
 MANIFEST_FILENAME = "manifest.json"
+MANIFEST_BACKUP_FILENAME = "manifest.json.bak"
 PARTITIONS_DIRNAME = "partitions"
 
 
@@ -29,10 +32,14 @@ class ArchivePartitionEntry:
     bytes_written: int = 0
     exported_at: str | None = None
     copy_method: str = "FILE_ARCHIVE"
+    checksum_sha256: str | None = None
+    verified_at: str | None = None
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "ArchivePartitionEntry":
-        return cls(**data)
+        allowed = {item.name for item in fields(cls)}
+        payload = {key: value for key, value in dict(data).items() if key in allowed}
+        return cls(**payload)
 
 
 @dataclass
@@ -51,7 +58,9 @@ class ArchiveManifest:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "ArchiveManifest":
-        return cls(**data)
+        allowed = {item.name for item in fields(cls)}
+        payload = {key: value for key, value in dict(data).items() if key in allowed}
+        return cls(**payload)
 
 
 class ArchiveManifestStore:
@@ -60,6 +69,7 @@ class ArchiveManifestStore:
     def __init__(self, archive_path: str | Path):
         self.archive_dir = self.resolve_archive_dir(archive_path)
         self.manifest_path = self.archive_dir / MANIFEST_FILENAME
+        self.backup_path = self.archive_dir / MANIFEST_BACKUP_FILENAME
         self.partitions_dir = self.archive_dir / PARTITIONS_DIRNAME
 
     @staticmethod
@@ -75,14 +85,68 @@ class ArchiveManifestStore:
         endpoint.pop("password", None)
         return endpoint
 
+    @staticmethod
+    def _fsync_directory(path: Path) -> None:
+        if not path.exists():
+            return
+        dir_fd = None
+        try:
+            flags = getattr(os, "O_RDONLY", 0)
+            if hasattr(os, "O_DIRECTORY"):
+                flags |= os.O_DIRECTORY
+            dir_fd = os.open(str(path), flags)
+            os.fsync(dir_fd)
+        except Exception:
+            # 플랫폼별 제약(예: Windows) 때문에 디렉터리 fsync가 실패할 수 있다.
+            pass
+        finally:
+            if dir_fd is not None:
+                os.close(dir_fd)
+
+    def _atomic_write_text(self, path: Path, text: str) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+        try:
+            with tmp_path.open("w", encoding="utf-8") as fp:
+                fp.write(text)
+                fp.flush()
+                os.fsync(fp.fileno())
+            os.replace(tmp_path, path)
+            self._fsync_directory(path.parent)
+        except Exception:
+            try:
+                if tmp_path.exists():
+                    tmp_path.unlink()
+            except Exception:
+                pass
+            raise
+
+    def replace_file_atomically(self, temp_path: str | Path, final_path: str | Path) -> None:
+        src = Path(temp_path)
+        dst = Path(final_path)
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        os.replace(src, dst)
+        self._fsync_directory(dst.parent)
+
     def ensure_archive(self) -> None:
         self.archive_dir.mkdir(parents=True, exist_ok=True)
         self.partitions_dir.mkdir(parents=True, exist_ok=True)
 
     def load(self) -> ArchiveManifest:
-        if not self.manifest_path.exists():
-            raise FileNotFoundError(f"manifest.json 파일을 찾을 수 없습니다: {self.manifest_path}")
-        return ArchiveManifest.from_dict(json.loads(self.manifest_path.read_text(encoding="utf-8")))
+        candidates = [self.manifest_path, self.backup_path]
+        errors: list[str] = []
+        for candidate in candidates:
+            if not candidate.exists():
+                continue
+            try:
+                data = json.loads(candidate.read_text(encoding="utf-8"))
+                return ArchiveManifest.from_dict(data)
+            except Exception as exc:
+                errors.append(f"{candidate}: {exc}")
+
+        if errors:
+            raise ValueError("manifest.json 로드 실패: " + " | ".join(errors))
+        raise FileNotFoundError(f"manifest.json 파일을 찾을 수 없습니다: {self.manifest_path}")
 
     def load_or_create(
         self,
@@ -90,7 +154,7 @@ class ArchiveManifestStore:
         source: dict[str, Any] | None = None,
         target: dict[str, Any] | None = None,
     ) -> ArchiveManifest:
-        if self.manifest_path.exists():
+        if self.manifest_path.exists() or self.backup_path.exists():
             manifest = self.load()
         else:
             manifest = ArchiveManifest()
@@ -103,13 +167,18 @@ class ArchiveManifestStore:
         self.save(manifest)
         return manifest
 
-    def save(self, manifest: ArchiveManifest) -> None:
+    def save(self, manifest: ArchiveManifest, *, create_backup: bool = True) -> None:
         self.ensure_archive()
         manifest.updated_at = datetime.now().isoformat()
-        self.manifest_path.write_text(
-            json.dumps(manifest.to_dict(), ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
+        payload = json.dumps(manifest.to_dict(), ensure_ascii=False, indent=2)
+
+        if create_backup and self.manifest_path.exists():
+            self._atomic_write_text(
+                self.backup_path,
+                self.manifest_path.read_text(encoding="utf-8"),
+            )
+
+        self._atomic_write_text(self.manifest_path, payload)
 
     def upsert_parent_table(
         self,
@@ -139,6 +208,49 @@ class ArchiveManifestStore:
     def build_partition_file_path(self, partition_name: str) -> Path:
         return self.partitions_dir / f"{partition_name}.csv"
 
+    def build_partition_temp_file_path(self, partition_name: str) -> Path:
+        return self.partitions_dir / f".{partition_name}.csv.tmp"
+
+    def compute_file_metadata(self, file_path: str | Path) -> dict[str, Any]:
+        path = Path(file_path)
+        if not path.exists():
+            raise FileNotFoundError(f"아카이브 데이터 파일이 없습니다: {path}")
+
+        digest = hashlib.sha256()
+        size = 0
+        with path.open("rb") as fp:
+            while True:
+                chunk = fp.read(1024 * 1024)
+                if not chunk:
+                    break
+                size += len(chunk)
+                digest.update(chunk)
+
+        return {
+            "bytes_written": size,
+            "checksum_sha256": digest.hexdigest(),
+            "verified_at": datetime.now().isoformat(),
+        }
+
+    def verify_partition_file(self, entry: ArchivePartitionEntry) -> dict[str, Any]:
+        file_path = self.archive_dir / entry.file_path
+        metadata = self.compute_file_metadata(file_path)
+
+        expected_size = int(entry.bytes_written or 0)
+        if expected_size and metadata["bytes_written"] != expected_size:
+            raise ValueError(
+                f"파일 크기 불일치: expected={expected_size}, actual={metadata['bytes_written']}"
+            )
+
+        expected_checksum = (entry.checksum_sha256 or "").strip().lower()
+        if expected_checksum and metadata["checksum_sha256"] != expected_checksum:
+            raise ValueError(
+                "파일 체크섬 불일치: "
+                f"expected={expected_checksum}, actual={metadata['checksum_sha256']}"
+            )
+
+        return metadata
+
     def get_partition_entry(self, partition_name: str) -> ArchivePartitionEntry | None:
         manifest = self.load()
         for item in manifest.partitions:
@@ -159,8 +271,11 @@ class ArchiveManifestStore:
             if not item:
                 results[name] = False
                 continue
-            file_path = self.archive_dir / item.get("file_path", "")
-            results[name] = bool(file_path.exists())
+            try:
+                self.verify_partition_file(ArchivePartitionEntry.from_dict(item))
+                results[name] = True
+            except Exception:
+                results[name] = False
         return results
 
     def filter_partitions(
