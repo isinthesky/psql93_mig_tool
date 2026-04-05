@@ -310,7 +310,7 @@ class ConnectionDialog(QDialog):
         )
 
         try:
-            conn = psycopg.connect(**psycopg_config)
+            conn = psycopg.connect(**psycopg_config, connect_timeout=7)
             with conn.cursor() as cur:
                 cur.execute("SELECT version()")
                 version_str = cur.fetchone()[0]

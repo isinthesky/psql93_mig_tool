@@ -23,6 +23,7 @@ from src.core.table_types import (
     TableType,
     get_partition_primary_key_columns,
     get_table_type,
+    infer_partition_range,
 )
 from src.models.profile import ConnectionProfile
 
@@ -62,11 +63,18 @@ class ManifestTableCreator(TableCreator):
             entry.table_type,
             metadata.get("table_type"),
         )
+        from_ts = entry.from_timestamp
+        to_ts = entry.to_timestamp
+        if from_ts is None or to_ts is None:
+            inferred_from, inferred_to = infer_partition_range(table_type, partition_name)
+            from_ts = from_ts if from_ts is not None else inferred_from
+            to_ts = to_ts if to_ts is not None else inferred_to
+
         return {
             "table_data": table_type.value,
             "table_type": table_type,
-            "from_date": entry.from_timestamp,
-            "to_date": entry.to_timestamp,
+            "from_date": from_ts,
+            "to_date": to_ts,
         }
 
     def _create_parent_table(self, parent_table: str, table_type: TableType = None):
