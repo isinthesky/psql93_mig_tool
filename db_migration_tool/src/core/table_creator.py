@@ -4,6 +4,7 @@
 파티션 테이블의 스키마를 소스에서 복제하고,
 테이블 타입에 따라 TRIGGER 또는 RULE을 생성합니다.
 """
+import re
 from typing import Dict, Any, Tuple
 from datetime import datetime
 
@@ -17,6 +18,16 @@ from .table_types import (
     get_partition_primary_key_columns,
     should_cluster_partition_by_pkey,
 )
+
+# 안전한 식별자 패턴: 영문자, 숫자, 언더스코어만 허용
+_SAFE_IDENTIFIER_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
+
+
+def _validate_identifier(name: str) -> str:
+    """식별자가 안전한 패턴인지 검증하고 반환. 아니면 ValueError 발생."""
+    if not _SAFE_IDENTIFIER_RE.match(name):
+        raise ValueError(f"안전하지 않은 식별자: {name!r}")
+    return name
 
 
 class TableCreator:
@@ -38,7 +49,9 @@ class TableCreator:
         """
         try:
             # 부모 테이블 이름 추출 (예: point_history_221026 -> point_history)
+            _validate_identifier(partition_name)
             parent_table = '_'.join(partition_name.split('_')[:-1])
+            _validate_identifier(parent_table)
 
             # 소스에서 파티션 정보 가져오기
             partition_info = self._get_partition_info(partition_name, parent_table)
@@ -185,27 +198,48 @@ class TableCreator:
             if not columns:
                 raise Exception(f"소스 테이블 구조를 찾을 수 없습니다: {parent_table}")
 
-        # CREATE TABLE 문 생성
-        create_sql = f"CREATE TABLE IF NOT EXISTS {parent_table} (\n"
+        # CREATE TABLE 문 생성 (식별자 검증으로 SQL injection 방지)
+        _validate_identifier(parent_table)
         column_defs = []
 
         for col in columns:
             col_name, data_type, max_length, is_nullable, default = col
 
-            # 컬럼 정의 생성
+            _validate_identifier(col_name)
+            # data_type은 information_schema에서 오므로 안전하지만 방어적으로 검증
+            if not re.match(r"^[a-zA-Z_ ]+$", data_type):
+                raise ValueError(f"안전하지 않은 데이터 타입: {data_type!r}")
+
             col_def = f"    {col_name} {data_type}"
 
             if max_length:
-                col_def += f"({max_length})"
+                col_def += f"({int(max_length)})"
 
             if is_nullable == 'NO':
                 col_def += " NOT NULL"
 
+            # column_default는 임의 SQL 표현식일 수 있으므로 엄격한 패턴만 허용
             if default:
-                col_def += f" DEFAULT {default}"
+                safe_default = re.match(
+                    r"^(?:"
+                    r"NULL|"                                              # NULL
+                    r"'[^']*'(?:::[a-zA-Z_ ]+)?|"                        # 문자열 리터럴 (캐스트 포함)
+                    r"[0-9.eE+-]+|"                                      # 숫자 리터럴
+                    r"(?:now|current_timestamp|current_date)\(\)|"        # 인자 없는 시간 함수만
+                    r"nextval\('[a-zA-Z0-9_]+'::regclass\)|"             # nextval (엄격: 식별자만)
+                    r"false|true"                                         # 불리언
+                    r")$",
+                    default,
+                    re.IGNORECASE,
+                )
+                if safe_default:
+                    col_def += f" DEFAULT {default}"
+                else:
+                    print(f"  [WARN] 안전하지 않은 DEFAULT 값 스킵: {col_name} = {default}")
 
             column_defs.append(col_def)
 
+        create_sql = f"CREATE TABLE IF NOT EXISTS {parent_table} (\n"
         create_sql += ",\n".join(column_defs) + "\n)"
 
         # 대상에 테이블 생성
@@ -246,28 +280,37 @@ class TableCreator:
         from_date = partition_info.get('from_date')
         to_date = partition_info.get('to_date')
 
+        # 식별자 검증
+        _validate_identifier(partition_name)
+        _validate_identifier(parent_table)
+        _validate_identifier(config.date_column)
+
         with self.target_conn.cursor() as cur:
             # CHECK constraint 생성
             date_check = None
             if from_date is not None and to_date is not None:
+                # 날짜 값은 정수로 검증
+                from_date_val = int(from_date)
+                to_date_val = int(to_date)
                 if config.date_is_timestamp:
-                    # 밀리초 → timestamp 변환 후 비교 (9.3 호환)
-                    from_ts = f"to_timestamp({from_date}::double precision / 1000)"
-                    to_ts = f"to_timestamp({to_date}::double precision / 1000)"
+                    from_ts = f"to_timestamp({from_date_val}::double precision / 1000)"
+                    to_ts = f"to_timestamp({to_date_val}::double precision / 1000)"
                     date_check = (
                         f"CHECK({config.date_column} >= {from_ts} "
                         f"AND {config.date_column} <= {to_ts})"
                     )
                 else:
                     date_check = (
-                        f"CHECK({config.date_column} >= {from_date} "
-                        f"AND {config.date_column} <= {to_date})"
+                        f"CHECK({config.date_column} >= {from_date_val} "
+                        f"AND {config.date_column} <= {to_date_val})"
                     )
 
             # 테이블 타입별 constraint 추가
             constraints = []
             pk_columns = get_partition_primary_key_columns(table_type)
             if pk_columns:
+                for pk_col in pk_columns:
+                    _validate_identifier(pk_col)
                 constraints.append(
                     f"CONSTRAINT {partition_name}_pkey PRIMARY KEY({', '.join(pk_columns)})"
                 )
@@ -492,6 +535,8 @@ class TableCreator:
             table_type: 테이블 타입
             cursor: 데이터베이스 커서
         """
+        _validate_identifier(parent_table)
+
         # 인덱스 생성 (9.3 호환: IF NOT EXISTS 미지원 → 중복은 예외 무시)
         self._create_indexes(
             cursor,
@@ -501,9 +546,14 @@ class TableCreator:
             ],
         )
 
-        # 트리거 함수 생성
+        func_name = f"{parent_table}_partition_insert"
+        trigger_name = f"insert_{parent_table}_trigger"
+        _validate_identifier(func_name)
+        _validate_identifier(trigger_name)
+
+        # 트리거 함수 생성 (parent_table은 이미 검증됨)
         cursor.execute(f"""
-            CREATE OR REPLACE FUNCTION {parent_table}_partition_insert()
+            CREATE OR REPLACE FUNCTION {func_name}()
             RETURNS trigger
             LANGUAGE plpgsql
             AS $function$
@@ -524,11 +574,11 @@ class TableCreator:
 
         # 트리거 생성
         cursor.execute(f"""
-            DROP TRIGGER IF EXISTS insert_{parent_table}_trigger ON {parent_table};
+            DROP TRIGGER IF EXISTS {trigger_name} ON {parent_table};
 
-            CREATE TRIGGER insert_{parent_table}_trigger
+            CREATE TRIGGER {trigger_name}
             BEFORE INSERT ON {parent_table}
-            FOR EACH ROW EXECUTE PROCEDURE {parent_table}_partition_insert();
+            FOR EACH ROW EXECUTE PROCEDURE {func_name}();
         """)
 
     def _create_parent_indexes(self, parent_table: str, table_type: TableType, cursor):
@@ -540,6 +590,7 @@ class TableCreator:
             table_type: 테이블 타입
             cursor: 데이터베이스 커서
         """
+        _validate_identifier(parent_table)
         # 테이블 타입별 인덱스 (9.3 호환: IF NOT EXISTS 미지원 → 중복은 예외 무시)
         if table_type in (TableType.POINT_HISTORY, TableType.POINT_SEC_HISTORY, TableType.TREND_HISTORY):
             # PH, PS, TH: path_id + issued_date 인덱스
@@ -593,21 +644,28 @@ class TableCreator:
         from_date = partition_info['from_date']
         to_date = partition_info['to_date']
 
+        # 식별자 검증
+        _validate_identifier(parent_table)
+        _validate_identifier(partition_name)
+        _validate_identifier(config.date_column)
+        for col in config.columns:
+            _validate_identifier(col)
+
         # 날짜 조건 생성 (타입에 따라 다름)
         date_condition = None
         if from_date is not None and to_date is not None:
+            # 날짜 값은 정수로 강제 변환하여 injection 방지
+            from_date_val = int(from_date)
+            to_date_val = int(to_date)
             if config.date_is_timestamp:
-                # timestamp 타입 (energy_display)
-                # bigint timestamp를 timestamp로 변환
-                from_dt = datetime.fromtimestamp(from_date / 1000)
-                to_dt = datetime.fromtimestamp(to_date / 1000)
+                from_dt = datetime.fromtimestamp(from_date_val / 1000)
+                to_dt = datetime.fromtimestamp(to_date_val / 1000)
 
                 date_condition = f"""(new.{config.date_column} >= '{from_dt.strftime('%Y-%m-%d %H:%M:%S')}'::timestamp without time zone)
                 AND (new.{config.date_column} <= '{to_dt.strftime('%Y-%m-%d %H:%M:%S')}'::timestamp without time zone)"""
             else:
-                # bigint 타입 (point_history, trend_history, running_time_history)
-                date_condition = f"""(new.{config.date_column} >= '{from_date}'::bigint)
-                AND (new.{config.date_column} <= '{to_date}'::bigint)"""
+                date_condition = f"""(new.{config.date_column} >= '{from_date_val}'::bigint)
+                AND (new.{config.date_column} <= '{to_date_val}'::bigint)"""
 
         # 컬럼 리스트 생성
         columns = ', '.join(config.columns)
@@ -616,6 +674,7 @@ class TableCreator:
         # RULE 생성 SQL (날짜 범위가 없으면 RULE 생성을 건너뜀)
         if date_condition:
             rule_name = f"rule_{partition_name}"
+            _validate_identifier(rule_name)
 
             # 기존 RULE 제거 (있다면)
             cursor.execute(f"""
