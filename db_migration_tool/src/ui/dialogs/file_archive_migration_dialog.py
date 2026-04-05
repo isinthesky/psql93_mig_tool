@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 
 import psycopg
+from psycopg import sql
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor, QTextCursor
 from PySide6.QtWidgets import (
@@ -224,6 +225,7 @@ class FileArchiveMigrationDialog(QDialog):
         self.pause_btn = QPushButton("일시정지")
         self.pause_btn.clicked.connect(self.pause_migration)
         self.pause_btn.setEnabled(False)
+        self.pause_btn.setVisible(False)
         self.cancel_btn = QPushButton("취소")
         self.cancel_btn.clicked.connect(self.cancel_migration)
         controls.addWidget(self.start_btn)
@@ -623,7 +625,7 @@ class FileArchiveMigrationDialog(QDialog):
                     if not exists:
                         continue
                     try:
-                        cur.execute(f"SELECT COUNT(*) FROM {name}")
+                        cur.execute(sql.SQL("SELECT COUNT(*) FROM {}").format(sql.Identifier(name)))
                         results[name] = bool(cur.fetchone()[0] > 0)
                     except Exception:
                         results[name] = False
@@ -845,14 +847,35 @@ class FileArchiveMigrationDialog(QDialog):
         self.current_progress.setValue(100)
         total = len(self.worker.partitions) if self.worker else 0
         self.total_label.setText(f"{total} / {total}")
-        if self.history_id:
-            self.history_manager.update_history_status(
-                self.history_id,
-                "completed",
-                processed_rows=rows_processed,
+
+        has_failures = bool(self.worker and getattr(self.worker, "partition_failures", []))
+        if has_failures:
+            failed_count = len(self.worker.partition_failures)
+            if self.history_id:
+                self.history_manager.update_history_status(
+                    self.history_id,
+                    "running",
+                    processed_rows=rows_processed,
+                )
+            self.add_log(
+                f"작업 완료 (일부 실패: {failed_count}건). 이어서 진행(resume)할 수 있습니다.",
+                "WARNING",
             )
-        self.add_log("마이그레이션이 완료되었습니다", "SUCCESS")
-        QMessageBox.information(self, "완료", "마이그레이션이 성공적으로 완료되었습니다.")
+            QMessageBox.warning(
+                self,
+                "부분 완료",
+                f"마이그레이션이 완료되었지만 {failed_count}개 파티션이 실패했습니다.\n"
+                "다음 실행 시 이어서 진행할 수 있습니다.",
+            )
+        else:
+            if self.history_id:
+                self.history_manager.update_history_status(
+                    self.history_id,
+                    "completed",
+                    processed_rows=rows_processed,
+                )
+            self.add_log("마이그레이션이 완료되었습니다", "SUCCESS")
+            QMessageBox.information(self, "완료", "마이그레이션이 성공적으로 완료되었습니다.")
         self._update_nav_state()
 
     def on_error(self, error_msg: str):

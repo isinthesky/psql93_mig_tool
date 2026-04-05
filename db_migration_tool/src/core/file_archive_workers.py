@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
 import time
 from pathlib import Path
 from typing import Any
 
 import psycopg2
+import psycopg2.extensions
 from psycopg2 import sql
 from PySide6.QtCore import Signal
 
@@ -476,6 +478,7 @@ class PostgresToFileArchiveWorker(ArchiveMigrationWorkerBase):
         temp_file_path = self.archive_store.build_partition_temp_file_path(partition_name)
         relative_file_path = str(file_path.relative_to(self.archive_store.archive_dir))
 
+        actual_temp = None
         self._log(f"{partition_name} 아카이브 내보내기 시작", "INFO")
         try:
             self._raise_if_stopped(partition_name, current_phase)
@@ -488,6 +491,10 @@ class PostgresToFileArchiveWorker(ArchiveMigrationWorkerBase):
                 copy_method=copy_method,
                 file_path=relative_file_path,
                 temp_file_path=str(temp_file_path),
+            )
+
+            self.source_conn.set_isolation_level(
+                psycopg2.extensions.ISOLATION_LEVEL_REPEATABLE_READ
             )
 
             table_type = self._detect_table_type(partition_name)
@@ -516,7 +523,6 @@ class PostgresToFileArchiveWorker(ArchiveMigrationWorkerBase):
                 order=order_sql,
             ).as_string(self.source_conn)
 
-            self._cleanup_file(temp_file_path)
             current_phase = "export"
             self._raise_if_stopped(partition_name, current_phase)
             self._mark_partition_running(
@@ -527,16 +533,27 @@ class PostgresToFileArchiveWorker(ArchiveMigrationWorkerBase):
                 bytes_transferred=0,
                 copy_method=copy_method,
                 file_path=relative_file_path,
-                temp_file_path=str(temp_file_path),
             )
 
-            with temp_file_path.open("w", encoding="utf-8", newline="") as fp:
-                with self.source_conn.cursor() as cur:
-                    cur.copy_expert(copy_query, fp)
-                fp.flush()
-                os.fsync(fp.fileno())
+            # O_EXCL로 원자적 임시 파일 생성 (symlink 공격 방어)
+            temp_file_path.parent.mkdir(parents=True, exist_ok=True)
+            fd, actual_temp_path = tempfile.mkstemp(
+                dir=str(temp_file_path.parent),
+                prefix=f".{partition_name}_",
+                suffix=".csv.tmp",
+            )
+            actual_temp = Path(actual_temp_path)
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8", newline="") as fp:
+                    with self.source_conn.cursor() as cur:
+                        cur.copy_expert(copy_query, fp)
+                    fp.flush()
+                    os.fsync(fp.fileno())
+            except Exception:
+                self._cleanup_file(actual_temp)
+                raise
 
-            bytes_written = temp_file_path.stat().st_size if temp_file_path.exists() else 0
+            bytes_written = actual_temp.stat().st_size if actual_temp.exists() else 0
             current_phase = "verify"
             self._raise_if_stopped(partition_name, current_phase)
             self._mark_partition_running(
@@ -547,11 +564,10 @@ class PostgresToFileArchiveWorker(ArchiveMigrationWorkerBase):
                 bytes_transferred=bytes_written,
                 copy_method=copy_method,
                 file_path=relative_file_path,
-                temp_file_path=str(temp_file_path),
             )
 
-            self.archive_store.compute_file_metadata(temp_file_path)
-            self.archive_store.replace_file_atomically(temp_file_path, file_path)
+            self.archive_store.compute_file_metadata(actual_temp)
+            self.archive_store.replace_file_atomically(actual_temp, file_path)
             integrity = self.archive_store.compute_file_metadata(file_path)
 
             entry = ArchivePartitionEntry(
@@ -569,6 +585,12 @@ class PostgresToFileArchiveWorker(ArchiveMigrationWorkerBase):
                 checksum_sha256=integrity["checksum_sha256"],
                 verified_at=integrity["verified_at"],
             )
+
+            # REPEATABLE READ 트랜잭션 해제 (읽기 전용이므로 rollback)
+            try:
+                self.source_conn.rollback()
+            except Exception:
+                pass
 
             current_phase = "manifest"
             self._raise_if_stopped(partition_name, current_phase)
@@ -597,12 +619,13 @@ class PostgresToFileArchiveWorker(ArchiveMigrationWorkerBase):
             self._log(f"{partition_name} 아카이브 내보내기 완료 ({total_rows:,} rows)", "SUCCESS")
         except Exception as exc:
             bytes_written = 0
-            if temp_file_path.exists():
+            cleanup_target = actual_temp if actual_temp is not None else temp_file_path
+            if cleanup_target.exists():
                 try:
-                    bytes_written = temp_file_path.stat().st_size
+                    bytes_written = cleanup_target.stat().st_size
                 except Exception:
                     bytes_written = 0
-            partial_removed = self._cleanup_file(temp_file_path)
+            partial_removed = self._cleanup_file(cleanup_target)
             extra = {
                 "event_type": self._detect_event_type(exc, phase=current_phase),
                 "exception_type": type(exc).__name__,
@@ -622,7 +645,6 @@ class PostgresToFileArchiveWorker(ArchiveMigrationWorkerBase):
                     bytes_transferred=bytes_written,
                     copy_method=copy_method,
                     file_path=relative_file_path,
-                    temp_file_path=str(temp_file_path),
                     extra=extra,
                 )
             else:
@@ -638,7 +660,6 @@ class PostgresToFileArchiveWorker(ArchiveMigrationWorkerBase):
                     bytes_transferred=bytes_written,
                     copy_method=copy_method,
                     file_path=relative_file_path,
-                    temp_file_path=str(temp_file_path),
                     extra=extra,
                 )
             raise
@@ -742,7 +763,7 @@ class FileToPostgresArchiveWorker(ArchiveMigrationWorkerBase):
         if entry is None:
             raise Exception(f"manifest에 파티션이 없습니다: {partition_name}")
 
-        file_path = self.archive_store.archive_dir / entry.file_path
+        file_path = self.archive_store.resolve_safe_path(entry.file_path)
         self._log(f"{partition_name} 아카이브 가져오기 시작", "INFO")
 
         try:
@@ -750,14 +771,22 @@ class FileToPostgresArchiveWorker(ArchiveMigrationWorkerBase):
             self._mark_partition_running(
                 checkpoint,
                 phase=current_phase,
-                detail="아카이브 파일 존재 여부/크기/sha256 검증 중",
+                detail="아카이브 파일 열기 및 sha256/크기 검증 중",
                 rows_processed=0,
                 bytes_transferred=0,
                 copy_method=copy_method,
                 file_path=entry.file_path,
             )
 
-            integrity = self.archive_store.verify_partition_file(entry)
+            # 파일을 한 번 열어 검증 후 같은 핸들로 COPY (TOCTOU 방어)
+            archive_fp = file_path.open("rb")
+            try:
+                integrity = self.archive_store.verify_open_file(entry, archive_fp)
+                archive_fp.seek(0)
+            except Exception:
+                archive_fp.close()
+                raise
+
             expected_rows = int(entry.row_count or 0)
             self.performance_metrics.start_partition(partition_name, expected_rows)
 
@@ -765,6 +794,7 @@ class FileToPostgresArchiveWorker(ArchiveMigrationWorkerBase):
             table_config = TABLE_TYPE_CONFIG[table_type]
             expected_columns = list(table_config.columns)
             if entry.columns and list(entry.columns) != expected_columns:
+                archive_fp.close()
                 raise ValueError(
                     f"manifest 컬럼 순서 불일치: expected={expected_columns}, actual={entry.columns}"
                 )
@@ -794,35 +824,25 @@ class FileToPostgresArchiveWorker(ArchiveMigrationWorkerBase):
             self._mark_partition_running(
                 checkpoint,
                 phase=current_phase,
-                detail="CSV 파일을 대상 PostgreSQL 파티션으로 COPY 중",
+                detail="검증된 파일을 대상 PostgreSQL 파티션으로 COPY 중",
                 rows_processed=0,
                 bytes_transferred=int(integrity["bytes_written"]),
                 copy_method=copy_method,
                 file_path=entry.file_path,
             )
 
-            with file_path.open("r", encoding="utf-8", newline="") as fp:
+            try:
                 with self.target_conn.cursor() as cur:
-                    cur.copy_expert(copy_query, fp)
+                    cur.copy_expert(copy_query, archive_fp)
+            finally:
+                archive_fp.close()
 
-            current_phase = "commit"
+            current_phase = "verify"
             self._raise_if_stopped(partition_name, current_phase)
             self._mark_partition_running(
                 checkpoint,
                 phase=current_phase,
-                detail="대상 트랜잭션 커밋 중",
-                rows_processed=expected_rows,
-                bytes_transferred=int(integrity["bytes_written"]),
-                copy_method=copy_method,
-                file_path=entry.file_path,
-            )
-            self.target_conn.commit()
-
-            current_phase = "verify"
-            self._mark_partition_running(
-                checkpoint,
-                phase=current_phase,
-                detail="대상 row_count 검증 중",
+                detail="커밋 전 대상 row_count 검증 중",
                 rows_processed=expected_rows,
                 bytes_transferred=int(integrity["bytes_written"]),
                 copy_method=copy_method,
@@ -830,9 +850,22 @@ class FileToPostgresArchiveWorker(ArchiveMigrationWorkerBase):
             )
             imported_rows = self._query_row_count(self.target_conn, partition_name)
             if imported_rows != expected_rows:
+                self.target_conn.rollback()
                 raise ValueError(
                     f"대상 row_count 검증 실패: expected={expected_rows}, actual={imported_rows}"
                 )
+
+            current_phase = "commit"
+            self._mark_partition_running(
+                checkpoint,
+                phase=current_phase,
+                detail="검증 통과, 대상 트랜잭션 커밋 중",
+                rows_processed=expected_rows,
+                bytes_transferred=int(integrity["bytes_written"]),
+                copy_method=copy_method,
+                file_path=entry.file_path,
+            )
+            self.target_conn.commit()
 
             self.performance_metrics.update(expected_rows, int(integrity["bytes_written"]))
             self.performance_metrics.complete_partition()

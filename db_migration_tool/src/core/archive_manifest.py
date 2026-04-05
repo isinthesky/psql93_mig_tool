@@ -5,6 +5,8 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
+import uuid
 from dataclasses import asdict, dataclass, field, fields
 from datetime import date, datetime
 from pathlib import Path
@@ -17,6 +19,8 @@ ARCHIVE_FORMAT_VERSION = 2
 MANIFEST_FILENAME = "manifest.json"
 MANIFEST_BACKUP_FILENAME = "manifest.json.bak"
 PARTITIONS_DIRNAME = "partitions"
+
+_SAFE_PARTITION_NAME_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
 
 
 @dataclass
@@ -71,6 +75,7 @@ class ArchiveManifestStore:
         self.manifest_path = self.archive_dir / MANIFEST_FILENAME
         self.backup_path = self.archive_dir / MANIFEST_BACKUP_FILENAME
         self.partitions_dir = self.archive_dir / PARTITIONS_DIRNAME
+        self._lock_path = self.archive_dir / ".manifest.lock"
 
     @staticmethod
     def resolve_archive_dir(archive_path: str | Path) -> Path:
@@ -105,7 +110,7 @@ class ArchiveManifestStore:
 
     def _atomic_write_text(self, path: Path, text: str) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
-        tmp_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+        tmp_path = path.with_name(f".{path.name}.{uuid.uuid4().hex[:12]}.tmp")
         try:
             with tmp_path.open("w", encoding="utf-8") as fp:
                 fp.write(text)
@@ -132,6 +137,21 @@ class ArchiveManifestStore:
         self.archive_dir.mkdir(parents=True, exist_ok=True)
         self.partitions_dir.mkdir(parents=True, exist_ok=True)
 
+    @staticmethod
+    def _validate_manifest_schema(data: dict[str, Any]) -> None:
+        fmt = data.get("format")
+        if fmt != ARCHIVE_FORMAT_NAME:
+            raise ValueError(
+                f"지원하지 않는 manifest 형식입니다: {fmt!r} (expected={ARCHIVE_FORMAT_NAME!r})"
+            )
+        version = data.get("version")
+        if not isinstance(version, int) or version < 1 or version > ARCHIVE_FORMAT_VERSION:
+            raise ValueError(
+                f"지원하지 않는 manifest 버전입니다: {version!r} (max supported={ARCHIVE_FORMAT_VERSION})"
+            )
+        if not isinstance(data.get("partitions", []), list):
+            raise ValueError("manifest partitions 필드가 list가 아닙니다.")
+
     def load(self) -> ArchiveManifest:
         candidates = [self.manifest_path, self.backup_path]
         errors: list[str] = []
@@ -140,6 +160,7 @@ class ArchiveManifestStore:
                 continue
             try:
                 data = json.loads(candidate.read_text(encoding="utf-8"))
+                self._validate_manifest_schema(data)
                 return ArchiveManifest.from_dict(data)
             except Exception as exc:
                 errors.append(f"{candidate}: {exc}")
@@ -167,18 +188,43 @@ class ArchiveManifestStore:
         self.save(manifest)
         return manifest
 
-    def save(self, manifest: ArchiveManifest, *, create_backup: bool = True) -> None:
+    def _acquire_lock(self):
+        """manifest 쓰기 직렬화를 위한 파일 락 획득."""
         self.ensure_archive()
-        manifest.updated_at = datetime.now().isoformat()
-        payload = json.dumps(manifest.to_dict(), ensure_ascii=False, indent=2)
+        lock_fd = open(self._lock_path, "w")
+        try:
+            if hasattr(os, "name") and os.name == "nt":
+                import msvcrt
+                msvcrt.locking(lock_fd.fileno(), msvcrt.LK_LOCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        except Exception:
+            pass
+        return lock_fd
 
-        if create_backup and self.manifest_path.exists():
-            self._atomic_write_text(
-                self.backup_path,
-                self.manifest_path.read_text(encoding="utf-8"),
-            )
+    @staticmethod
+    def _release_lock(lock_fd):
+        try:
+            lock_fd.close()
+        except Exception:
+            pass
 
-        self._atomic_write_text(self.manifest_path, payload)
+    def save(self, manifest: ArchiveManifest, *, create_backup: bool = True) -> None:
+        lock_fd = self._acquire_lock()
+        try:
+            manifest.updated_at = datetime.now().isoformat()
+            payload = json.dumps(manifest.to_dict(), ensure_ascii=False, indent=2)
+
+            if create_backup and self.manifest_path.exists():
+                self._atomic_write_text(
+                    self.backup_path,
+                    self.manifest_path.read_text(encoding="utf-8"),
+                )
+
+            self._atomic_write_text(self.manifest_path, payload)
+        finally:
+            self._release_lock(lock_fd)
 
     def upsert_parent_table(
         self,
@@ -205,10 +251,31 @@ class ArchiveManifestStore:
         else:
             manifest.partitions.append(payload)
 
+    def resolve_safe_path(self, relative_path: str) -> Path:
+        """아카이브 루트 하위 경로만 허용, 절대경로/.. 탈출 차단."""
+        if not relative_path:
+            raise ValueError("빈 파일 경로입니다.")
+        candidate = Path(relative_path)
+        if candidate.is_absolute():
+            raise ValueError(f"절대 경로는 허용되지 않습니다: {relative_path}")
+        resolved = (self.archive_dir / candidate).resolve()
+        archive_root = self.archive_dir.resolve()
+        if not str(resolved).startswith(str(archive_root) + os.sep) and resolved != archive_root:
+            raise ValueError(f"아카이브 루트를 벗어나는 경로입니다: {relative_path}")
+        return resolved
+
+    @staticmethod
+    def _validate_partition_name(partition_name: str) -> str:
+        if not partition_name or not _SAFE_PARTITION_NAME_RE.match(partition_name):
+            raise ValueError(f"안전하지 않은 파티션 이름입니다: {partition_name!r}")
+        return partition_name
+
     def build_partition_file_path(self, partition_name: str) -> Path:
+        self._validate_partition_name(partition_name)
         return self.partitions_dir / f"{partition_name}.csv"
 
     def build_partition_temp_file_path(self, partition_name: str) -> Path:
+        self._validate_partition_name(partition_name)
         return self.partitions_dir / f".{partition_name}.csv.tmp"
 
     def compute_file_metadata(self, file_path: str | Path) -> dict[str, Any]:
@@ -232,16 +299,15 @@ class ArchiveManifestStore:
             "verified_at": datetime.now().isoformat(),
         }
 
-    def verify_partition_file(self, entry: ArchivePartitionEntry) -> dict[str, Any]:
-        file_path = self.archive_dir / entry.file_path
-        metadata = self.compute_file_metadata(file_path)
-
+    @staticmethod
+    def _verify_entry_against_metadata(
+        entry: ArchivePartitionEntry, metadata: dict[str, Any]
+    ) -> None:
         expected_size = int(entry.bytes_written or 0)
         if expected_size and metadata["bytes_written"] != expected_size:
             raise ValueError(
                 f"파일 크기 불일치: expected={expected_size}, actual={metadata['bytes_written']}"
             )
-
         expected_checksum = (entry.checksum_sha256 or "").strip().lower()
         if expected_checksum and metadata["checksum_sha256"] != expected_checksum:
             raise ValueError(
@@ -249,6 +315,30 @@ class ArchiveManifestStore:
                 f"expected={expected_checksum}, actual={metadata['checksum_sha256']}"
             )
 
+    def verify_partition_file(self, entry: ArchivePartitionEntry) -> dict[str, Any]:
+        file_path = self.resolve_safe_path(entry.file_path)
+        metadata = self.compute_file_metadata(file_path)
+        self._verify_entry_against_metadata(entry, metadata)
+        return metadata
+
+    def verify_open_file(self, entry: ArchivePartitionEntry, fp) -> dict[str, Any]:
+        """열린 파일 핸들을 통해 무결성 검증 (TOCTOU 방어)."""
+        digest = hashlib.sha256()
+        size = 0
+        while True:
+            chunk = fp.read(1024 * 1024)
+            if not chunk:
+                break
+            if isinstance(chunk, str):
+                chunk = chunk.encode("utf-8")
+            size += len(chunk)
+            digest.update(chunk)
+        metadata = {
+            "bytes_written": size,
+            "checksum_sha256": digest.hexdigest(),
+            "verified_at": datetime.now().isoformat(),
+        }
+        self._verify_entry_against_metadata(entry, metadata)
         return metadata
 
     def get_partition_entry(self, partition_name: str) -> ArchivePartitionEntry | None:

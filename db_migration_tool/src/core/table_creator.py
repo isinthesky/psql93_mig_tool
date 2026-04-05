@@ -4,9 +4,12 @@
 파티션 테이블의 스키마를 소스에서 복제하고,
 테이블 타입에 따라 TRIGGER 또는 RULE을 생성합니다.
 """
+import logging
 import re
 from typing import Dict, Any, Optional, Tuple
 from datetime import datetime
+
+logger = logging.getLogger(__name__)
 
 import psycopg
 
@@ -83,7 +86,7 @@ def _build_column_definition(column: Dict[str, Any]) -> str:
     if safe_default:
         col_def += f" DEFAULT {safe_default}"
     elif original_default:
-        print(f"  [WARN] 안전하지 않은 DEFAULT 값 스킵: {col_name} = {original_default}")
+        logger.warning("안전하지 않은 DEFAULT 값 스킵: %s = %s", col_name, original_default)
 
     return col_def
 
