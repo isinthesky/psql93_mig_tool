@@ -521,9 +521,13 @@ class FileArchiveMigrationDialog(QDialog):
         ]
         self._target_has_data = {}
         self._render_partition_list()
-        self.discover_status.setText(f"완료: {len(self.discovered_partitions)}개 파티션")
+        self.discover_status.setText(f"완료: {len(self.discovered_partitions)}개 파티션, 대상 확인 중...")
         self._update_counts()
         self._update_nav_state()
+
+        if self.discovered_partitions:
+            self.check_target_completed()
+            self.discover_status.setText(f"완료: {len(self.discovered_partitions)}개 파티션")
 
     def _render_partition_list(self):
         self.partition_list.clear()
