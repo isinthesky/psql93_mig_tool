@@ -30,6 +30,7 @@ from src.models.profile import (
     ENDPOINT_KIND_POSTGRES,
     ConnectionProfile,
 )
+from src.models.saved_connection import SavedConnectionManager
 from src.utils.validators import ConnectionValidator, VersionValidator
 
 from .connection_mapper import (
@@ -48,6 +49,8 @@ class ConnectionDialog(QDialog):
         self.profile = profile
         self.is_edit_mode = profile is not None
         self.endpoint_widgets: dict[str, dict] = {}
+        self.saved_conn_manager = SavedConnectionManager()
+        self._preset_items: dict[str, list[dict]] = {"source": [], "target": []}
 
         self.setup_ui()
         if self.is_edit_mode:
@@ -114,6 +117,20 @@ class ConnectionDialog(QDialog):
         postgres_widget = QWidget()
         postgres_layout = QFormLayout(postgres_widget)
 
+        preset_row = QHBoxLayout()
+        preset_combo = QComboBox()
+        preset_combo.setMinimumWidth(300)
+        preset_combo.addItem("저장된 연결 선택...")
+        preset_combo.currentIndexChanged.connect(
+            lambda idx, side=key: self._on_preset_selected(side, idx)
+        )
+        delete_preset_btn = QPushButton("삭제")
+        delete_preset_btn.setToolTip("선택한 프리셋 삭제")
+        delete_preset_btn.clicked.connect(lambda _=False, side=key: self._delete_selected_preset(side))
+        preset_row.addWidget(preset_combo)
+        preset_row.addWidget(delete_preset_btn)
+        postgres_layout.addRow("저장된 연결:", preset_row)
+
         host_edit = QLineEdit()
         host_edit.setPlaceholderText("localhost")
         postgres_layout.addRow("호스트:", host_edit)
@@ -179,6 +196,8 @@ class ConnectionDialog(QDialog):
         self.endpoint_widgets[key] = {
             "kind": kind_combo,
             "stack": stacked,
+            "preset_combo": preset_combo,
+            "delete_preset_btn": delete_preset_btn,
             "archive_path": archive_path_edit,
             "host": host_edit,
             "port": port_spin,
@@ -189,6 +208,7 @@ class ConnectionDialog(QDialog):
             "compat_mode": compat_combo,
             "title": title,
         }
+        self._refresh_presets(key)
         self.on_endpoint_kind_changed(key)
         return widget
 
@@ -198,6 +218,65 @@ class ConnectionDialog(QDialog):
         selected = QFileDialog.getExistingDirectory(self, "아카이브 폴더 선택", start_dir)
         if selected:
             self.endpoint_widgets[side]["archive_path"].setText(selected)
+
+    def _refresh_presets(self, side: str):
+        combo = self.endpoint_widgets[side]["preset_combo"]
+        combo.blockSignals(True)
+        combo.clear()
+        combo.addItem("저장된 연결 선택...")
+        presets = self.saved_conn_manager.get_all()
+        self._preset_items[side] = presets
+        for p in presets:
+            combo.addItem(p["label"])
+        combo.setCurrentIndex(0)
+        combo.blockSignals(False)
+
+    def _on_preset_selected(self, side: str, index: int):
+        if index <= 0:
+            return
+        presets = self._preset_items.get(side, [])
+        if index - 1 >= len(presets):
+            return
+        preset = presets[index - 1]
+        w = self.endpoint_widgets[side]
+        w["host"].setText(preset["host"])
+        w["port"].setValue(preset["port"])
+        w["database"].setText(preset["database"])
+        w["username"].setText(preset["username"])
+        w["password"].setText(preset["password"])
+        w["ssl"].setChecked(preset["ssl"])
+        mode_label = COMPAT_MODE_LABELS.get(preset["compat_mode"], COMPAT_MODE_LABELS["auto"])
+        idx = w["compat_mode"].findText(mode_label)
+        if idx >= 0:
+            w["compat_mode"].setCurrentIndex(idx)
+
+    def _delete_selected_preset(self, side: str):
+        combo = self.endpoint_widgets[side]["preset_combo"]
+        index = combo.currentIndex()
+        if index <= 0:
+            return
+        presets = self._preset_items.get(side, [])
+        if index - 1 >= len(presets):
+            return
+        preset = presets[index - 1]
+        reply = QMessageBox.question(
+            self, "프리셋 삭제", f"'{preset['label']}'을(를) 삭제하시겠습니까?",
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        if reply == QMessageBox.Yes:
+            self.saved_conn_manager.delete(preset["id"])
+            self._refresh_presets(side)
+            for other_side in ("source", "target"):
+                if other_side != side:
+                    self._refresh_presets(other_side)
+
+    def _save_preset_on_success(self, side: str):
+        config = self._get_endpoint_profile_config(side)
+        if config.get("kind") == ENDPOINT_KIND_FILE:
+            return
+        self.saved_conn_manager.save_connection(config)
+        self._refresh_presets("source")
+        self._refresh_presets("target")
 
     def on_endpoint_kind_changed(self, side: str):
         widgets = self.endpoint_widgets[side]
@@ -317,6 +396,7 @@ class ConnectionDialog(QDialog):
                 version_info = parse_version_string(version_str)
             conn.close()
 
+            self._save_preset_on_success(side)
             QMessageBox.information(
                 self,
                 "연결 성공",

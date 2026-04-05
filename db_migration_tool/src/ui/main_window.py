@@ -7,16 +7,12 @@ from PySide6.QtGui import QAction, QCloseEvent
 from PySide6.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
-    QHeaderView,
     QListWidget,
     QListWidgetItem,
     QMainWindow,
     QMessageBox,
     QPushButton,
-    QSplitter,
     QStatusBar,
-    QTableWidget,
-    QTableWidgetItem,
     QToolBar,
     QVBoxLayout,
     QWidget,
@@ -24,6 +20,7 @@ from PySide6.QtWidgets import (
 
 from src.ui.dialogs.connection_dialog import ConnectionDialog
 from src.ui.dialogs.file_archive_migration_dialog import FileArchiveMigrationDialog
+from src.ui.dialogs.history_dialog import HistoryDialog
 from src.ui.dialogs.log_viewer_dialog import LogViewerDialog
 from src.ui.dialogs.migration_wizard_dialog import MigrationWizardDialog
 from src.ui.viewmodels.main_viewmodel import MainViewModel
@@ -44,6 +41,7 @@ class MainWindow(QMainWindow):
 
         # UI 상태
         self.log_viewer_dialog = None
+        self.history_dialog = None
 
         # 트레이 아이콘 관련
         self.tray_icon = None  # TrayIconManager 인스턴스 (main.py에서 설정)
@@ -61,7 +59,7 @@ class MainWindow(QMainWindow):
     def setup_ui(self):
         """UI 초기화"""
         self.setWindowTitle("DB 마이그레이션 도구")
-        self.setGeometry(100, 100, 1200, 800)
+        self.setGeometry(100, 100, 480, 600)
 
         # 중앙 위젯
         central_widget = QWidget()
@@ -69,20 +67,7 @@ class MainWindow(QMainWindow):
 
         # 메인 레이아웃
         main_layout = QHBoxLayout(central_widget)
-
-        # 좌측: 연결 프로필
-        left_panel = self.create_profile_panel()
-
-        # 우측: 작업 이력
-        right_panel = self.create_history_panel()
-
-        # 스플리터로 분할
-        splitter = QSplitter(Qt.Horizontal)
-        splitter.addWidget(left_panel)
-        splitter.addWidget(right_panel)
-        splitter.setSizes([400, 800])
-
-        main_layout.addWidget(splitter)
+        main_layout.addWidget(self.create_profile_panel())
 
         # 툴바 생성
         self.create_toolbar()
@@ -123,6 +108,12 @@ class MainWindow(QMainWindow):
         toolbar.addAction(self.migrate_action)
 
         toolbar.addSeparator()
+
+        # 작업 이력 액션
+        history_action = QAction("작업 이력", self)
+        history_action.setShortcut("Ctrl+H")
+        history_action.triggered.connect(self.show_history_dialog)
+        toolbar.addAction(history_action)
 
         # 로그 뷰어 액션
         log_viewer_action = QAction("로그 뷰어", self)
@@ -207,50 +198,11 @@ class MainWindow(QMainWindow):
         group.setLayout(layout)
         return group
 
-    def create_history_panel(self):
-        """작업 이력 패널 생성"""
-        group = QGroupBox("작업 이력")
-        layout = QVBoxLayout()
-
-        # 이력 테이블
-        self.history_table = QTableWidget()
-        self.history_table.setColumnCount(6)
-        self.history_table.setHorizontalHeaderLabels(
-            ["프로필", "시작 날짜", "종료 날짜", "시작 시간", "완료 시간", "상태"]
-        )
-
-        # 열 너비 조정
-        header = self.history_table.horizontalHeader()
-        header.setSectionResizeMode(0, QHeaderView.Stretch)
-        header.setSectionResizeMode(5, QHeaderView.ResizeToContents)
-
-        # 행 선택 모드
-        self.history_table.setSelectionBehavior(QTableWidget.SelectRows)
-
-        layout.addWidget(self.history_table)
-
-        # 새로고침 버튼
-        refresh_btn = QPushButton("새로고침")
-        refresh_btn.setStyleSheet("""
-            QPushButton {
-                font-size: 16px;
-                padding: 12px 20px;
-                min-height: 45px;
-                font-weight: bold;
-            }
-        """)
-        refresh_btn.clicked.connect(self.refresh_history)
-        layout.addWidget(refresh_btn)
-
-        group.setLayout(layout)
-        return group
-
     def bind_viewmodel(self):
         """ViewModel 시그널 바인딩"""
         # ViewModel → UI 시그널
         self.vm.profiles_changed.connect(self.update_profile_list)
         self.vm.current_profile_changed.connect(self.update_profile_selection)
-        self.vm.histories_changed.connect(self.update_history_table)
         self.vm.error_occurred.connect(self.show_error)
         self.vm.message_sent.connect(self.show_message)
 
@@ -320,48 +272,6 @@ class MainWindow(QMainWindow):
         else:
             self.status_bar.showMessage("준비")
 
-    def update_history_table(self, histories):
-        """작업 이력 테이블 UI 업데이트"""
-        self.history_table.setRowCount(0)
-
-        for history in histories:
-            row = self.history_table.rowCount()
-            self.history_table.insertRow(row)
-
-            # 프로필 이름 가져오기
-            profile = self.vm.profile_manager.get_profile(history.profile_id)
-            profile_name = profile.name if profile else "알 수 없음"
-
-            # 테이블 항목 설정
-            self.history_table.setItem(row, 0, QTableWidgetItem(profile_name))
-            self.history_table.setItem(row, 1, QTableWidgetItem(str(history.start_date)))
-            self.history_table.setItem(row, 2, QTableWidgetItem(str(history.end_date)))
-            self.history_table.setItem(
-                row,
-                3,
-                QTableWidgetItem(
-                    history.started_at.strftime("%Y-%m-%d %H:%M:%S") if history.started_at else ""
-                ),
-            )
-            self.history_table.setItem(
-                row,
-                4,
-                QTableWidgetItem(
-                    history.completed_at.strftime("%Y-%m-%d %H:%M:%S")
-                    if history.completed_at
-                    else ""
-                ),
-            )
-
-            # 상태 표시
-            status_text = {
-                "completed": "완료",
-                "failed": "실패",
-                "cancelled": "취소",
-                "running": "진행중",
-            }.get(history.status, history.status)
-            self.history_table.setItem(row, 5, QTableWidgetItem(status_text))
-
     def show_error(self, message):
         """오류 메시지 표시"""
         QMessageBox.critical(self, "오류", message)
@@ -423,12 +333,17 @@ class MainWindow(QMainWindow):
             dialog = FileArchiveMigrationDialog(self, profile)
         dialog.exec()
 
-        self.vm.refresh_histories()
+    def show_history_dialog(self):
+        """작업 이력 다이얼로그 표시 (modeless 싱글톤)"""
+        if self.history_dialog is None:
+            self.history_dialog = HistoryDialog(self)
 
-    def refresh_history(self):
-        """작업 이력 새로고침 (ViewModel로 위임)"""
-        self.vm.refresh_histories()
-        self.status_bar.showMessage("작업 이력이 새로고침되었습니다.")
+        if self.history_dialog.isHidden():
+            self.history_dialog.show()
+        else:
+            self.history_dialog.refresh()
+            self.history_dialog.raise_()
+            self.history_dialog.activateWindow()
 
     def show_log_viewer(self):
         """로그 뷰어 표시"""

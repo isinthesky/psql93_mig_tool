@@ -105,7 +105,7 @@ def main():
 
         # 시그널 연결
         tray_manager.show_window_requested.connect(lambda: window.show())
-        tray_manager.show_history_requested.connect(window.refresh_history)
+        tray_manager.show_history_requested.connect(window.show_history_dialog)
         tray_manager.quit_requested.connect(app.quit)
 
     # 윈도우 표시

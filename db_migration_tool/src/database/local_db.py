@@ -67,6 +67,23 @@ class Checkpoint(Base):
     bytes_transferred = Column(Integer, default=0)
 
 
+class SavedConnection(Base):
+    """저장된 PostgreSQL 연결 프리셋"""
+
+    __tablename__ = "saved_connections"
+
+    id = Column(Integer, primary_key=True)
+    host = Column(String(255), nullable=False)
+    port = Column(Integer, nullable=False, default=5432)
+    database = Column(String(100), nullable=False)
+    username = Column(String(100), nullable=False)
+    password = Column(Text, default="")  # 암호화
+    ssl = Column(Integer, default=0)  # 0=False, 1=True
+    compat_mode = Column(String(10), default="auto")
+    last_used = Column(DateTime, default=datetime.now)
+    created_at = Column(DateTime, default=datetime.now)
+
+
 class LogEntry(Base):
     """로그 엔트리 테이블"""
 
