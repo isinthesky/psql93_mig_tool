@@ -117,10 +117,10 @@ class MainWindow(QMainWindow):
         toolbar.addSeparator()
 
         # 마이그레이션 작업 설정 액션
-        migrate_action = QAction("마이그레이션 작업 설정", self)
-        migrate_action.setShortcut("F5")
-        migrate_action.triggered.connect(self.start_migration)
-        toolbar.addAction(migrate_action)
+        self.migrate_action = QAction("마이그레이션 작업 설정", self)
+        self.migrate_action.setShortcut("F5")
+        self.migrate_action.triggered.connect(self.start_migration)
+        toolbar.addAction(self.migrate_action)
 
         toolbar.addSeparator()
 
@@ -257,18 +257,45 @@ class MainWindow(QMainWindow):
         # UI → ViewModel 시그널
         self.profile_list.itemSelectionChanged.connect(self.on_profile_selected)
 
+    def _migration_mode_text(self, profile) -> str:
+        if not profile:
+            return "마이그레이션 작업 설정"
+        mode = profile.migration_mode
+        return {
+            "postgres_to_postgres": "DB → DB 마이그레이션",
+            "postgres_to_file": "DB → 파일 아카이브 내보내기",
+            "file_to_postgres": "파일 아카이브 → DB 가져오기",
+        }.get(mode, "마이그레이션 작업 설정")
+
+    def _endpoint_summary(self, profile) -> str:
+        if not profile:
+            return ""
+        source = "PostgreSQL" if profile.source_kind == "postgres" else "File Archive"
+        target = "PostgreSQL" if profile.target_kind == "postgres" else "File Archive"
+        return f"{source} → {target}"
+
     def refresh_ui_from_vm(self):
         """ViewModel 상태를 기반으로 UI 초기화"""
         has_profile = self.vm.current_profile is not None
         self.edit_btn.setEnabled(has_profile)
         self.delete_btn.setEnabled(has_profile)
         self.migrate_btn.setEnabled(has_profile)
+        label = self._migration_mode_text(self.vm.current_profile)
+        self.migrate_btn.setText(label)
+        if hasattr(self, "migrate_action"):
+            self.migrate_action.setText(label)
 
     def update_profile_list(self, profiles):
         """프로필 목록 UI 업데이트"""
         self.profile_list.clear()
         for profile in profiles:
-            item = QListWidgetItem(profile.name)
+            summary = self._endpoint_summary(profile)
+            item = QListWidgetItem(f"{profile.name}  [{summary}]")
+            item.setToolTip(
+                f"프로필: {profile.name}\n"
+                f"마이그레이션 경로: {summary}\n"
+                f"실행 동작: {self._migration_mode_text(profile)}"
+            )
             item.setData(Qt.UserRole, profile.id)
             self.profile_list.addItem(item)
 
@@ -279,8 +306,17 @@ class MainWindow(QMainWindow):
         self.delete_btn.setEnabled(has_profile)
         self.migrate_btn.setEnabled(has_profile)
 
+        label = self._migration_mode_text(profile)
+        self.migrate_btn.setText(label)
+        self.migrate_btn.setToolTip(label)
+        if hasattr(self, "migrate_action"):
+            self.migrate_action.setText(label)
+            self.migrate_action.setToolTip(label)
+
         if has_profile:
-            self.status_bar.showMessage(f"프로필 선택됨: {profile.name}")
+            self.status_bar.showMessage(
+                f"프로필 선택됨: {profile.name} · {self._endpoint_summary(profile)}"
+            )
         else:
             self.status_bar.showMessage("준비")
 
@@ -378,6 +414,9 @@ class MainWindow(QMainWindow):
             return
 
         profile = self.vm.current_profile
+        self.status_bar.showMessage(
+            f"{self._migration_mode_text(profile)} 실행 준비 · {self._endpoint_summary(profile)}"
+        )
         if profile.source_kind == "postgres" and profile.target_kind == "postgres":
             dialog = MigrationWizardDialog(self, profile)
         else:

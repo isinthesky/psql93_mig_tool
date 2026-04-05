@@ -84,8 +84,8 @@ class FileArchiveMigrationDialog(QDialog):
 
     def _build_title(self) -> str:
         if self.profile.migration_mode == "postgres_to_file":
-            return "Migration Wizard - PostgreSQL → File Archive"
-        return "Migration Wizard - File Archive → PostgreSQL"
+            return "파일 아카이브 마이그레이션 - PostgreSQL → File Archive"
+        return "파일 아카이브 마이그레이션 - File Archive → PostgreSQL"
 
     def _source_label(self) -> str:
         return "소스 DB" if self.profile.source_kind == ENDPOINT_KIND_POSTGRES else "소스 Archive"
@@ -98,7 +98,9 @@ class FileArchiveMigrationDialog(QDialog):
 
         self.step_title = QLabel("1/3 연결 확인")
         self.step_title.setStyleSheet("font-size: 18px; font-weight: bold;")
-        self.step_hint = QLabel("양쪽 엔드포인트 연결/경로를 확인합니다.")
+        self.step_hint = QLabel(
+            f"{self._source_label()}와 {self._target_label()} 연결/경로를 확인하고, 파티션 단위로 내보내기/가져오기를 진행합니다."
+        )
         self.step_hint.setStyleSheet("color: #888888;")
         root.addWidget(self.step_title)
         root.addWidget(self.step_hint)
