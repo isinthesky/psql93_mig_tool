@@ -15,7 +15,7 @@ from PySide6.QtCore import Signal
 from src.core.base_migration_worker import BaseMigrationWorker
 from src.core.performance_metrics import PerformanceMetrics
 from src.core.table_creator import TableCreator
-from src.core.table_types import TABLE_TYPE_CONFIG, get_table_type
+from src.core.table_types import TABLE_TYPE_CONFIG, TableType, get_table_type, get_partition_primary_key_columns
 from src.database.postgres_utils import PostgresOptimizer
 from src.database.version_info import PgVersionInfo
 from src.models.profile import ConnectionProfile
@@ -31,19 +31,34 @@ class CopyStreamBuffer:
     큐 크기를 제한해 한번에 전체 파티션을 메모리에 적재하지 않는다.
     """
 
-    def __init__(self, max_queue_size: int = 8):
+    # write()가 큐에 넣을 때 최대 대기 시간 (초). 이 시간이 지나면 교착 대신 예외 발생
+    _WRITE_TIMEOUT = 30
+
+    def __init__(self, max_queue_size: int = 8, extra_track_indices: list[int] | None = None):
+        """
+        Args:
+            max_queue_size: 큐 최대 크기
+            extra_track_indices: CSV에서 추가로 추적할 컬럼 인덱스 목록
+                (예: save_type이 columns[2]이면 [2] 전달)
+        """
         self.queue: Queue[Union[str, bytes, None]] = Queue(maxsize=max_queue_size)
         self.last_key: str | None = None
         self.last_date: str | None = None
+        self.last_extra: dict[int, str] = {}  # {csv_index: last_value}
+        self._extra_track_indices = extra_track_indices or []
         self.row_count: int = 0
         self.total_bytes: int = 0
         self._partial_line: str = ""
         self._closed = False
+        self._cancel = threading.Event()
         self.error: Exception | None = None
 
     def write(self, data: Union[str, bytes]):
-        """COPY OUT이 호출하는 write; 청크를 큐에 적재"""
-        if self._closed:
+        """COPY OUT이 호출하는 write; 청크를 큐에 적재
+
+        교착 방지: 큐가 가득 찬 상태에서 _WRITE_TIMEOUT 초 대기 후 예외 발생
+        """
+        if self._closed or self._cancel.is_set():
             return
 
         # psycopg2는 bytes를 줄 수 있으므로 문자열로 변환
@@ -54,7 +69,11 @@ class CopyStreamBuffer:
 
         self._track_last_row(data_str)
         self.total_bytes += len(data_str.encode("utf-8"))
-        self.queue.put(data)
+        try:
+            self.queue.put(data, timeout=self._WRITE_TIMEOUT)
+        except Exception:
+            if not self._cancel.is_set():
+                self.set_error(TimeoutError("CopyStreamBuffer.write() 큐 대기 시간 초과"))
 
     def read(self, size: int = -1) -> str:
         """COPY IN이 호출하는 read; 큐에서 꺼내 전달"""
@@ -68,11 +87,15 @@ class CopyStreamBuffer:
         bytes_read = 0
 
         while size < 0 or bytes_read < size:
+            if self._cancel.is_set():
+                break
             try:
                 chunk = self.queue.get(timeout=1)
             except Empty:
-                if self._closed:
+                if self._closed or self._cancel.is_set():
                     break
+                if self.error:
+                    raise self.error
                 continue
 
             if chunk is None:
@@ -99,14 +122,22 @@ class CopyStreamBuffer:
             self._finalize_partial_line()
 
         self._closed = True
+        # 큐가 가득 차 있어도 안전하게 종료 신호 전달
         try:
             self.queue.put_nowait(None)
         except Exception:
-            pass
+            # 큐가 가득 차면 cancel 이벤트로 소비자 깨움
+            self._cancel.set()
+
+    def cancel(self):
+        """양쪽 스레드를 강제 해제하기 위한 취소"""
+        self._cancel.set()
+        self._closed = True
 
     def set_error(self, exc: Exception):
         """프로듀서에서 발생한 오류를 기록"""
         self.error = exc
+        self._cancel.set()
         self.close()
 
     def _track_last_row(self, data: str):
@@ -124,8 +155,12 @@ class CopyStreamBuffer:
             try:
                 self.last_key = parts[0]
                 self.last_date = parts[1]
-            except (IndexError):
+            except IndexError:
                 continue
+            # 추가 PK 컬럼 추적
+            for idx in self._extra_track_indices:
+                if idx < len(parts):
+                    self.last_extra[idx] = parts[idx]
 
     def _finalize_partial_line(self):
         """마지막 미완성 행 정리 (COPY OUT이 개행 없이 끝난 경우)"""
@@ -140,8 +175,11 @@ class CopyStreamBuffer:
         try:
             self.last_key = parts[0]
             self.last_date = parts[1]
-        except (IndexError):
+        except IndexError:
             pass
+        for idx in self._extra_track_indices:
+            if idx < len(parts):
+                self.last_extra[idx] = parts[idx]
 
 
 class CopyMigrationWorker(BaseMigrationWorker):
@@ -452,7 +490,7 @@ class CopyMigrationWorker(BaseMigrationWorker):
         return f"'{safe}'"
 
     def _get_target_last_key(self, partition_name: str, key_column: str, date_column: str):
-        """대상 테이블에서 마지막 키(재개 SSOT) 조회
+        """대상 테이블에서 마지막 키(재개 SSOT) 조회 (2-컬럼 PK용)
 
         Returns:
             (last_key, last_date) 또는 None
@@ -478,6 +516,33 @@ class CopyMigrationWorker(BaseMigrationWorker):
             return None
         return row[0], row[1]
 
+    def _get_target_last_key_multi(self, partition_name: str, pk_columns: list[str]):
+        """대상 테이블에서 마지막 PK(재개 SSOT) 조회 (N-컬럼 PK용)
+
+        Returns:
+            {col_name: value} dict 또는 None
+        """
+        if not self.target_conn or not pk_columns:
+            return None
+
+        with self.target_conn.cursor() as cur:
+            cols = sql.SQL(", ").join(sql.Identifier(c) for c in pk_columns)
+            order = sql.SQL(", ").join(
+                sql.SQL("{} DESC").format(sql.Identifier(c)) for c in pk_columns
+            )
+            q = sql.SQL(
+                "SELECT {cols} FROM {t} ORDER BY {order} LIMIT 1"
+            ).format(cols=cols, t=sql.Identifier(partition_name), order=order)
+            try:
+                cur.execute(q)
+                row = cur.fetchone()
+            except Exception:
+                return None
+
+        if not row:
+            return None
+        return dict(zip(pk_columns, row))
+
 
     def _migrate_partition_with_copy(self, partition_name: str, checkpoint: Any):
         """COPY 명령을 사용한 파티션 마이그레이션 (청크 단위 처리)
@@ -496,6 +561,11 @@ class CopyMigrationWorker(BaseMigrationWorker):
         key_column = table_config.columns[0]
         date_column = table_config.date_column
         is_timestamp_date = table_config.date_is_timestamp
+        # PK 컬럼이 3개 이상인 경우(예: RUNNING_TIME_HISTORY) 추가 키 추적
+        pk_columns = get_partition_primary_key_columns(table_type)
+        extra_pk_columns = [c for c in pk_columns if c not in (key_column, date_column)]
+        # 추가 PK 컬럼별 마지막 값 추적 딕셔너리
+        last_extra_pk: dict = {}  # {col_name: value}
         try:
             # 테이블 크기 추정
             table_info = PostgresOptimizer.estimate_table_size(
@@ -563,7 +633,19 @@ class CopyMigrationWorker(BaseMigrationWorker):
                 self.performance_metrics.current_partition_rows = accumulated_rows
             # --- resume SSOT: 대상 테이블 마지막 키 조회 ---
             if resume_expected:
-                anchor = self._get_target_last_key(partition_name, key_column, date_column)
+                if extra_pk_columns:
+                    # 멀티 PK (예: RUNNING_TIME_HISTORY의 save_type 포함)
+                    anchor_dict = self._get_target_last_key_multi(partition_name, pk_columns)
+                    if anchor_dict:
+                        anchor_key = anchor_dict.get(key_column)
+                        anchor_date = anchor_dict.get(date_column)
+                        for ec in extra_pk_columns:
+                            last_extra_pk[ec] = anchor_dict.get(ec)
+                    else:
+                        anchor_key = anchor_date = None
+                    anchor = (anchor_key, anchor_date) if anchor_key is not None else None
+                else:
+                    anchor = self._get_target_last_key(partition_name, key_column, date_column)
                 if anchor:
                     anchor_key, anchor_date = anchor
                     try:
@@ -597,32 +679,82 @@ class CopyMigrationWorker(BaseMigrationWorker):
                     last_issued_date = None
                     last_issued_date_text = None
                     self._log("재개 모드: 대상 테이블에 기존 데이터 없음 → 처음부터 진행", "INFO")
+            # COPY FROM 쿼리는 루프 밖에서 한 번만 빌드 (식별자 안전 처리)
+            cols_idents = sql.SQL(", ").join(
+                sql.Identifier(c) for c in table_config.columns
+            )
+            tbl_ident = sql.Identifier(partition_name)
+            copy_from_query = sql.SQL(
+                "COPY {tbl} ({cols}) FROM STDIN WITH (FORMAT CSV, HEADER FALSE, NULL 'NULL')"
+            ).format(tbl=tbl_ident, cols=cols_idents).as_string(self.target_conn)
+
+            key_ident = sql.Identifier(key_column)
+            date_ident = sql.Identifier(date_column)
+
+            # ORDER BY에 PK 전체 컬럼 포함 (예: RUNNING_TIME_HISTORY → path_id, issued_date, save_type)
+            order_idents = sql.SQL(", ").join(
+                sql.Identifier(c) for c in pk_columns
+            ) if pk_columns else sql.SQL("{k}, {d}").format(k=key_ident, d=date_ident)
+
             # 청크 단위 처리 루프
             while self.is_running:
                 self._check_pause()
-                where_clause = ""
+                # COPY TO 쿼리 빌드 (식별자 안전 처리)
                 if last_path_id is not None and (last_issued_date_text is not None or last_issued_date is not None):
                     key_literal = self._format_literal(last_path_id, is_timestamp=False)
                     date_val = last_issued_date_text if is_timestamp_date else last_issued_date
                     date_literal = self._format_literal(date_val, is_timestamp_date)
-                    where_clause = (
-                        f"WHERE {key_column} > {key_literal} OR "
-                        f"({key_column} = {key_literal} AND {date_column} > {date_literal})"
-                    )
-                copy_to_query = f"""
-                    COPY (
-                        SELECT {columns_csv}
-                        FROM {partition_name}
-                        {where_clause}
-                        ORDER BY {key_column}, {date_column}
-                        LIMIT {self.batch_size}
-                    ) TO STDOUT WITH (FORMAT CSV, HEADER FALSE, NULL 'NULL')
-                """
-                copy_from_query = f"""
-                    COPY {partition_name} ({columns_csv})
-                    FROM STDIN WITH (FORMAT CSV, HEADER FALSE, NULL 'NULL')
-                """
-                stream_buffer = CopyStreamBuffer()
+
+                    if extra_pk_columns and last_extra_pk:
+                        # 멀티 PK WHERE: (k, d, extra...) > (kv, dv, ev...)
+                        # ROW 비교를 사용하여 정확한 resume 지점 결정
+                        all_pk_idents = sql.SQL(", ").join(
+                            sql.Identifier(c) for c in pk_columns
+                        )
+                        all_pk_vals = []
+                        for c in pk_columns:
+                            if c == key_column:
+                                all_pk_vals.append(sql.SQL(key_literal))
+                            elif c == date_column:
+                                all_pk_vals.append(sql.SQL(date_literal))
+                            else:
+                                val = last_extra_pk.get(c)
+                                all_pk_vals.append(
+                                    sql.SQL(self._format_literal(val, is_timestamp=False))
+                                )
+                        all_pk_val_csv = sql.SQL(", ").join(all_pk_vals)
+                        where_fragment = sql.SQL(
+                            "WHERE ({cols}) > ({vals})"
+                        ).format(cols=all_pk_idents, vals=all_pk_val_csv)
+                    else:
+                        where_fragment = sql.SQL(
+                            "WHERE {k} > {kv} OR ({k} = {kv} AND {d} > {dv})"
+                        ).format(
+                            k=key_ident,
+                            kv=sql.SQL(key_literal),
+                            d=date_ident,
+                            dv=sql.SQL(date_literal),
+                        )
+                else:
+                    where_fragment = sql.SQL("")
+
+                copy_to_query = sql.SQL(
+                    "COPY (SELECT {cols} FROM {tbl} {where} ORDER BY {order} LIMIT {lim}) "
+                    "TO STDOUT WITH (FORMAT CSV, HEADER FALSE, NULL 'NULL')"
+                ).format(
+                    cols=cols_idents,
+                    tbl=tbl_ident,
+                    where=where_fragment,
+                    order=order_idents,
+                    lim=sql.SQL(str(int(self.batch_size))),
+                ).as_string(self.source_conn)
+
+                # extra PK 컬럼의 CSV 인덱스 계산
+                extra_indices = []
+                for ec in extra_pk_columns:
+                    if ec in table_config.columns:
+                        extra_indices.append(table_config.columns.index(ec))
+                stream_buffer = CopyStreamBuffer(extra_track_indices=extra_indices)
                 def copy_out():
                     try:
                         with self.source_conn.cursor() as source_cursor:
@@ -639,7 +771,11 @@ class CopyMigrationWorker(BaseMigrationWorker):
                     except Exception as exc:
                         stream_buffer.set_error(exc)
                         raise
-                producer_thread.join()
+                producer_thread.join(timeout=120)
+                if producer_thread.is_alive():
+                    stream_buffer.cancel()
+                    producer_thread.join(timeout=10)
+                    raise Exception(f"{partition_name} COPY producer 스레드가 시간 내 종료되지 않음")
                 if stream_buffer.error:
                     raise stream_buffer.error
                 self.target_conn.commit()
@@ -661,6 +797,13 @@ class CopyMigrationWorker(BaseMigrationWorker):
                         except Exception:
                             last_issued_date = stream_buffer.last_date
                         last_issued_date_text = None
+                # 추가 PK 컬럼 값 갱신 (매 배치 후 반드시 업데이트)
+                if extra_pk_columns and stream_buffer.last_extra:
+                    for ec in extra_pk_columns:
+                        if ec in table_config.columns:
+                            idx = table_config.columns.index(ec)
+                            if idx in stream_buffer.last_extra:
+                                last_extra_pk[ec] = stream_buffer.last_extra[idx]
                 accumulated_rows += copied_rows
                 self.performance_metrics.update(copied_rows, stream_buffer.total_bytes)
                 self.checkpoint_manager.update_checkpoint_status(
@@ -687,6 +830,12 @@ class CopyMigrationWorker(BaseMigrationWorker):
             )
             self._log(f"{partition_name} COPY 완료: 총 {accumulated_rows:,}개 행", "SUCCESS")
         except Exception as e:
+            # 트랜잭션 롤백 (skip_on_error 시 다음 파티션이 정상 동작하도록)
+            try:
+                if self.target_conn and not self.target_conn.closed:
+                    self.target_conn.rollback()
+            except Exception:
+                pass
             if checkpoint is None:
                 checkpoint = self.checkpoint_manager.create_checkpoint(self.history_id, partition_name)
             self.checkpoint_manager.update_checkpoint_status(
@@ -901,8 +1050,9 @@ class CopyMigrationWorker(BaseMigrationWorker):
 
         creator = TableCreator(self.source_conn, self.target_conn)
 
-        if resume_expected and checkpoint is not None and (checkpoint.rows_processed or 0) > 0:
-            # 재개 모드: 부분 데이터가 이미 들어있을 수 있으므로 keep
+        if resume_expected:
+            # 재개 모드: 대상에 이미 부분 데이터가 있을 수 있으므로 항상 keep
+            # (checkpoint가 0이어도 commit 후 checkpoint 갱신 전 crash 가능)
             truncate_mode = "keep"
             cb = None
         elif self.copy_mode == "server":

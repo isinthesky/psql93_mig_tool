@@ -451,7 +451,9 @@ class TableCreator:
             # 테이블이 이미 존재해도 partition_table_info 동기화
             self._sync_partition_info(partition_name)
 
-            # 기존 데이터 확인
+            # 기존 데이터 확인 (식별자는 _validate_identifier로 검증 → 안전한 문자열 보간)
+            # NOTE: psycopg2/psycopg3 혼용을 피하기 위해 psql.SQL 대신 검증된 문자열 사용
+            _validate_identifier(partition_name)
             cursor.execute(f"SELECT COUNT(*) FROM {partition_name}")
             row_count = cursor.fetchone()[0]
 
@@ -472,7 +474,8 @@ class TableCreator:
 
                 if should_truncate:
                     cursor.execute(f"TRUNCATE TABLE {partition_name} RESTART IDENTITY")
-                    self.target_conn.commit()
+                    # TRUNCATE는 커밋하지 않음 — 호출자의 COPY/INSERT와 같은
+                    # 트랜잭션에서 처리되어야 migration 실패 시 롤백 가능
                 else:
                     # keep 모드는 예외 없이 진행
                     if truncate_mode != "keep":

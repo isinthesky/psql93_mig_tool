@@ -127,10 +127,18 @@ class MigrationWorker(BaseMigrationWorker):
                 return
 
             # 대상 테이블 준비
-            self._prepare_target_table(target_conn, partition_name)
+            _was_truncated = self._prepare_target_table(target_conn, partition_name)
 
             # 배치 단위로 데이터 복사
-            offset = checkpoint.rows_processed if checkpoint else 0
+            # TRUNCATE가 수행된 경우 offset을 0으로 리셋 (데이터 유실 방지)
+            if _was_truncated:
+                offset = 0
+                if checkpoint:
+                    self.checkpoint_manager.update_checkpoint_status(
+                        checkpoint.id, "pending", rows_processed=0
+                    )
+            else:
+                offset = checkpoint.rows_processed if checkpoint else 0
             current_batch_size = self.batch_size
 
             while offset < total_rows:
@@ -202,8 +210,13 @@ class MigrationWorker(BaseMigrationWorker):
                 )
             raise
 
-    def _prepare_target_table(self, conn: psycopg.Connection, partition_name: str):
-        """대상 테이블 준비"""
+    def _prepare_target_table(self, conn: psycopg.Connection, partition_name: str) -> bool:
+        """대상 테이블 준비
+
+        Returns:
+            True면 TRUNCATE가 수행됨 (offset 리셋 필요)
+        """
+        was_truncated = False
 
         def confirm_truncate(partition_name: str, row_count: int) -> bool:
             """사용자에게 TRUNCATE 확인 요청"""
@@ -231,12 +244,16 @@ class MigrationWorker(BaseMigrationWorker):
             # 결과에 따른 로그 출력
             if created:
                 self._log(f"{partition_name} 테이블 생성 완료", "SUCCESS")
+                was_truncated = True  # 새 테이블 = 처음부터 시작
             elif row_count > 0:
                 self._log(f"{partition_name} 테이블 데이터 삭제 완료", "SUCCESS")
+                was_truncated = True
 
         finally:
             # 권한 초기화
             self.truncate_permission = None
+
+        return was_truncated
 
     def _copy_batch(
         self,
