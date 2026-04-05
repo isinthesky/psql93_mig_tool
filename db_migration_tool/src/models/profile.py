@@ -43,10 +43,21 @@ class ConnectionProfile:
 
     @classmethod
     def from_db_model(cls, db_profile: Profile, cipher_suite: Fernet) -> "ConnectionProfile":
-        """DB 모델에서 생성"""
-        # 암호화된 설정 복호화
-        source_config = json.loads(cipher_suite.decrypt(db_profile.source_config.encode()).decode())
-        target_config = json.loads(cipher_suite.decrypt(db_profile.target_config.encode()).decode())
+        """DB 모델에서 생성
+
+        현재 키로 복호화 실패 시 레거시 키로 재시도합니다.
+        """
+        source_encrypted = db_profile.source_config.encode()
+        target_encrypted = db_profile.target_config.encode()
+
+        try:
+            source_config = json.loads(cipher_suite.decrypt(source_encrypted).decode())
+            target_config = json.loads(cipher_suite.decrypt(target_encrypted).decode())
+        except Exception:
+            # 현재 키 실패 → 레거시 키로 재시도
+            legacy = Fernet(ProfileManager._LEGACY_KEY)
+            source_config = json.loads(legacy.decrypt(source_encrypted).decode())
+            target_config = json.loads(legacy.decrypt(target_encrypted).decode())
 
         return cls(
             id=db_profile.id,
@@ -65,11 +76,45 @@ class ProfileManager:
         self.db = get_db()
         self._cipher_suite = self._get_or_create_cipher()
 
+    # 레거시 호환을 위한 이전 하드코딩 키 (기존 프로필 복호화용)
+    _LEGACY_KEY = b"ZmDfcTF7_60GrrY167zsiPd67pEvs0aGOv2oasOM1Pg="
+
     def _get_or_create_cipher(self) -> Fernet:
-        """암호화 키 가져오기 또는 생성"""
-        # 실제 구현에서는 안전한 키 저장소 사용 권장
-        # 여기서는 간단히 고정 키 사용
-        key = b"ZmDfcTF7_60GrrY167zsiPd67pEvs0aGOv2oasOM1Pg="
+        """암호화 키 가져오기 또는 생성
+
+        앱 데이터 디렉토리에 키 파일을 저장하여 소스코드에
+        하드코딩하지 않습니다.
+        - 키 파일이 이미 있으면 해당 키 사용
+        - 키 파일이 없고 기존 프로필이 있으면(업그레이드) 레거시 키로 초기화
+        - 키 파일이 없고 기존 프로필도 없으면(신규) 새 키 생성
+        """
+        from src.utils.app_paths import AppPaths
+
+        key_file = AppPaths.get_app_data_dir() / ".encryption_key"
+        if key_file.exists():
+            key = key_file.read_bytes().strip()
+        else:
+            # 기존 프로필 존재 여부 확인 (레거시 키 호환 필요 판단)
+            has_existing_profiles = False
+            try:
+                with self.db.session_scope() as session:
+                    has_existing_profiles = session.query(Profile).first() is not None
+            except Exception:
+                pass
+
+            if has_existing_profiles:
+                # 업그레이드: 레거시 키 유지 (기존 프로필 복호화 가능)
+                key = self._LEGACY_KEY
+            else:
+                # 신규 설치: 새 키 생성
+                key = Fernet.generate_key()
+
+            key_file.write_bytes(key)
+            try:
+                import os
+                os.chmod(key_file, 0o600)
+            except (OSError, AttributeError):
+                pass
         return Fernet(key)
 
     def _encrypt_config(self, config: dict[str, Any]) -> str:
