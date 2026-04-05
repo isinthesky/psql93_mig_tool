@@ -77,6 +77,12 @@ class ManifestTableCreator(TableCreator):
             "to_date": to_ts,
         }
 
+    def _sync_partition_info(self, partition_name: str):
+        """소스 DB 대신 manifest에서 파티션 정보를 가져와 대상 DB에 동기화."""
+        parent_table = "_".join(partition_name.split("_")[:-1])
+        partition_info = self._get_partition_info(partition_name, parent_table)
+        self._add_partition_info(partition_name, partition_info)
+
     def _create_parent_table(self, parent_table: str, table_type: TableType = None):
         metadata = self.manifest_store.get_parent_table_metadata(parent_table)
         resolved_type = self._resolve_table_type(parent_table, metadata.get("table_type"))
