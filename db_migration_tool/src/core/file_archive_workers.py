@@ -270,7 +270,7 @@ class PostgresToFileArchiveWorker(ArchiveMigrationWorkerBase):
         order_columns = get_partition_primary_key_columns(table_type) or table_config.columns
         order_sql = sql.SQL(", ").join(sql.Identifier(col) for col in order_columns)
         copy_query = sql.SQL(
-            "COPY (SELECT {cols} FROM {tbl} ORDER BY {order}) TO STDOUT WITH (FORMAT CSV, HEADER FALSE, NULL NULL)"
+            "COPY (SELECT {cols} FROM {tbl} ORDER BY {order}) TO STDOUT WITH (FORMAT CSV, HEADER FALSE)"
         ).format(
             cols=cols_sql,
             tbl=sql.Identifier(partition_name),
@@ -397,7 +397,7 @@ class FileToPostgresArchiveWorker(ArchiveMigrationWorkerBase):
         table_config = TABLE_TYPE_CONFIG[table_type]
         cols_sql = sql.SQL(", ").join(sql.Identifier(col) for col in table_config.columns)
         copy_query = sql.SQL(
-            "COPY {tbl} ({cols}) FROM STDIN WITH (FORMAT CSV, HEADER FALSE, NULL NULL)"
+            "COPY {tbl} ({cols}) FROM STDIN WITH (FORMAT CSV, HEADER FALSE)"
         ).format(
             tbl=sql.Identifier(partition_name),
             cols=cols_sql,
