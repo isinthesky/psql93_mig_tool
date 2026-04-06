@@ -189,18 +189,15 @@ class ArchiveManifestStore:
         return manifest
 
     def _acquire_lock(self):
-        """manifest 쓰기 직렬화를 위한 파일 락 획득."""
+        """manifest 쓰기 직렬화를 위한 파일 락 획득. 실패 시 예외 발생."""
         self.ensure_archive()
         lock_fd = open(self._lock_path, "w")
-        try:
-            if hasattr(os, "name") and os.name == "nt":
-                import msvcrt
-                msvcrt.locking(lock_fd.fileno(), msvcrt.LK_LOCK, 1)
-            else:
-                import fcntl
-                fcntl.flock(lock_fd, fcntl.LOCK_EX)
-        except Exception:
-            pass
+        if hasattr(os, "name") and os.name == "nt":
+            import msvcrt
+            msvcrt.locking(lock_fd.fileno(), msvcrt.LK_LOCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
         return lock_fd
 
     @staticmethod
@@ -213,6 +210,29 @@ class ArchiveManifestStore:
     def save(self, manifest: ArchiveManifest, *, create_backup: bool = True) -> None:
         lock_fd = self._acquire_lock()
         try:
+            # lock 하에서 디스크의 최신 manifest를 reload하여 병합 (lost-update 방지)
+            if self.manifest_path.exists():
+                try:
+                    disk_data = json.loads(self.manifest_path.read_text(encoding="utf-8"))
+                    disk_manifest = ArchiveManifest.from_dict(disk_data)
+
+                    # parent_tables 병합 (in-memory 우선)
+                    merged_parents = dict(disk_manifest.parent_tables)
+                    merged_parents.update(manifest.parent_tables)
+                    manifest.parent_tables = merged_parents
+
+                    # partitions 병합 (partition_name 기준, in-memory 우선)
+                    disk_by_name = {
+                        p.get("partition_name"): p for p in disk_manifest.partitions
+                    }
+                    mem_by_name = {
+                        p.get("partition_name"): p for p in manifest.partitions
+                    }
+                    disk_by_name.update(mem_by_name)
+                    manifest.partitions = list(disk_by_name.values())
+                except Exception:
+                    pass
+
             manifest.updated_at = datetime.now().isoformat()
             payload = json.dumps(manifest.to_dict(), ensure_ascii=False, indent=2)
 
