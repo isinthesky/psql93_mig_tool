@@ -954,18 +954,11 @@ class FileToPostgresArchiveWorker(ArchiveMigrationWorkerBase):
             raise
 
     def _prepare_target_table(self, partition_name: str, checkpoint: Any, creator: ManifestTableCreator):
-        def confirm_truncate(table: str, row_count: int) -> bool:
-            self.truncate_permission = None
-            self.truncate_requested.emit(table, row_count)
-            while self.is_running and self.truncate_permission is None:
-                time.sleep(0.1)
-            return bool(self.truncate_permission)
-
-        truncate_mode = "auto" if self.should_resume else "ask"
+        # 파일 아카이브 import는 파티션 전체 적재이므로
+        # 기존 데이터가 있으면 자동 TRUNCATE (매번 확인 팝업 불필요)
         creator.ensure_partition_ready(
             partition_name,
-            truncate_mode=truncate_mode,
-            confirm_callback=None if truncate_mode == "auto" else confirm_truncate,
+            truncate_mode="auto",
         )
 
     def stop(self, reason: str = "user_stop"):

@@ -744,7 +744,6 @@ class FileArchiveMigrationDialog(QDialog):
                 self.history_id,
                 resume=self.resume_mode,
             )
-            self.worker.truncate_requested.connect(self.on_truncate_requested)
 
         self._worker_had_error = False
         self.worker.skip_on_error = self.error_strategy == "skip"
