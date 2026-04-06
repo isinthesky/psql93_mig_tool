@@ -703,6 +703,14 @@ class FileArchiveMigrationDialog(QDialog):
         if self.worker and self.worker.isRunning():
             return
 
+        # 이전 실행이 중단된 상태에서 다시 시작 → resume 모드로 전환
+        if self.history_id and not self.resume_mode:
+            pending = self.checkpoint_manager.get_pending_checkpoints(self.history_id)
+            if pending:
+                self.resume_mode = True
+                self._frozen_selection = [cp.partition_name for cp in pending]
+                self.add_log(f"중단된 작업 재개: 미완료 파티션 {len(pending)}개", "INFO")
+
         partitions = self._frozen_selection or self.get_selected_partition_names()
         if not partitions:
             QMessageBox.warning(self, "파티션 없음", "실행할 파티션이 없습니다.")
@@ -822,6 +830,7 @@ class FileArchiveMigrationDialog(QDialog):
         if self.worker:
             self.worker.is_running = False
 
+        self.start_btn.setEnabled(True)
         self.pause_btn.setEnabled(False)
         self.close_btn.setEnabled(True)
 
@@ -886,6 +895,7 @@ class FileArchiveMigrationDialog(QDialog):
         self._worker_had_error = True
         if self.worker:
             self.worker.is_running = False
+        self.start_btn.setEnabled(True)
         self.pause_btn.setEnabled(False)
         self.close_btn.setEnabled(True)
         if self.history_id:
