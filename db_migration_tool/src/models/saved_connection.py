@@ -8,6 +8,7 @@ from typing import Any
 from cryptography.fernet import Fernet
 
 from src.database.local_db import SavedConnection, get_db
+from src.utils.master_password import MasterPasswordService
 
 
 class SavedConnectionManager:
@@ -19,21 +20,15 @@ class SavedConnectionManager:
 
     @staticmethod
     def _get_cipher() -> Fernet:
-        from src.utils.app_paths import AppPaths
+        auth_service = MasterPasswordService()
+        if auth_service.is_configured() and MasterPasswordService.is_authenticated():
+            return MasterPasswordService.get_active_cipher_suite()
 
-        key_file = AppPaths.get_app_data_dir() / ".encryption_key"
-        if key_file.exists():
-            return Fernet(key_file.read_bytes().strip())
-        # 키 파일이 없으면 새로 생성 (하드코딩 키 사용 금지)
-        key = Fernet.generate_key()
-        key_file.parent.mkdir(parents=True, exist_ok=True)
-        key_file.write_bytes(key)
-        try:
-            import os
-            os.chmod(key_file, 0o600)
-        except (OSError, AttributeError):
-            pass
-        return Fernet(key)
+        legacy_ciphers = MasterPasswordService.get_legacy_cipher_suites()
+        if legacy_ciphers:
+            return legacy_ciphers[0]
+
+        return Fernet.generate_key()
 
     def _encrypt(self, text: str) -> str:
         return self._cipher.encrypt(text.encode()).decode()
@@ -107,6 +102,31 @@ class SavedConnectionManager:
                 session.delete(row)
                 return True
             return False
+
+    def reencrypt_all_saved_connections(self, target_cipher: Fernet) -> int:
+        """저장된 연결 프리셋을 현재 활성 암호화 키로 재암호화합니다."""
+        migrated_count = 0
+
+        with self.db.session_scope() as session:
+            rows = session.query(SavedConnection).all()
+
+            for row in rows:
+                decrypted_password = None
+
+                for source_cipher in MasterPasswordService.get_legacy_cipher_suites():
+                    try:
+                        decrypted_password = source_cipher.decrypt(row.password.encode()).decode()
+                        break
+                    except Exception:
+                        continue
+
+                if decrypted_password is None:
+                    continue
+
+                row.password = target_cipher.encrypt(decrypted_password.encode()).decode()
+                migrated_count += 1
+
+        return migrated_count
 
     def _to_dict(self, row: SavedConnection) -> dict[str, Any]:
         return {

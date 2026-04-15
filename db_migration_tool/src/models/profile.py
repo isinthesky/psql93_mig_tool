@@ -6,18 +6,19 @@ from __future__ import annotations
 
 import json
 from datetime import datetime
-from typing import Any, Optional
+from typing import Any
 
 from cryptography.fernet import Fernet
 
 from src.database.local_db import Profile, get_db
+from src.utils.master_password import MasterPasswordService
 
 ENDPOINT_KIND_POSTGRES = "postgres"
 ENDPOINT_KIND_FILE = "file"
 SUPPORTED_ENDPOINT_KINDS = {ENDPOINT_KIND_POSTGRES, ENDPOINT_KIND_FILE}
 
 
-def normalize_endpoint_config(config: Optional[dict[str, Any]]) -> dict[str, Any]:
+def normalize_endpoint_config(config: dict[str, Any] | None) -> dict[str, Any]:
     """엔드포인트 설정을 정규화합니다.
 
     레거시 프로필은 kind 필드가 없으므로 PostgreSQL로 간주합니다.
@@ -62,12 +63,12 @@ class ConnectionProfile:
 
     def __init__(
         self,
-        id: Optional[int] = None,
+        id: int | None = None,
         name: str = "",
-        source_config: Optional[dict[str, Any]] = None,
-        target_config: Optional[dict[str, Any]] = None,
-        created_at: Optional[datetime] = None,
-        updated_at: Optional[datetime] = None,
+        source_config: dict[str, Any] | None = None,
+        target_config: dict[str, Any] | None = None,
+        created_at: datetime | None = None,
+        updated_at: datetime | None = None,
     ):
         self.id = id
         self.name = name
@@ -100,7 +101,7 @@ class ConnectionProfile:
         }
 
     @classmethod
-    def from_db_model(cls, db_profile: Profile, cipher_suite: Fernet) -> "ConnectionProfile":
+    def from_db_model(cls, db_profile: Profile, cipher_suite: Fernet) -> ConnectionProfile:
         """DB 모델에서 생성
 
         현재 키로 복호화 실패 시 레거시 키로 재시도합니다.
@@ -112,9 +113,19 @@ class ConnectionProfile:
             source_config = json.loads(cipher_suite.decrypt(source_encrypted).decode())
             target_config = json.loads(cipher_suite.decrypt(target_encrypted).decode())
         except Exception:
-            legacy = Fernet(ProfileManager._LEGACY_KEY)
-            source_config = json.loads(legacy.decrypt(source_encrypted).decode())
-            target_config = json.loads(legacy.decrypt(target_encrypted).decode())
+            source_config = None
+            target_config = None
+
+            for legacy in MasterPasswordService.get_legacy_cipher_suites():
+                try:
+                    source_config = json.loads(legacy.decrypt(source_encrypted).decode())
+                    target_config = json.loads(legacy.decrypt(target_encrypted).decode())
+                    break
+                except Exception:
+                    continue
+
+            if source_config is None or target_config is None:
+                raise
 
         return cls(
             id=db_profile.id,
@@ -133,36 +144,17 @@ class ProfileManager:
         self.db = get_db()
         self._cipher_suite = self._get_or_create_cipher()
 
-    _LEGACY_KEY = b"ZmDfcTF7_60GrrY167zsiPd67pEvs0aGOv2oasOM1Pg="
-
     def _get_or_create_cipher(self) -> Fernet:
-        """암호화 키 가져오기 또는 생성"""
-        from src.utils.app_paths import AppPaths
+        """현재 인증 세션의 암호화 키를 반환합니다."""
+        auth_service = MasterPasswordService()
+        if auth_service.is_configured() and MasterPasswordService.is_authenticated():
+            return MasterPasswordService.get_active_cipher_suite()
 
-        key_file = AppPaths.get_app_data_dir() / ".encryption_key"
-        if key_file.exists():
-            key = key_file.read_bytes().strip()
-        else:
-            has_existing_profiles = False
-            try:
-                with self.db.session_scope() as session:
-                    has_existing_profiles = session.query(Profile).first() is not None
-            except Exception:
-                pass
+        legacy_ciphers = MasterPasswordService.get_legacy_cipher_suites()
+        if legacy_ciphers:
+            return legacy_ciphers[0]
 
-            if has_existing_profiles:
-                key = self._LEGACY_KEY
-            else:
-                key = Fernet.generate_key()
-
-            key_file.write_bytes(key)
-            try:
-                import os
-
-                os.chmod(key_file, 0o600)
-            except (OSError, AttributeError):
-                pass
-        return Fernet(key)
+        return Fernet.generate_key()
 
     def _encrypt_config(self, config: dict[str, Any]) -> str:
         """설정 암호화"""
@@ -184,7 +176,7 @@ class ProfileManager:
 
             return ConnectionProfile.from_db_model(db_profile, self._cipher_suite)
 
-    def get_profile(self, profile_id: int) -> Optional[ConnectionProfile]:
+    def get_profile(self, profile_id: int) -> ConnectionProfile | None:
         """프로필 조회"""
         with self.db.session_scope() as session:
             db_profile = session.query(Profile).filter_by(id=profile_id).first()
@@ -219,3 +211,39 @@ class ProfileManager:
                 session.delete(db_profile)
                 return True
             return False
+
+    def reencrypt_all_profiles(self, target_cipher: Fernet) -> int:
+        """기존 프로필 전체를 현재 활성 암호화 키로 재암호화합니다."""
+        migrated_count = 0
+
+        with self.db.session_scope() as session:
+            db_profiles = session.query(Profile).all()
+
+            for db_profile in db_profiles:
+                source_config = None
+                target_config = None
+
+                for source_cipher in MasterPasswordService.get_legacy_cipher_suites():
+                    try:
+                        source_config = json.loads(
+                            source_cipher.decrypt(db_profile.source_config.encode()).decode()
+                        )
+                        target_config = json.loads(
+                            source_cipher.decrypt(db_profile.target_config.encode()).decode()
+                        )
+                        break
+                    except Exception:
+                        continue
+
+                if source_config is None or target_config is None:
+                    continue
+
+                db_profile.source_config = target_cipher.encrypt(
+                    json.dumps(normalize_endpoint_config(source_config)).encode()
+                ).decode()
+                db_profile.target_config = target_cipher.encrypt(
+                    json.dumps(normalize_endpoint_config(target_config)).encode()
+                ).decode()
+                migrated_count += 1
+
+        return migrated_count
