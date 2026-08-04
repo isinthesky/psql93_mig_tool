@@ -2,10 +2,10 @@
 트레이 아이콘 기능 테스트
 """
 
-import pytest
 from unittest.mock import MagicMock, patch
-from PySide6.QtWidgets import QApplication, QSystemTrayIcon
-from PySide6.QtGui import QIcon
+
+import pytest
+from PySide6.QtWidgets import QApplication
 
 from src.ui.tray_icon import TrayIconManager
 
@@ -177,9 +177,7 @@ class TestTrayIconManager:
         # 기본 상태
         tray_manager.set_migration_running(False)
         tooltip_calls = [
-            call[0][0]
-            for call in tray_manager.tray_icon.setToolTip.call_args_list
-            if call[0]
+            call[0][0] for call in tray_manager.tray_icon.setToolTip.call_args_list if call[0]
         ]
         assert any("DB Migration Tool" in tip for tip in tooltip_calls)
 
@@ -187,9 +185,7 @@ class TestTrayIconManager:
         tray_manager.tray_icon.reset_mock()
         tray_manager.set_migration_running(True)
         tooltip_calls = [
-            call[0][0]
-            for call in tray_manager.tray_icon.setToolTip.call_args_list
-            if call[0]
+            call[0][0] for call in tray_manager.tray_icon.setToolTip.call_args_list if call[0]
         ]
         assert any("마이그레이션 실행 중" in tip for tip in tooltip_calls)
 

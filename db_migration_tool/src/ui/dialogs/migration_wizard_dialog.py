@@ -77,7 +77,9 @@ class PartitionDiscoveryWorker(QThread):
     result = Signal(list)  # list[dict]
     error = Signal(str)
 
-    def __init__(self, source_config: dict, start_date: date, end_date: date, table_types: list[TableType]):
+    def __init__(
+        self, source_config: dict, start_date: date, end_date: date, table_types: list[TableType]
+    ):
         super().__init__()
         self.source_config = source_config
         self.start_date = start_date
@@ -162,8 +164,6 @@ class TargetCompletedCheckWorker(QThread):
             self.error.emit(str(e))
 
 
-
-
 class RowCountVerificationWorker(QThread):
     """소스/대상 row_count(COUNT(*)) 검증 워커
 
@@ -237,6 +237,8 @@ class RowCountVerificationWorker(QThread):
 
         except Exception as e:
             self.error.emit(str(e))
+
+
 class MigrationWizardDialog(QDialog):
     """COPY 중심 단계형 마이그레이션 마법사"""
 
@@ -901,7 +903,9 @@ class MigrationWizardDialog(QDialog):
         self.verify_btn.setEnabled(has_history and not running)
 
         if state == "done":
-            self.start_btn.setToolTip("완료된 작업입니다. 새로 실행하려면 창을 닫고 다시 시작하세요.")
+            self.start_btn.setToolTip(
+                "완료된 작업입니다. 새로 실행하려면 창을 닫고 다시 시작하세요."
+            )
         elif state == "stopped":
             self.start_btn.setToolTip("중단된 지점부터 미완료 파티션만 이어서 실행합니다.")
         else:
@@ -1096,7 +1100,9 @@ class MigrationWizardDialog(QDialog):
                 return
 
             history_ids = [h.id for h in completed_histories]
-            self._completed_from_history = self.checkpoint_manager.get_completed_partition_names(history_ids)
+            self._completed_from_history = self.checkpoint_manager.get_completed_partition_names(
+                history_ids
+            )
         except Exception as e:
             self._completed_from_history = set()
             self.add_log(f"완료 파티션 캐시 로드 실패: {e}", "WARNING")
@@ -1138,7 +1144,6 @@ class MigrationWizardDialog(QDialog):
             self.copy_mode = "auto"
             # auto는 fallback 시 배치 크기 의미가 있으므로 활성화
             self.batch_size_spin.setEnabled(True)
-
 
     def _set_preset_days(self, days: int, yesterday: bool = False):
         today = datetime.now().date()
@@ -1274,9 +1279,7 @@ class MigrationWizardDialog(QDialog):
                 if self._target_has_data.get(s.table_name):
                     reasons.append("대상 DB에 데이터 있음")
                 item.setForeground(muted)
-                item.setToolTip(
-                    f"{' · '.join(reasons)}\n다시 실행하려면 체크하세요."
-                )
+                item.setToolTip(f"{' · '.join(reasons)}\n다시 실행하려면 체크하세요.")
             else:
                 item.setToolTip(f"{s.table_name} · {s.row_count:,} rows")
 
@@ -1391,7 +1394,9 @@ class MigrationWizardDialog(QDialog):
         self.completed_check_worker.progress.connect(self._on_target_check_progress)
         self.completed_check_worker.result.connect(self._on_target_check_result)
         self.completed_check_worker.error.connect(self._on_target_check_error)
-        self.completed_check_worker.finished.connect(lambda: self.check_completed_btn.setEnabled(True))
+        self.completed_check_worker.finished.connect(
+            lambda: self.check_completed_btn.setEnabled(True)
+        )
         self.completed_check_worker.start()
 
     def _on_target_check_progress(self, done: int, total: int):
@@ -1416,9 +1421,7 @@ class MigrationWizardDialog(QDialog):
 
     def _selected_row_total(self, names) -> int:
         wanted = set(names)
-        return sum(
-            s.row_count for s in self.discovered_partitions if s.table_name in wanted
-        )
+        return sum(s.row_count for s in self.discovered_partitions if s.table_name in wanted)
 
     def _refresh_summary(self):
         error_text = "중단" if self.error_strategy == "stop" else "건너뛰기"
@@ -1436,9 +1439,7 @@ class MigrationWizardDialog(QDialog):
 
         start_date = self.start_date_edit.date().toPython()
         end_date = self.end_date_edit.date().toPython()
-        types_text = ", ".join(
-            TABLE_TYPE_CONFIG[t].display_name for t in self.selected_table_types
-        )
+        types_text = ", ".join(TABLE_TYPE_CONFIG[t].display_name for t in self.selected_table_types)
         parts = self._frozen_selection or self.get_selected_partition_names()
 
         lines = [
@@ -1531,7 +1532,11 @@ class MigrationWizardDialog(QDialog):
 
         self._set_run_state("running", f"파티션 {len(partitions):,}개")
 
-        mode_label = ("Server-side" if self.copy_mode == "server" else ("AUTO" if self.copy_mode == "auto" else "COPY"))
+        mode_label = (
+            "Server-side"
+            if self.copy_mode == "server"
+            else ("AUTO" if self.copy_mode == "auto" else "COPY")
+        )
         self.add_log(
             f"마이그레이션 시작({mode_label}) - 파티션 {len(partitions)}개, 배치 {self.batch_size:,}",
             "INFO",
@@ -1586,15 +1591,18 @@ class MigrationWizardDialog(QDialog):
             self.worker.stop()
             self.add_log("사용자가 마이그레이션을 취소했습니다", "WARNING")
 
-
     def run_rowcount_verification(self):
         """수동 row_count 검증 실행 (옵션3)"""
         if self.worker and getattr(self.worker, "is_running", False):
-            QMessageBox.information(self, "안내", "마이그레이션 실행 중에는 검증을 시작할 수 없습니다.")
+            QMessageBox.information(
+                self, "안내", "마이그레이션 실행 중에는 검증을 시작할 수 없습니다."
+            )
             return
 
         if not self.history_id:
-            QMessageBox.warning(self, "이력 없음", "검증할 작업 이력이 없습니다. 먼저 마이그레이션을 실행하세요.")
+            QMessageBox.warning(
+                self, "이력 없음", "검증할 작업 이력이 없습니다. 먼저 마이그레이션을 실행하세요."
+            )
             return
 
         table_names = self._frozen_selection or self.get_selected_partition_names()
@@ -1833,7 +1841,9 @@ class MigrationWizardDialog(QDialog):
         self.pages.currentChanged.connect(lambda _i: self._update_nav_state())
 
         # 파티션 체크 변경 시 카운트/네비 갱신
-        self.partition_list.itemChanged.connect(lambda _item: (self._update_counts(), self._update_nav_state()))
+        self.partition_list.itemChanged.connect(
+            lambda _item: (self._update_counts(), self._update_nav_state())
+        )
 
         self.pages.setCurrentIndex(0)
         self._guard_last_table_type()
@@ -1850,8 +1860,7 @@ class MigrationWizardDialog(QDialog):
         QMessageBox.warning(
             self,
             "진행 중",
-            "마이그레이션 진행 중에는 닫을 수 없습니다.\n"
-            "먼저 '작업 취소'로 작업을 멈추세요.",
+            "마이그레이션 진행 중에는 닫을 수 없습니다.\n먼저 '작업 취소'로 작업을 멈추세요.",
         )
         return True
 

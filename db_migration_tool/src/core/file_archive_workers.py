@@ -241,7 +241,9 @@ class ArchiveMigrationWorkerBase(BaseMigrationWorker):
 
     def _raise_if_stopped(self, partition_name: str, phase: str) -> None:
         if not self.is_running:
-            raise MigrationInterruptedError(f"{partition_name} 작업이 중단되었습니다 (phase={phase})")
+            raise MigrationInterruptedError(
+                f"{partition_name} 작업이 중단되었습니다 (phase={phase})"
+            )
 
     def _build_checkpoint_payload(
         self,
@@ -455,7 +457,9 @@ class PostgresToFileArchiveWorker(ArchiveMigrationWorkerBase):
                     self.performance_metrics.completed_partitions += 1
                     continue
                 if checkpoint is None:
-                    checkpoint = self.checkpoint_manager.create_checkpoint(self.history_id, partition_name)
+                    checkpoint = self.checkpoint_manager.create_checkpoint(
+                        self.history_id, partition_name
+                    )
                     checkpoints[partition_name] = checkpoint
 
                 try:
@@ -517,7 +521,9 @@ class PostgresToFileArchiveWorker(ArchiveMigrationWorkerBase):
             self.performance_metrics.start_partition(partition_name, total_rows)
 
             parent_columns = self._query_parent_columns(self.source_conn, parent_table)
-            partition_meta = self._query_partition_meta(self.source_conn, partition_name, table_type)
+            partition_meta = self._query_partition_meta(
+                self.source_conn, partition_name, table_type
+            )
             self.archive_store.upsert_parent_table(
                 manifest,
                 parent_table=parent_table,
@@ -529,13 +535,17 @@ class PostgresToFileArchiveWorker(ArchiveMigrationWorkerBase):
             cols_sql = sql.SQL(", ").join(sql.Identifier(col) for col in table_config.columns)
             order_columns = get_partition_primary_key_columns(table_type) or table_config.columns
             order_sql = sql.SQL(", ").join(sql.Identifier(col) for col in order_columns)
-            copy_query = sql.SQL(
-                "COPY (SELECT {cols} FROM {tbl} ORDER BY {order}) TO STDOUT WITH (FORMAT CSV, HEADER FALSE)"
-            ).format(
-                cols=cols_sql,
-                tbl=sql.Identifier(partition_name),
-                order=order_sql,
-            ).as_string(self.source_conn)
+            copy_query = (
+                sql.SQL(
+                    "COPY (SELECT {cols} FROM {tbl} ORDER BY {order}) TO STDOUT WITH (FORMAT CSV, HEADER FALSE)"
+                )
+                .format(
+                    cols=cols_sql,
+                    tbl=sql.Identifier(partition_name),
+                    order=order_sql,
+                )
+                .as_string(self.source_conn)
+            )
 
             current_phase = "export"
             self._raise_if_stopped(partition_name, current_phase)
@@ -735,7 +745,9 @@ class FileToPostgresArchiveWorker(ArchiveMigrationWorkerBase):
                     self.performance_metrics.completed_partitions += 1
                     continue
                 if checkpoint is None:
-                    checkpoint = self.checkpoint_manager.create_checkpoint(self.history_id, partition_name)
+                    checkpoint = self.checkpoint_manager.create_checkpoint(
+                        self.history_id, partition_name
+                    )
                     checkpoints[partition_name] = checkpoint
 
                 try:
@@ -763,7 +775,9 @@ class FileToPostgresArchiveWorker(ArchiveMigrationWorkerBase):
                 except Exception:
                     pass
 
-    def _import_partition(self, partition_name: str, checkpoint: Any, creator: ManifestTableCreator, manifest):
+    def _import_partition(
+        self, partition_name: str, checkpoint: Any, creator: ManifestTableCreator, manifest
+    ):
         copy_method = "FILE_ARCHIVE_IMPORT"
         current_phase = "verify_archive"
         entry = next(
@@ -828,10 +842,14 @@ class FileToPostgresArchiveWorker(ArchiveMigrationWorkerBase):
             self._prepare_target_table(partition_name, checkpoint, creator)
 
             cols_sql = sql.SQL(", ").join(sql.Identifier(col) for col in expected_columns)
-            copy_query = sql.SQL("COPY {tbl} ({cols}) FROM STDIN WITH (FORMAT CSV, HEADER FALSE)").format(
-                tbl=sql.Identifier(partition_name),
-                cols=cols_sql,
-            ).as_string(self.target_conn)
+            copy_query = (
+                sql.SQL("COPY {tbl} ({cols}) FROM STDIN WITH (FORMAT CSV, HEADER FALSE)")
+                .format(
+                    tbl=sql.Identifier(partition_name),
+                    cols=cols_sql,
+                )
+                .as_string(self.target_conn)
+            )
 
             current_phase = "copy"
             self._raise_if_stopped(partition_name, current_phase)
@@ -890,7 +908,9 @@ class FileToPostgresArchiveWorker(ArchiveMigrationWorkerBase):
                 copy_method=copy_method,
             )
             self._emit_performance_metrics(force=True)
-            self._log(f"{partition_name} 아카이브 가져오기 완료 ({expected_rows:,} rows)", "SUCCESS")
+            self._log(
+                f"{partition_name} 아카이브 가져오기 완료 ({expected_rows:,} rows)", "SUCCESS"
+            )
         except Exception as exc:
             try:
                 if self.target_conn is not None:
@@ -953,7 +973,9 @@ class FileToPostgresArchiveWorker(ArchiveMigrationWorkerBase):
                 )
             raise
 
-    def _prepare_target_table(self, partition_name: str, checkpoint: Any, creator: ManifestTableCreator):
+    def _prepare_target_table(
+        self, partition_name: str, checkpoint: Any, creator: ManifestTableCreator
+    ):
         # 파일 아카이브 import는 파티션 전체 적재이므로
         # 기존 데이터가 있으면 자동 TRUNCATE (매번 확인 팝업 불필요)
         creator.ensure_partition_ready(

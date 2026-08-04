@@ -10,7 +10,6 @@ import time
 from datetime import datetime
 from queue import Queue
 from threading import Thread
-from typing import Optional
 
 
 class SensitiveDataMasker:
@@ -87,7 +86,7 @@ class DatabaseLoggerMixin:
         self._session_local = threading.local()
         self.db_queue = Queue()
         self.is_running = True
-        self.db_thread: Optional[Thread] = None
+        self.db_thread: Thread | None = None
 
         # pytest 실행 중에는 DB 스레드 시작하지 않음 (성능 최적화)
         if os.environ.get("PYTEST_CURRENT_TEST") is None:
@@ -179,12 +178,12 @@ class DatabaseLoggerMixin:
             pass  # 큐가 가득 찬 경우 무시
 
     @property
-    def session_id(self) -> Optional[str]:
+    def session_id(self) -> str | None:
         """현재 스레드의 세션 ID (thread-local)"""
         return getattr(self._session_local, "session_id", None)
 
     @session_id.setter
-    def session_id(self, value: Optional[str]):
+    def session_id(self, value: str | None):
         self._session_local.session_id = value
 
     def generate_session_id(self) -> str:

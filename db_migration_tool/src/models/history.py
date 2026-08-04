@@ -3,7 +3,6 @@
 """
 
 from datetime import datetime
-from typing import Optional
 
 from src.database.local_db import Checkpoint, MigrationHistory
 from src.database.repository import CheckpointRepository, HistoryRepository
@@ -14,12 +13,12 @@ class MigrationHistoryItem:
 
     def __init__(
         self,
-        id: Optional[int] = None,
+        id: int | None = None,
         profile_id: int = 0,
         start_date: str = "",
         end_date: str = "",
-        started_at: Optional[datetime] = None,
-        completed_at: Optional[datetime] = None,
+        started_at: datetime | None = None,
+        completed_at: datetime | None = None,
         status: str = "pending",
         total_rows: int = 0,
         processed_rows: int = 0,
@@ -55,15 +54,15 @@ class CheckpointItem:
 
     def __init__(
         self,
-        id: Optional[int] = None,
+        id: int | None = None,
         history_id: int = 0,
         partition_name: str = "",
         status: str = "pending",
         rows_processed: int = 0,
         error_message: str = "",
-        last_path_id: Optional[int] = None,
-        last_issued_date: Optional[int] = None,
-        last_issued_date_text: Optional[str] = None,
+        last_path_id: int | None = None,
+        last_issued_date: int | None = None,
+        last_issued_date_text: str | None = None,
         copy_method: str = "INSERT",
         bytes_transferred: int = 0,
     ):
@@ -124,7 +123,7 @@ class HistoryManager:
         )
         return MigrationHistoryItem.from_db_model(db_history)
 
-    def get_history(self, history_id: int) -> Optional[MigrationHistoryItem]:
+    def get_history(self, history_id: int) -> MigrationHistoryItem | None:
         """이력 조회"""
         db_history = self.repo.get_by_id(history_id)
         if db_history:
@@ -149,7 +148,7 @@ class HistoryManager:
 
         return self.repo.update_by_id(history_id, **updates)
 
-    def get_incomplete_history(self, profile_id: int) -> Optional[MigrationHistoryItem]:
+    def get_incomplete_history(self, profile_id: int) -> MigrationHistoryItem | None:
         """미완료 이력 조회"""
         db_history = self.repo.get_incomplete_by_profile(profile_id)
         if db_history:

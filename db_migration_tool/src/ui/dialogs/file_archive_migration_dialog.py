@@ -376,7 +376,9 @@ class FileArchiveMigrationDialog(QDialog):
         self.stop_on_error_radio.setToolTip("오류가 발생하면 작업을 중단합니다.")
         self.stop_on_error_radio.setChecked(True)
         self.skip_on_error_radio = QRadioButton("건너뛰기(파티션 단위)")
-        self.skip_on_error_radio.setToolTip("오류가 난 파티션은 건너뛰고 다음 파티션을 계속 처리합니다.")
+        self.skip_on_error_radio.setToolTip(
+            "오류가 난 파티션은 건너뛰고 다음 파티션을 계속 처리합니다."
+        )
         bg = QButtonGroup(self)
         bg.addButton(self.stop_on_error_radio)
         bg.addButton(self.skip_on_error_radio)
@@ -654,7 +656,9 @@ class FileArchiveMigrationDialog(QDialog):
 
         self._update_connection_ui(s_ok, t_ok, s_msg, t_msg)
 
-    def _update_connection_ui(self, source_ok: bool, target_ok: bool, source_msg: str, target_msg: str):
+    def _update_connection_ui(
+        self, source_ok: bool, target_ok: bool, source_msg: str, target_msg: str
+    ):
         self.source_connected = source_ok
         self.target_connected = target_ok
         self.source_status_message = source_msg

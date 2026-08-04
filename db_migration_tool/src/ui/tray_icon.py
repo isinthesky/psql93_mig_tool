@@ -199,7 +199,11 @@ class TrayIconManager(QObject):
     # === 공개 메서드: 외부에서 호출 ===
 
     def show_message(
-        self, title: str, message: str, icon=QSystemTrayIcon.MessageIcon.Information, duration: int = 3000
+        self,
+        title: str,
+        message: str,
+        icon=QSystemTrayIcon.MessageIcon.Information,
+        duration: int = 3000,
     ):
         """시스템 알림 표시
 
@@ -263,7 +267,10 @@ class TrayIconManager(QObject):
         """
         self.set_migration_running(False)
         self.show_message(
-            "마이그레이션 오류", f"오류가 발생했습니다:\n{error_message}", QSystemTrayIcon.MessageIcon.Critical, 5000
+            "마이그레이션 오류",
+            f"오류가 발생했습니다:\n{error_message}",
+            QSystemTrayIcon.MessageIcon.Critical,
+            5000,
         )
 
     def notify_first_minimize(self):

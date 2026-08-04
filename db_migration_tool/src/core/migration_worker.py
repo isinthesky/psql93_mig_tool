@@ -13,6 +13,7 @@ from src.core.base_migration_worker import BaseMigrationWorker
 from src.core.table_creator import TableCreator
 from src.models.profile import ConnectionProfile
 
+
 class MigrationWorker(BaseMigrationWorker):
     """INSERT 기반 마이그레이션 워커
 

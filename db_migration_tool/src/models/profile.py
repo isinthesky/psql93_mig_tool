@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime
-from typing import Any, Optional
+from typing import Any
 
 from cryptography.fernet import Fernet
 
@@ -17,7 +17,7 @@ ENDPOINT_KIND_FILE = "file"
 SUPPORTED_ENDPOINT_KINDS = {ENDPOINT_KIND_POSTGRES, ENDPOINT_KIND_FILE}
 
 
-def normalize_endpoint_config(config: Optional[dict[str, Any]]) -> dict[str, Any]:
+def normalize_endpoint_config(config: dict[str, Any] | None) -> dict[str, Any]:
     """엔드포인트 설정을 정규화합니다.
 
     레거시 프로필은 kind 필드가 없으므로 PostgreSQL로 간주합니다.
@@ -62,12 +62,12 @@ class ConnectionProfile:
 
     def __init__(
         self,
-        id: Optional[int] = None,
+        id: int | None = None,
         name: str = "",
-        source_config: Optional[dict[str, Any]] = None,
-        target_config: Optional[dict[str, Any]] = None,
-        created_at: Optional[datetime] = None,
-        updated_at: Optional[datetime] = None,
+        source_config: dict[str, Any] | None = None,
+        target_config: dict[str, Any] | None = None,
+        created_at: datetime | None = None,
+        updated_at: datetime | None = None,
     ):
         self.id = id
         self.name = name
@@ -100,7 +100,7 @@ class ConnectionProfile:
         }
 
     @classmethod
-    def from_db_model(cls, db_profile: Profile, cipher_suite: Fernet) -> "ConnectionProfile":
+    def from_db_model(cls, db_profile: Profile, cipher_suite: Fernet) -> ConnectionProfile:
         """DB 모델에서 생성
 
         현재 키로 복호화 실패 시 레거시 키로 재시도합니다.
@@ -184,7 +184,7 @@ class ProfileManager:
 
             return ConnectionProfile.from_db_model(db_profile, self._cipher_suite)
 
-    def get_profile(self, profile_id: int) -> Optional[ConnectionProfile]:
+    def get_profile(self, profile_id: int) -> ConnectionProfile | None:
         """프로필 조회"""
         with self.db.session_scope() as session:
             db_profile = session.query(Profile).filter_by(id=profile_id).first()

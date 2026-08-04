@@ -2,8 +2,6 @@
 PostgreSQL 버전 감지 및 매핑 테스트
 """
 
-import pytest
-
 from src.database.version_info import (
     PgVersionFamily,
     PgVersionInfo,

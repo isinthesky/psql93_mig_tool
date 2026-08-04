@@ -2,7 +2,6 @@
 Manager 클래스들의 session_scope() 사용 검증 테스트
 """
 
-
 import pytest
 
 from src.models.history import CheckpointManager, HistoryManager

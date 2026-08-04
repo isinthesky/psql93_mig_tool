@@ -4,8 +4,6 @@ MainWindow를 위한 ViewModel
 프로필 관리와 이력 조회 로직을 담당합니다.
 """
 
-from typing import Optional
-
 from PySide6.QtCore import Signal
 
 from src.models.history import HistoryManager, MigrationHistoryItem
@@ -29,8 +27,8 @@ class MainViewModel(BaseViewModel):
 
     def __init__(
         self,
-        profile_manager: Optional[ProfileManager] = None,
-        history_manager: Optional[HistoryManager] = None,
+        profile_manager: ProfileManager | None = None,
+        history_manager: HistoryManager | None = None,
     ):
         super().__init__()
 
@@ -40,7 +38,7 @@ class MainViewModel(BaseViewModel):
 
         # 내부 상태
         self._profiles: list[ConnectionProfile] = []
-        self._current_profile: Optional[ConnectionProfile] = None
+        self._current_profile: ConnectionProfile | None = None
         self._histories: list[MigrationHistoryItem] = []
 
     # --- 프로필 관련 메서드 ---
@@ -56,7 +54,7 @@ class MainViewModel(BaseViewModel):
         finally:
             self.is_loading = False
 
-    def select_profile(self, profile_id: Optional[int]):
+    def select_profile(self, profile_id: int | None):
         """프로필 선택
 
         Args:
@@ -138,7 +136,7 @@ class MainViewModel(BaseViewModel):
             return False
 
     @property
-    def current_profile(self) -> Optional[ConnectionProfile]:
+    def current_profile(self) -> ConnectionProfile | None:
         """현재 선택된 프로필"""
         return self._current_profile
 

@@ -40,7 +40,7 @@ class ArchivePartitionEntry:
     verified_at: str | None = None
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "ArchivePartitionEntry":
+    def from_dict(cls, data: dict[str, Any]) -> ArchivePartitionEntry:
         allowed = {item.name for item in fields(cls)}
         payload = {key: value for key, value in dict(data).items() if key in allowed}
         return cls(**payload)
@@ -61,7 +61,7 @@ class ArchiveManifest:
         return asdict(self)
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "ArchiveManifest":
+    def from_dict(cls, data: dict[str, Any]) -> ArchiveManifest:
         allowed = {item.name for item in fields(cls)}
         payload = {key: value for key, value in dict(data).items() if key in allowed}
         return cls(**payload)
@@ -194,9 +194,11 @@ class ArchiveManifestStore:
         lock_fd = open(self._lock_path, "w")
         if hasattr(os, "name") and os.name == "nt":
             import msvcrt
+
             msvcrt.locking(lock_fd.fileno(), msvcrt.LK_LOCK, 1)
         else:
             import fcntl
+
             fcntl.flock(lock_fd, fcntl.LOCK_EX)
         return lock_fd
 
@@ -222,12 +224,8 @@ class ArchiveManifestStore:
                     manifest.parent_tables = merged_parents
 
                     # partitions 병합 (partition_name 기준, in-memory 우선)
-                    disk_by_name = {
-                        p.get("partition_name"): p for p in disk_manifest.partitions
-                    }
-                    mem_by_name = {
-                        p.get("partition_name"): p for p in manifest.partitions
-                    }
+                    disk_by_name = {p.get("partition_name"): p for p in disk_manifest.partitions}
+                    mem_by_name = {p.get("partition_name"): p for p in manifest.partitions}
                     disk_by_name.update(mem_by_name)
                     manifest.partitions = list(disk_by_name.values())
                 except Exception:

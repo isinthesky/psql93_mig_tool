@@ -94,7 +94,10 @@ class ConnectionValidator:
         target_kind = (target_config or {}).get("kind", ENDPOINT_KIND_POSTGRES)
 
         if (source_kind, target_kind) not in SUPPORTED_MIGRATION_PAIRS:
-            return False, "현재 버전은 PostgreSQL↔PostgreSQL / PostgreSQL→File / File→PostgreSQL만 지원합니다."
+            return (
+                False,
+                "현재 버전은 PostgreSQL↔PostgreSQL / PostgreSQL→File / File→PostgreSQL만 지원합니다.",
+            )
 
         if source_kind == ENDPOINT_KIND_FILE:
             valid, msg = ConnectionValidator.validate_file_archive_config(
@@ -157,8 +160,8 @@ class VersionValidator:
 
     @staticmethod
     def validate_version_compatibility(
-        source_version: "PgVersionInfo",
-        target_version: "PgVersionInfo",
+        source_version: PgVersionInfo,
+        target_version: PgVersionInfo,
     ) -> tuple[bool, list[str]]:
         from src.database.version_info import PgVersionFamily
 

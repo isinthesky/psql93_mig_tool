@@ -4,7 +4,7 @@ MigrationDialog를 위한 ViewModel
 마이그레이션 진행 상태와 UI 상태를 관리합니다.
 """
 
-from typing import Any, Optional
+from typing import Any
 
 from PySide6.QtCore import Signal
 
@@ -37,7 +37,7 @@ class MigrationViewModel(BaseViewModel):
     migration_completed = Signal()  # 완료됨
     migration_failed = Signal(str)  # 실패 (오류 메시지)
 
-    def __init__(self, profile: Optional[ConnectionProfile] = None):
+    def __init__(self, profile: ConnectionProfile | None = None):
         super().__init__()
 
         self.profile = profile

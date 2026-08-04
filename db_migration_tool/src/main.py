@@ -79,8 +79,7 @@ def main():
         QMessageBox.warning(
             None,
             "중복 실행",
-            "DB 마이그레이션 도구가 이미 실행 중입니다.\n"
-            "기존 창을 확인해 주세요.",
+            "DB 마이그레이션 도구가 이미 실행 중입니다.\n기존 창을 확인해 주세요.",
         )
         return 0
     # shared_mem은 프로세스 종료 시 OS가 자동 해제 (Windows)

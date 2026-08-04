@@ -89,19 +89,25 @@ class HistoryDialog(QDialog):
             row = self.table.rowCount()
             self.table.insertRow(row)
 
-            self.table.setItem(row, 0, QTableWidgetItem(self._resolve_profile_name(history.profile_id)))
+            self.table.setItem(
+                row, 0, QTableWidgetItem(self._resolve_profile_name(history.profile_id))
+            )
             self.table.setItem(row, 1, QTableWidgetItem(str(history.start_date)))
             self.table.setItem(row, 2, QTableWidgetItem(str(history.end_date)))
             self.table.setItem(
-                row, 3,
+                row,
+                3,
                 QTableWidgetItem(
                     history.started_at.strftime("%Y-%m-%d %H:%M:%S") if history.started_at else ""
                 ),
             )
             self.table.setItem(
-                row, 4,
+                row,
+                4,
                 QTableWidgetItem(
-                    history.completed_at.strftime("%Y-%m-%d %H:%M:%S") if history.completed_at else ""
+                    history.completed_at.strftime("%Y-%m-%d %H:%M:%S")
+                    if history.completed_at
+                    else ""
                 ),
             )
             status_text, status_color = STATUS_DISPLAY.get(

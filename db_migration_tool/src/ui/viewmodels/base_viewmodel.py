@@ -7,8 +7,6 @@ ViewModel 베이스 클래스
 - 상태 변경 알림
 """
 
-from typing import Optional
-
 from PySide6.QtCore import QObject, Signal
 
 
@@ -27,7 +25,7 @@ class BaseViewModel(QObject):
     def __init__(self):
         super().__init__()
         self._is_loading = False
-        self._error_message: Optional[str] = None
+        self._error_message: str | None = None
 
     @property
     def is_loading(self) -> bool:
@@ -42,7 +40,7 @@ class BaseViewModel(QObject):
             self.loading_changed.emit(value)
 
     @property
-    def error_message(self) -> Optional[str]:
+    def error_message(self) -> str | None:
         """마지막 오류 메시지"""
         return self._error_message
 

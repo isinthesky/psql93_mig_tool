@@ -376,7 +376,6 @@ class TestBaseRepositoryRollback:
             processed_rows=0,
         )
 
-
         # When: 잘못된 필드로 업데이트 시도
         # (존재하지 않는 필드는 무시되지만, hasattr 체크로 안전)
         repo.update_by_id(history.id, status="updated", nonexistent_field="value")

@@ -107,7 +107,9 @@ class PostgresOptimizer:
                         return True, ""
 
                 # COPY 권한 직접 테스트 (임시 테이블 사용)
-                success, probe_error = PostgresOptimizer._probe_copy_privilege(connection, check_write)
+                success, probe_error = PostgresOptimizer._probe_copy_privilege(
+                    connection, check_write
+                )
                 if success:
                     return True, ""
 
@@ -327,9 +329,13 @@ class PostgresOptimizer:
         detected = PostgresOptimizer.detect_version(connection)
 
         if compat_mode == "9.3":
-            return PgVersionInfo(9, 3, f"forced:9.3 (실제: {detected.full_version})", PgVersionFamily.PG_9_3)
+            return PgVersionInfo(
+                9, 3, f"forced:9.3 (실제: {detected.full_version})", PgVersionFamily.PG_9_3
+            )
         if compat_mode == "16":
-            return PgVersionInfo(16, 0, f"forced:16 (실제: {detected.full_version})", PgVersionFamily.PG_16)
+            return PgVersionInfo(
+                16, 0, f"forced:16 (실제: {detected.full_version})", PgVersionFamily.PG_16
+            )
 
         # auto: 감지된 버전 사용
         return detected
@@ -383,9 +389,7 @@ class PostgresOptimizer:
                         "COPY copy_test FROM STDIN WITH (FORMAT CSV)", StringIO("1\n")
                     )
                 else:
-                    cursor.copy_expert(
-                        "COPY copy_test TO STDOUT WITH (FORMAT CSV)", StringIO()
-                    )
+                    cursor.copy_expert("COPY copy_test TO STDOUT WITH (FORMAT CSV)", StringIO())
                 cursor.execute("DROP TABLE copy_test")
             connection.commit()
             return True, ""

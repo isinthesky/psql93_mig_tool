@@ -5,7 +5,7 @@ CRUD 공통 로직을 제공하는 베이스 리포지토리와
 """
 
 from contextlib import contextmanager
-from typing import Generic, Optional, TypeVar
+from typing import Generic, TypeVar
 
 from .local_db import Checkpoint, MigrationHistory, get_db
 
@@ -68,7 +68,7 @@ class BaseRepository(Generic[T]):
             return obj
 
     # READ
-    def get_by_id(self, id: int) -> Optional[T]:
+    def get_by_id(self, id: int) -> T | None:
         """ID로 조회
 
         Args:
@@ -83,7 +83,7 @@ class BaseRepository(Generic[T]):
                 session.expunge(obj)
             return obj
 
-    def get_one_by(self, **filters) -> Optional[T]:
+    def get_one_by(self, **filters) -> T | None:
         """조건으로 단건 조회
 
         Args:
@@ -231,7 +231,7 @@ class HistoryRepository(BaseRepository[MigrationHistory]):
         """
         super().__init__(MigrationHistory, db)
 
-    def get_incomplete_by_profile(self, profile_id: int) -> Optional[MigrationHistory]:
+    def get_incomplete_by_profile(self, profile_id: int) -> MigrationHistory | None:
         """프로필의 미완료 이력 조회
 
         running 또는 failed 상태의 최신 이력을 반환합니다.

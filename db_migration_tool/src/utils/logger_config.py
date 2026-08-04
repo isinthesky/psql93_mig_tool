@@ -6,7 +6,6 @@ logging 핸들러 생성과 로거 설정을 중앙집중화합니다.
 import logging
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
 
 from .app_paths import AppPaths
 
@@ -27,7 +26,7 @@ class LoggerConfig:
 
     @staticmethod
     def create_file_handler(
-        log_dir: Optional[Path] = None,
+        log_dir: Path | None = None,
         filename_pattern: str = "migration_{date}.log",
         level: int = logging.DEBUG,
         encoding: str = "utf-8",
@@ -65,7 +64,7 @@ class LoggerConfig:
 
     @staticmethod
     def create_console_handler(
-        level: int = logging.INFO, format_string: Optional[str] = None
+        level: int = logging.INFO, format_string: str | None = None
     ) -> logging.StreamHandler:
         """콘솔 핸들러 생성
 

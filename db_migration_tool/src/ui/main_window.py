@@ -100,7 +100,9 @@ class MainWindow(QMainWindow):
         # 삭제 액션
         delete_action = QAction("삭제", self)
         delete_action.setShortcut("Delete")
-        delete_action.setStatusTip("선택한 연결 프로필을 삭제합니다. 작업 이력은 삭제하지 않습니다.")
+        delete_action.setStatusTip(
+            "선택한 연결 프로필을 삭제합니다. 작업 이력은 삭제하지 않습니다."
+        )
         delete_action.setToolTip("선택한 연결 프로필 삭제 (작업 이력 삭제 아님)")
         delete_action.triggered.connect(self.delete_connection)
         toolbar.addAction(delete_action)
@@ -110,7 +112,9 @@ class MainWindow(QMainWindow):
         # 마이그레이션 작업 설정 액션
         self.migrate_action = QAction("마이그레이션 작업 설정", self)
         self.migrate_action.setShortcut("F5")
-        self.migrate_action.setStatusTip("선택한 프로필로 마이그레이션 범위와 실행 옵션을 설정합니다.")
+        self.migrate_action.setStatusTip(
+            "선택한 프로필로 마이그레이션 범위와 실행 옵션을 설정합니다."
+        )
         self.migrate_action.setToolTip("프로필을 선택한 뒤 마이그레이션 작업을 설정합니다. (F5)")
         self.migrate_action.triggered.connect(self.start_migration)
         toolbar.addAction(self.migrate_action)
@@ -168,7 +172,9 @@ class MainWindow(QMainWindow):
 
         self.delete_btn = QPushButton("삭제")
         self.delete_btn.setObjectName("dangerAction")
-        self.delete_btn.setToolTip("연결 프로필을 선택하면 삭제할 수 있습니다. 작업 이력은 삭제하지 않습니다.")
+        self.delete_btn.setToolTip(
+            "연결 프로필을 선택하면 삭제할 수 있습니다. 작업 이력은 삭제하지 않습니다."
+        )
         self.delete_btn.clicked.connect(self.delete_connection)
         self.delete_btn.setEnabled(False)
         button_layout.addWidget(self.delete_btn)
@@ -178,7 +184,9 @@ class MainWindow(QMainWindow):
         # 마이그레이션 작업 설정 버튼
         self.migrate_btn = QPushButton("마이그레이션 작업 설정")
         self.migrate_btn.setObjectName("migrationButton")
-        self.migrate_btn.setToolTip("연결 프로필을 선택하면 마이그레이션 작업을 설정할 수 있습니다.")
+        self.migrate_btn.setToolTip(
+            "연결 프로필을 선택하면 마이그레이션 작업을 설정할 수 있습니다."
+        )
         self.migrate_btn.clicked.connect(self.start_migration)
         self.migrate_btn.setEnabled(False)
         layout.addWidget(self.migrate_btn)
@@ -228,7 +236,9 @@ class MainWindow(QMainWindow):
         default_migrate_tip = "연결 프로필을 선택하면 마이그레이션 작업을 설정할 수 있습니다."
         self.migrate_btn.setToolTip(default_migrate_tip)
         self.edit_btn.setToolTip("연결 프로필을 선택하면 편집할 수 있습니다.")
-        self.delete_btn.setToolTip("연결 프로필을 선택하면 삭제할 수 있습니다. 작업 이력은 삭제하지 않습니다.")
+        self.delete_btn.setToolTip(
+            "연결 프로필을 선택하면 삭제할 수 있습니다. 작업 이력은 삭제하지 않습니다."
+        )
         if hasattr(self, "migrate_action"):
             self.migrate_action.setText(label)
             self.migrate_action.setToolTip(default_migrate_tip)
@@ -274,7 +284,9 @@ class MainWindow(QMainWindow):
         else:
             migrate_tip = default_migrate_tip
             self.edit_btn.setToolTip("연결 프로필을 선택하면 편집할 수 있습니다.")
-            self.delete_btn.setToolTip("연결 프로필을 선택하면 삭제할 수 있습니다. 작업 이력은 삭제하지 않습니다.")
+            self.delete_btn.setToolTip(
+                "연결 프로필을 선택하면 삭제할 수 있습니다. 작업 이력은 삭제하지 않습니다."
+            )
         self.migrate_btn.setToolTip(migrate_tip)
         if hasattr(self, "migrate_action"):
             self.migrate_action.setText(label)

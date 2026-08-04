@@ -5,7 +5,6 @@
 """
 
 from pathlib import Path
-from typing import Optional
 
 from PySide6.QtCore import QStandardPaths
 
@@ -28,16 +27,16 @@ class AppPaths:
     """
 
     # 클래스 변수: 경로 캐싱
-    _app_data_dir: Optional[Path] = None
-    _logs_dir: Optional[Path] = None
-    _db_path: Optional[Path] = None
-    _temp_dir: Optional[Path] = None
+    _app_data_dir: Path | None = None
+    _logs_dir: Path | None = None
+    _db_path: Path | None = None
+    _temp_dir: Path | None = None
 
     # 설정: 커스텀 루트 디렉토리 (테스트용)
-    _custom_root: Optional[Path] = None
+    _custom_root: Path | None = None
 
     @classmethod
-    def set_custom_root(cls, root: Optional[Path]):
+    def set_custom_root(cls, root: Path | None):
         """커스텀 루트 디렉토리 설정 (테스트용)
 
         Args:

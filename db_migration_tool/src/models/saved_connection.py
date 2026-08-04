@@ -30,6 +30,7 @@ class SavedConnectionManager:
         key_file.write_bytes(key)
         try:
             import os
+
             os.chmod(key_file, 0o600)
         except (OSError, AttributeError):
             pass
@@ -93,11 +94,7 @@ class SavedConnectionManager:
     def get_all(self) -> list[dict[str, Any]]:
         """저장된 연결 목록 (최근 사용순)."""
         with self.db.session_scope() as session:
-            rows = (
-                session.query(SavedConnection)
-                .order_by(SavedConnection.last_used.desc())
-                .all()
-            )
+            rows = session.query(SavedConnection).order_by(SavedConnection.last_used.desc()).all()
             return [self._to_dict(row) for row in rows]
 
     def delete(self, connection_id: int) -> bool:

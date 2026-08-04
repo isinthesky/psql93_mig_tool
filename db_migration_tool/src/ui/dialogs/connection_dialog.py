@@ -122,10 +122,14 @@ class ConnectionDialog(QDialog):
             lambda idx, side=key: self._on_preset_selected(side, idx)
         )
         delete_preset_btn = QPushButton("삭제")
-        delete_preset_btn.setToolTip("선택한 저장 연결만 삭제합니다. 현재 프로필이나 작업 이력은 삭제하지 않습니다.")
+        delete_preset_btn.setToolTip(
+            "선택한 저장 연결만 삭제합니다. 현재 프로필이나 작업 이력은 삭제하지 않습니다."
+        )
         delete_preset_btn.setProperty("variant", "chip")
         delete_preset_btn.setAutoDefault(False)
-        delete_preset_btn.clicked.connect(lambda _=False, side=key: self._delete_selected_preset(side))
+        delete_preset_btn.clicked.connect(
+            lambda _=False, side=key: self._delete_selected_preset(side)
+        )
         # 콤보가 남는 폭을 가져간다. 안 그러면 '삭제'가 행 절반을 차지한다.
         preset_row.addWidget(preset_combo, 1)
         preset_row.addWidget(delete_preset_btn)
@@ -154,7 +158,9 @@ class ConnectionDialog(QDialog):
         password_edit = QLineEdit()
         password_edit.setEchoMode(QLineEdit.Password)
         password_edit.setPlaceholderText("비밀번호 입력")
-        password_edit.setToolTip("PostgreSQL 접속 비밀번호를 입력하세요. 저장 정책은 기존 설정을 따릅니다.")
+        password_edit.setToolTip(
+            "PostgreSQL 접속 비밀번호를 입력하세요. 저장 정책은 기존 설정을 따릅니다."
+        )
         postgres_layout.addRow("비밀번호:", password_edit)
 
         ssl_check = QCheckBox("SSL 연결 사용")
@@ -302,7 +308,9 @@ class ConnectionDialog(QDialog):
             return
         preset = presets[index - 1]
         reply = QMessageBox.question(
-            self, "프리셋 삭제", f"'{preset['label']}'을(를) 삭제하시겠습니까?",
+            self,
+            "프리셋 삭제",
+            f"'{preset['label']}'을(를) 삭제하시겠습니까?",
             QMessageBox.Yes | QMessageBox.No,
         )
         if reply == QMessageBox.Yes:
