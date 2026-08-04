@@ -247,11 +247,11 @@ class PartitionDiscovery:
             config = self.connection_config
 
         conn_params = {
-            "host": config["host"],
-            "port": config["port"],
-            "dbname": config["database"],
-            "user": config["username"],
-            "password": config["password"],
+            "host": config.get("host", "localhost"),
+            "port": config.get("port", 5432),
+            "dbname": config.get("database", ""),
+            "user": config.get("username", ""),
+            "password": config.get("password", ""),
         }
 
         if config.get("ssl"):

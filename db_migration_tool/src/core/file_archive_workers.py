@@ -158,11 +158,11 @@ class ArchiveMigrationWorkerBase(BaseMigrationWorker):
     @staticmethod
     def _create_psycopg2_connection(config: dict[str, Any]):
         params = {
-            "host": config["host"],
-            "port": config["port"],
-            "database": config["database"],
-            "user": config["username"],
-            "password": config["password"],
+            "host": config.get("host", "localhost"),
+            "port": config.get("port", 5432),
+            "database": config.get("database", ""),
+            "user": config.get("username", ""),
+            "password": config.get("password", ""),
         }
         if config.get("ssl"):
             params["sslmode"] = "require"

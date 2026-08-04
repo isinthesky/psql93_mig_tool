@@ -148,11 +148,11 @@ class PostgresOptimizer:
 
         # 연결 파라미터 준비
         conn_params = {
-            "host": config["host"],
-            "port": config["port"],
-            "dbname": config["database"],
-            "user": config["username"],
-            "password": config["password"],
+            "host": config.get("host", "localhost"),
+            "port": config.get("port", 5432),
+            "dbname": config.get("database", ""),
+            "user": config.get("username", ""),
+            "password": config.get("password", ""),
             "connect_timeout": 5,  # 5초 타임아웃
         }
 
@@ -209,11 +209,11 @@ class PostgresOptimizer:
         """최적화된 연결 생성"""
         # 연결 파라미터 준비
         conn_params = {
-            "host": config["host"],
-            "port": config["port"],
-            "database": config["database"],
-            "user": config["username"],
-            "password": config["password"],
+            "host": config.get("host", "localhost"),
+            "port": config.get("port", 5432),
+            "database": config.get("database", ""),
+            "user": config.get("username", ""),
+            "password": config.get("password", ""),
         }
 
         # SSL 설정

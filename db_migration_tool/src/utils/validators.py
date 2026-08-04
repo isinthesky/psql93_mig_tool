@@ -35,7 +35,7 @@ class ConnectionValidator:
     @staticmethod
     def validate_postgres_config(config: dict[str, Any]) -> tuple[bool, str]:
         """PostgreSQL 연결 설정 검증"""
-        required_fields = ["host", "port", "database", "username"]
+        required_fields = ["host", "database", "username"]
         for field in required_fields:
             if not config.get(field):
                 return False, f"{field}는 필수 입력 항목입니다."
@@ -44,7 +44,7 @@ class ConnectionValidator:
         if not host or len(host) > 255:
             return False, "올바른 호스트 주소를 입력하세요."
 
-        port = config["port"]
+        port = config.get("port", 5432)
         if not isinstance(port, int) or port < 1 or port > 65535:
             return False, "포트는 1-65535 사이의 숫자여야 합니다."
 

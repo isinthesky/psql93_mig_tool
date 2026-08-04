@@ -365,11 +365,11 @@ class CopyMigrationWorker(BaseMigrationWorker):
         try:
             # 연결 파라미터 준비
             conn_params = {
-                "host": config["host"],
-                "port": config["port"],
-                "database": config["database"],
-                "user": config["username"],
-                "password": config["password"],
+                "host": config.get("host", "localhost"),
+                "port": config.get("port", 5432),
+                "database": config.get("database", ""),
+                "user": config.get("username", ""),
+                "password": config.get("password", ""),
             }
 
             # SSL 설정

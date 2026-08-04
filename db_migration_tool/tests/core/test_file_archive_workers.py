@@ -161,6 +161,30 @@ def test_export_worker_detect_table_type(tmp_path):
     assert worker._detect_table_type("point_history_240101") == TableType.POINT_HISTORY
 
 
+def test_archive_worker_connection_defaults_missing_port(tmp_path, monkeypatch):
+    captured = {}
+
+    def fake_connect(**params):
+        captured.update(params)
+        return DummyConn()
+
+    monkeypatch.setattr("src.core.file_archive_workers.psycopg2.connect", fake_connect)
+
+    worker = PostgresToFileArchiveWorker(make_profile(tmp_path, "postgres_to_file"), [], history_id=1)
+    config = {
+        "kind": "postgres",
+        "host": "localhost",
+        "database": "db",
+        "username": "user",
+        "password": "pass",
+    }
+
+    conn = worker._create_psycopg2_connection(config)
+
+    assert conn.closed is False
+    assert captured["port"] == 5432
+
+
 def test_import_worker_prepare_target_table_resume_uses_auto(tmp_path):
     worker = FileToPostgresArchiveWorker(
         make_profile(tmp_path, "file_to_postgres"),

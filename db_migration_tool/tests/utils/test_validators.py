@@ -17,6 +17,19 @@ def test_validate_postgres_config_ok():
     assert msg == ""
 
 
+def test_validate_postgres_config_defaults_missing_port():
+    valid, msg = ConnectionValidator.validate_connection_config(
+        {
+            "kind": "postgres",
+            "host": "localhost",
+            "database": "testdb",
+            "username": "tester",
+        }
+    )
+    assert valid is True
+    assert msg == ""
+
+
 def test_validate_file_archive_source_requires_manifest(tmp_path: Path):
     archive_dir = tmp_path / "archive"
     archive_dir.mkdir()
