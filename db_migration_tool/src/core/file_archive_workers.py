@@ -83,7 +83,7 @@ class ManifestTableCreator(TableCreator):
         partition_info = self._get_partition_info(partition_name, parent_table)
         self._add_partition_info(partition_name, partition_info)
 
-    def _create_parent_table(self, parent_table: str, table_type: TableType = None):
+    def _create_parent_table(self, parent_table: str, table_type: TableType | None = None):
         metadata = self.manifest_store.get_parent_table_metadata(parent_table)
         resolved_type = self._resolve_table_type(parent_table, metadata.get("table_type"))
         if table_type is None:
@@ -430,7 +430,8 @@ class PostgresToFileArchiveWorker(ArchiveMigrationWorkerBase):
         resume: bool = False,
     ):
         super().__init__(profile, partitions, history_id, resume)
-        self.source_conn = None
+        # psycopg2 연결. 스텁이 없어 Any로 둔다.
+        self.source_conn: Any = None
         self.archive_store = ArchiveManifestStore(self.profile.target_config["archive_path"])
 
     def _execute_migration(self):
@@ -722,7 +723,8 @@ class FileToPostgresArchiveWorker(ArchiveMigrationWorkerBase):
     ):
         super().__init__(profile, partitions, history_id, resume)
         self.archive_store = ArchiveManifestStore(self.profile.source_config["archive_path"])
-        self.target_conn = None
+        # psycopg2 연결. 스텁이 없어 Any로 둔다.
+        self.target_conn: Any = None
 
     def _execute_migration(self):
         checkpoints = {

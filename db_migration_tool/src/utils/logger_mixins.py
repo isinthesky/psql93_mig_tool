@@ -10,6 +10,7 @@ import time
 from datetime import datetime
 from queue import Queue
 from threading import Thread
+from typing import Any
 
 
 class SensitiveDataMasker:
@@ -84,7 +85,7 @@ class DatabaseLoggerMixin:
 
         # 스레드별 session_id 격리 (동시 워커 간 세션 혼선 방지)
         self._session_local = threading.local()
-        self.db_queue = Queue()
+        self.db_queue: Queue[dict[str, Any]] = Queue()
         self.is_running = True
         self.db_thread: Thread | None = None
 
@@ -117,7 +118,7 @@ class DatabaseLoggerMixin:
                 time.sleep(0.1)
 
                 # 큐에서 로그 가져오기 (최대 100개)
-                logs_to_save = []
+                logs_to_save: list[dict[str, Any]] = []
                 while not self.db_queue.empty() and len(logs_to_save) < 100:
                     try:
                         log_data = self.db_queue.get_nowait()

@@ -14,7 +14,9 @@ from .table_types import DEFAULT_TABLE_TYPE, TableType, infer_partition_range
 class PartitionDiscovery:
     """파티션 테이블 탐색 클래스"""
 
-    def __init__(self, connection_config: dict[str, Any], target_config: dict[str, Any] = None):
+    def __init__(
+        self, connection_config: dict[str, Any], target_config: dict[str, Any] | None = None
+    ):
         self.source_config = connection_config
         self.target_config = target_config
         self.connection_config = connection_config  # 하위 호환성을 위해 유지
@@ -160,7 +162,9 @@ class PartitionDiscovery:
         partitions.sort(key=lambda p: (p["table_type_code"], p["from_timestamp"] or 0))
         return partitions
 
-    def get_partition_info(self, partition_name: str, is_target: bool = False) -> dict[str, Any]:
+    def get_partition_info(
+        self, partition_name: str, is_target: bool = False
+    ) -> dict[str, Any] | None:
         """특정 파티션 정보 조회
 
         Args:
@@ -272,13 +276,15 @@ class PartitionDiscovery:
         """,
             (table_name,),
         )
-        return cursor.fetchone()[0]
+        row = cursor.fetchone()
+        return bool(row and row[0])
 
     def _get_row_count(self, cursor, table_name: str) -> int:
         """테이블 행 수 조회"""
         try:
             cursor.execute(sql.SQL("SELECT COUNT(*) FROM {}").format(sql.Identifier(table_name)))
-            return cursor.fetchone()[0]
+            row = cursor.fetchone()
+            return int(row[0]) if row else 0
         except (psycopg.DatabaseError, psycopg.OperationalError):
             return 0
 

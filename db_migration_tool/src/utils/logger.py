@@ -11,7 +11,8 @@ from .logger_config import LoggerConfig
 class MigrationLogger:
     """마이그레이션 로거"""
 
-    _instance = None
+    _instance: "MigrationLogger | None" = None
+    _initialized: bool = False
 
     def __new__(cls):
         if cls._instance is None:

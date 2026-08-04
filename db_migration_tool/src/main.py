@@ -24,12 +24,9 @@ from src.ui.theme import build_stylesheet
 
 def get_resource_path(relative_path):
     """리소스 파일 경로를 가져옵니다 (PyInstaller 호환)"""
-    try:
-        # PyInstaller가 생성한 임시 폴더
-        base_path = sys._MEIPASS
-    except Exception:
-        base_path = os.path.abspath(".")
-
+    # PyInstaller 번들로 실행될 때만 sys._MEIPASS(임시 압축 해제 폴더)가 생긴다.
+    # 타입 스텁에는 없는 속성이라 getattr로 읽는다.
+    base_path = getattr(sys, "_MEIPASS", None) or os.path.abspath(".")
     return os.path.join(base_path, relative_path)
 
 

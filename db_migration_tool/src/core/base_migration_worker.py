@@ -13,8 +13,11 @@ from src.models.profile import ConnectionProfile
 from src.utils.enhanced_logger import enhanced_logger, log_emitter
 
 
-class QThreadABCMeta(type(QThread), ABCMeta):
-    """QThread와 ABC를 동시에 상속하기 위한 메타클래스"""
+class QThreadABCMeta(type(QThread), ABCMeta):  # type: ignore[misc]
+    """QThread와 ABC를 동시에 상속하기 위한 메타클래스
+
+    type(QThread)는 런타임에만 결정되는 동적 베이스라 타입 체커가 해석하지 못한다.
+    """
 
     pass
 
@@ -57,10 +60,10 @@ class BaseMigrationWorker(QThread, metaclass=QThreadABCMeta):
         # 공통 상태 필드
         self.is_running = False
         self.is_paused = False
-        self.stop_reason = None
+        self.stop_reason: str | None = None
         self.current_partition_index = 0
         self.total_rows_processed = 0
-        self.start_time = None
+        self.start_time: float | None = None
 
         # 공통 매니저
         self.history_manager = HistoryManager()
@@ -163,7 +166,7 @@ class BaseMigrationWorker(QThread, metaclass=QThreadABCMeta):
         estimated_remaining_rows = remaining_partitions * 4000000  # 하루 평균 400만 rows
 
         # 예상 완료 시간
-        eta_seconds = 0
+        eta_seconds = 0.0
         if speed > 0:
             eta_seconds = estimated_remaining_rows / speed
 

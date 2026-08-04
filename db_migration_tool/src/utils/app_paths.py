@@ -81,7 +81,9 @@ class AppPaths:
             if cls._custom_root:
                 cls._app_data_dir = cls._custom_root
             else:
-                app_data = QStandardPaths.writableLocation(QStandardPaths.AppDataLocation)
+                app_data = QStandardPaths.writableLocation(
+                    QStandardPaths.StandardLocation.AppDataLocation
+                )
                 if not app_data:
                     # QStandardPaths가 빈 문자열 반환 시 fallback
                     app_data = str(Path.home() / ".db_migration_tool")

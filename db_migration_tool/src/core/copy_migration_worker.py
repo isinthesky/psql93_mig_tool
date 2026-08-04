@@ -215,16 +215,16 @@ class CopyMigrationWorker(BaseMigrationWorker):
         # COPY 워커 전용 필드
         self.performance_metrics = PerformanceMetrics()
 
-        # psycopg2 연결 (COPY 명령용)
-        self.source_conn = None
-        self.target_conn = None
+        # psycopg2 연결 (COPY 명령용). psycopg2는 타입 스텁이 없어 Any로 둔다.
+        self.source_conn: Any = None
+        self.target_conn: Any = None
 
         # 버전 정보 (연결 후 감지)
         self.source_version: PgVersionInfo | None = None
         self.target_version: PgVersionInfo | None = None
 
         # 성능 지표 업데이트 타이머
-        self.last_metric_update = 0
+        self.last_metric_update = 0.0
         self.metric_update_interval = 1.0  # 1초마다 업데이트
 
         # 에러 처리 전략
@@ -233,12 +233,17 @@ class CopyMigrationWorker(BaseMigrationWorker):
         self.skip_on_error: bool = False
 
         # 기존 데이터(TRUNCATE) 처리: UI가 응답을 넣어주는 필드
-        self.truncate_permission = None  # None|True|False
+        # None=미응답 / True=TRUNCATE 승인 / False=거부
+        self.truncate_permission: bool | None = None
+
+        # True면 실제 마이그레이션 대신 소스/대상 연결 확인만 하고 끝낸다.
+        # (연결 확인 마법사 단계가 워커를 재사용하려고 켜는 플래그)
+        self.check_connections_only: bool = False
 
     def _execute_migration(self):
         """COPY 기반 마이그레이션 실행"""
         # 연결 확인만 수행하는 경우
-        if hasattr(self, "check_connections_only") and self.check_connections_only:
+        if self.check_connections_only:
             self._check_connections()
             return
 
@@ -308,7 +313,7 @@ class CopyMigrationWorker(BaseMigrationWorker):
                                     f"{partition} - Server-side COPY 실패 → Python COPY로 전환: {e}",
                                     "WARNING",
                                 )
-                                if checkpoint:
+                                if checkpoint and checkpoint.id is not None:
                                     try:
                                         self.checkpoint_manager.update_checkpoint_status(
                                             checkpoint.id,
@@ -478,8 +483,12 @@ class CopyMigrationWorker(BaseMigrationWorker):
             try:
                 import datetime as _dt
 
-                if isinstance(value, (_dt.datetime, _dt.date)):
+                # date.isoformat()은 sep 인자를 받지 않는다. datetime을 먼저 걸러야
+                # date에서 TypeError가 나 except로 새지 않는다 (datetime은 date의 하위 타입).
+                if isinstance(value, _dt.datetime):
                     safe = value.isoformat(sep=" ")
+                elif isinstance(value, _dt.date):
+                    safe = value.isoformat()
                 else:
                     safe = str(value)
             except Exception:

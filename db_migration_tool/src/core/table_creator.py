@@ -95,7 +95,14 @@ def _build_column_definition(column: dict[str, Any]) -> str:
 class TableCreator:
     """대상 테이블 생성 클래스"""
 
-    def __init__(self, source_conn: psycopg.Connection, target_conn: psycopg.Connection):
+    def __init__(self, source_conn: Any, target_conn: Any):
+        """
+        Args:
+            source_conn: 소스 연결. DB-API 호환이면 되고 psycopg2/psycopg3 둘 다 들어온다
+                (CopyMigrationWorker는 psycopg2, MigrationWorker는 psycopg3).
+                ManifestTableCreator처럼 소스가 없는 경우 None이 들어온다.
+            target_conn: 대상 연결. 동일하게 duck-typed.
+        """
         self.source_conn = source_conn
         self.target_conn = target_conn
 
@@ -186,8 +193,6 @@ class TableCreator:
                 }
 
             # partition_table_info에 없으면 파티션 이름에서 추측
-            table_type = None
-
             # parent_table 기반으로 테이블 타입 추론
             try:
                 table_type = get_table_type(parent_table)
@@ -224,9 +229,10 @@ class TableCreator:
             """,
                 (parent_table,),
             )
-            return cur.fetchone()[0]
+            row = cur.fetchone()
+            return bool(row and row[0])
 
-    def _create_parent_table(self, parent_table: str, table_type: TableType = None):
+    def _create_parent_table(self, parent_table: str, table_type: TableType | None = None):
         """
         부모 테이블 생성
 
@@ -437,7 +443,8 @@ class TableCreator:
                 )
             """)
 
-            if not cur.fetchone()[0]:
+            row = cur.fetchone()
+            if not (row and row[0]):
                 # 테이블 생성
                 cur.execute("""
                     CREATE TABLE partition_table_info (
@@ -534,7 +541,8 @@ class TableCreator:
                 (partition_name,),
             )
 
-            table_exists = cursor.fetchone()[0]
+            exists_row = cursor.fetchone()
+            table_exists = bool(exists_row and exists_row[0])
 
             if not table_exists:
                 # 테이블 생성 (partition_table_info 동기화 포함)

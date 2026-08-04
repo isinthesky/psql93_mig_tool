@@ -4,6 +4,7 @@
 
 import time
 from datetime import timedelta
+from typing import Any
 
 
 class PerformanceMetrics:
@@ -20,15 +21,15 @@ class PerformanceMetrics:
         self.completed_partitions = 0
 
         # 현재 파티션 정보
-        self.current_partition = None
+        self.current_partition: str | None = None
         self.current_partition_rows = 0
         self.current_partition_total_rows = 0
-        self.current_partition_start_time = None
+        self.current_partition_start_time: float | None = None
 
         # 순간 속도 계산을 위한 윈도우
         self.window_size = 5  # 5초 윈도우
-        self.row_history = []  # (timestamp, rows) 튜플 리스트
-        self.byte_history = []  # (timestamp, bytes) 튜플 리스트
+        self.row_history: list[tuple[float, float]] = []  # (timestamp, rows)
+        self.byte_history: list[tuple[float, float]] = []  # (timestamp, bytes)
 
     def start_partition(self, partition_name: str, total_rows: int) -> None:
         """새 파티션 처리 시작"""
@@ -64,7 +65,7 @@ class PerformanceMetrics:
         self.current_partition_rows = 0
         self.current_partition_total_rows = 0
 
-    def get_stats(self) -> dict[str, any]:
+    def get_stats(self) -> dict[str, Any]:
         """현재 성능 통계 반환"""
         current_time = time.time()
         elapsed_seconds = current_time - self.start_time
@@ -80,14 +81,14 @@ class PerformanceMetrics:
         instant_mb_per_sec = self._calculate_instant_rate(self.byte_history) / (1024 * 1024)
 
         # 현재 파티션 진행률
-        partition_progress = 0
+        partition_progress = 0.0
         if self.current_partition_total_rows > 0:
             partition_progress = (
                 self.current_partition_rows / self.current_partition_total_rows
             ) * 100
 
         # 전체 진행률
-        total_progress = 0
+        total_progress = 0.0
         if self.total_partitions > 0:
             total_progress = (self.completed_partitions / self.total_partitions) * 100
 
@@ -121,7 +122,7 @@ class PerformanceMetrics:
             "current_partition_total_rows": self.current_partition_total_rows,
         }
 
-    def _calculate_instant_rate(self, history: list) -> float:
+    def _calculate_instant_rate(self, history: list[tuple[float, float]]) -> float:
         """순간 속도 계산 (최근 윈도우 기준)"""
         if len(history) < 2:
             return 0.0

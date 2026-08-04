@@ -119,7 +119,8 @@ class MigrationWorker(BaseMigrationWorker):
                 cur.execute(
                     sql.SQL("SELECT COUNT(*) FROM {}").format(sql.Identifier(partition_name))
                 )
-                total_rows = cur.fetchone()[0]
+                count_row = cur.fetchone()
+                total_rows = int(count_row[0]) if count_row else 0
 
             if total_rows == 0:
                 self._log(f"{partition_name} - 데이터 없음", "WARNING")
@@ -312,7 +313,11 @@ class MigrationWorker(BaseMigrationWorker):
 
         return rows_copied
 
-    def stop(self):
-        """중지 (오버라이드)"""
-        super().stop()
+    def stop(self, reason: str = "user_stop"):
+        """중지 (오버라이드)
+
+        기반 클래스와 시그니처를 맞춰야 stop(reason=...) 호출이 워커 종류에
+        상관없이 동작한다.
+        """
+        super().stop(reason=reason)
         self.is_interrupted = True

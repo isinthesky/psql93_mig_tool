@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import re
+import sys
 import uuid
 from dataclasses import asdict, dataclass, field, fields
 from datetime import date, datetime
@@ -192,7 +193,9 @@ class ArchiveManifestStore:
         """manifest 쓰기 직렬화를 위한 파일 락 획득. 실패 시 예외 발생."""
         self.ensure_archive()
         lock_fd = open(self._lock_path, "w")
-        if hasattr(os, "name") and os.name == "nt":
+        # os.name 대신 sys.platform 으로 분기해야 타입 체커가 플랫폼별 모듈
+        # (msvcrt / fcntl)을 각각 해당 플랫폼에서만 검사한다.
+        if sys.platform == "win32":
             import msvcrt
 
             msvcrt.locking(lock_fd.fileno(), msvcrt.LK_LOCK, 1)
