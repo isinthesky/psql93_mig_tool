@@ -19,6 +19,7 @@ from PySide6.QtWidgets import QApplication, QMessageBox
 
 from src.database.local_db import LocalDatabase
 from src.ui.main_window import MainWindow
+from src.ui.theme import build_stylesheet
 
 
 def get_resource_path(relative_path):
@@ -30,6 +31,10 @@ def get_resource_path(relative_path):
         base_path = os.path.abspath(".")
 
     return os.path.join(base_path, relative_path)
+
+
+# 전역 스타일은 src/ui/theme.py 의 디자인 토큰에서 생성한다.
+# (색/서체/간격을 한 곳에서만 정의하기 위해 이 파일의 APP_STYLE을 옮김)
 
 
 def initialize_application():
@@ -46,7 +51,7 @@ def initialize_application():
     app.setApplicationDisplayName("DB 마이그레이션 도구")
 
     # 다크 테마 적용
-    app.setStyleSheet(qdarkstyle.load_stylesheet(qt_api="pyside6"))
+    app.setStyleSheet(qdarkstyle.load_stylesheet(qt_api="pyside6") + build_stylesheet())
 
     # 애플리케이션 아이콘 설정
     icon_path = get_resource_path("resources/icons/app.ico")

@@ -5,7 +5,10 @@ from __future__ import annotations
 from pathlib import Path
 
 import psycopg
+from PySide6.QtCore import Qt
+from PySide6.QtGui import QCursor
 from PySide6.QtWidgets import (
+    QApplication,
     QCheckBox,
     QComboBox,
     QDialog,
@@ -27,10 +30,10 @@ from PySide6.QtWidgets import (
 from src.database.version_info import parse_version_string
 from src.models.profile import (
     ENDPOINT_KIND_FILE,
-    ENDPOINT_KIND_POSTGRES,
     ConnectionProfile,
 )
 from src.models.saved_connection import SavedConnectionManager
+from src.ui.widgets import StatusLamp
 from src.utils.validators import ConnectionValidator, VersionValidator
 
 from .connection_mapper import (
@@ -59,13 +62,15 @@ class ConnectionDialog(QDialog):
     def setup_ui(self):
         self.setWindowTitle("연결 편집" if self.is_edit_mode else "새 연결")
         self.setModal(True)
-        self.resize(620, 470)
+        self.resize(660, 540)
 
         layout = QVBoxLayout(self)
 
         name_layout = QHBoxLayout()
         name_layout.addWidget(QLabel("프로필 이름:"))
         self.name_edit = QLineEdit()
+        self.name_edit.setPlaceholderText("예: 운영DB → 검증DB")
+        self.name_edit.setToolTip("목록에서 구분하기 쉬운 연결 프로필 이름을 입력하세요.")
         name_layout.addWidget(self.name_edit)
         layout.addLayout(name_layout)
 
@@ -76,28 +81,18 @@ class ConnectionDialog(QDialog):
         self.tab_widget.addTab(self.target_tab, "대상")
         layout.addWidget(self.tab_widget)
 
+        # 저장/취소만 남긴다. 연결 테스트는 테스트하는 탭 안으로 옮겼다.
         button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         button_box.accepted.connect(self.accept)
         button_box.rejected.connect(self.reject)
 
-        self.test_source_btn = QPushButton("소스 테스트")
-        self.test_source_btn.clicked.connect(lambda: self.test_connection("source"))
-        button_box.addButton(self.test_source_btn, QDialogButtonBox.ActionRole)
+        ok_btn = button_box.button(QDialogButtonBox.Ok)
+        ok_btn.setText("저장")
+        ok_btn.setObjectName("primaryAction")
+        ok_btn.setToolTip("입력한 연결 정보를 확인한 뒤 프로필로 저장합니다.")
+        ok_btn.setDefault(True)
+        button_box.button(QDialogButtonBox.Cancel).setText("취소")
 
-        self.test_target_btn = QPushButton("대상 테스트")
-        self.test_target_btn.clicked.connect(lambda: self.test_connection("target"))
-        button_box.addButton(self.test_target_btn, QDialogButtonBox.ActionRole)
-
-        button_box.setStyleSheet(
-            """
-            QPushButton {
-                font-size: 16px;
-                padding: 10px 18px;
-                min-height: 40px;
-                font-weight: bold;
-            }
-            """
-        )
         layout.addWidget(button_box)
 
     def create_endpoint_tab(self, key: str, title: str) -> QWidget:
@@ -108,6 +103,7 @@ class ConnectionDialog(QDialog):
         kind_row.addWidget(QLabel("엔드포인트 종류:"))
         kind_combo = QComboBox()
         kind_combo.addItems(list(ENDPOINT_KIND_LABELS.values()))
+        kind_combo.setToolTip(f"{title} 엔드포인트가 PostgreSQL인지 File Archive인지 선택합니다.")
         kind_row.addWidget(kind_combo)
         kind_row.addStretch(1)
         layout.addLayout(kind_row)
@@ -120,19 +116,24 @@ class ConnectionDialog(QDialog):
         preset_row = QHBoxLayout()
         preset_combo = QComboBox()
         preset_combo.setMinimumWidth(300)
+        preset_combo.setToolTip("저장된 PostgreSQL 연결 정보를 불러와 입력값을 채웁니다.")
         preset_combo.addItem("저장된 연결 선택...")
         preset_combo.currentIndexChanged.connect(
             lambda idx, side=key: self._on_preset_selected(side, idx)
         )
         delete_preset_btn = QPushButton("삭제")
-        delete_preset_btn.setToolTip("선택한 프리셋 삭제")
+        delete_preset_btn.setToolTip("선택한 저장 연결만 삭제합니다. 현재 프로필이나 작업 이력은 삭제하지 않습니다.")
+        delete_preset_btn.setProperty("variant", "chip")
+        delete_preset_btn.setAutoDefault(False)
         delete_preset_btn.clicked.connect(lambda _=False, side=key: self._delete_selected_preset(side))
-        preset_row.addWidget(preset_combo)
+        # 콤보가 남는 폭을 가져간다. 안 그러면 '삭제'가 행 절반을 차지한다.
+        preset_row.addWidget(preset_combo, 1)
         preset_row.addWidget(delete_preset_btn)
         postgres_layout.addRow("저장된 연결:", preset_row)
 
         host_edit = QLineEdit()
-        host_edit.setPlaceholderText("localhost")
+        host_edit.setPlaceholderText("예: localhost 또는 192.168.0.10")
+        host_edit.setToolTip("PostgreSQL 서버 주소를 입력하세요.")
         postgres_layout.addRow("호스트:", host_edit)
 
         port_spin = QSpinBox()
@@ -141,19 +142,23 @@ class ConnectionDialog(QDialog):
         postgres_layout.addRow("포트:", port_spin)
 
         database_edit = QLineEdit()
-        database_edit.setPlaceholderText("데이터베이스명")
+        database_edit.setPlaceholderText("예: facreport")
+        database_edit.setToolTip("접속할 PostgreSQL 데이터베이스 이름을 입력하세요.")
         postgres_layout.addRow("데이터베이스:", database_edit)
 
         username_edit = QLineEdit()
-        username_edit.setPlaceholderText("사용자명")
+        username_edit.setPlaceholderText("예: postgres")
+        username_edit.setToolTip("PostgreSQL 접속 사용자명을 입력하세요.")
         postgres_layout.addRow("사용자명:", username_edit)
 
         password_edit = QLineEdit()
         password_edit.setEchoMode(QLineEdit.Password)
-        password_edit.setPlaceholderText("비밀번호")
+        password_edit.setPlaceholderText("비밀번호 입력")
+        password_edit.setToolTip("PostgreSQL 접속 비밀번호를 입력하세요. 저장 정책은 기존 설정을 따릅니다.")
         postgres_layout.addRow("비밀번호:", password_edit)
 
         ssl_check = QCheckBox("SSL 연결 사용")
+        ssl_check.setToolTip("서버가 SSL 접속을 요구할 때 선택하세요.")
         postgres_layout.addRow("", ssl_check)
 
         compat_combo = QComboBox()
@@ -169,18 +174,20 @@ class ConnectionDialog(QDialog):
         file_layout = QFormLayout(file_widget)
         archive_row = QHBoxLayout()
         archive_path_edit = QLineEdit()
-        archive_path_edit.setPlaceholderText("아카이브 폴더 경로")
+        archive_path_edit.setPlaceholderText("예: D:/backup/psql93_archive")
+        archive_path_edit.setToolTip("File Archive로 읽거나 쓸 폴더 경로를 지정하세요.")
         browse_btn = QPushButton("찾아보기")
+        browse_btn.setToolTip("아카이브 폴더를 파일 선택 창에서 지정합니다.")
         browse_btn.clicked.connect(lambda: self.browse_archive_path(key))
         archive_row.addWidget(archive_path_edit)
         archive_row.addWidget(browse_btn)
         file_layout.addRow("아카이브 경로:", archive_row)
 
         hint = QLabel(
-            "- 소스 File Archive: manifest.json 이 있는 폴더\n"
-            "- 대상 File Archive: 내보낼 새/기존 아카이브 폴더"
+            "- 소스 File Archive: manifest.json 이 있는 기존 아카이브 폴더\n"
+            "- 대상 File Archive: 내보낸 파일을 저장할 새/기존 폴더(필요 시 생성)"
         )
-        hint.setStyleSheet("color: #888888;")
+        hint.setProperty("role", "hint")
         hint.setWordWrap(True)
         file_layout.addRow("", hint)
 
@@ -189,9 +196,39 @@ class ConnectionDialog(QDialog):
         layout.addWidget(stacked)
         layout.addStretch(1)
 
+        # 테스트는 테스트할 대상 옆에서 하고, 결과도 그 자리에서 읽는다.
+        test_row = QHBoxLayout()
+        test_btn = QPushButton("연결 테스트")
+        test_btn.setToolTip(f"현재 입력한 {title} 연결 정보로 접속 가능 여부를 확인합니다.")
+        test_btn.setAutoDefault(False)
+        test_btn.clicked.connect(lambda _=False, side=key: self.test_connection(side))
+        test_row.addWidget(test_btn)
+
+        save_preset_btn = QPushButton("이 연결 저장")
+        save_preset_btn.setToolTip("확인된 연결 정보를 저장된 연결 목록에 추가합니다.")
+        save_preset_btn.setProperty("variant", "chip")
+        save_preset_btn.setAutoDefault(False)
+        save_preset_btn.setVisible(False)
+        save_preset_btn.clicked.connect(lambda _=False, side=key: self._save_preset_clicked(side))
+        test_row.addWidget(save_preset_btn)
+
+        result_lamp = StatusLamp()
+        result_lamp.set_state("idle", "아직 확인하지 않음")
+        test_row.addWidget(result_lamp)
+        test_row.addStretch(1)
+        layout.addLayout(test_row)
+
         kind_combo.currentIndexChanged.connect(
             lambda _idx, side=key: self.on_endpoint_kind_changed(side)
         )
+
+        # 입력을 고치면 직전 테스트 결과는 더 이상 이 설정에 대한 결과가 아니다.
+        # (저장은 '현재 위젯 값'을 읽고, 저장된 연결은 host/port/db/user/ssl 기준
+        #  upsert라 비밀번호만 고쳐 저장하면 검증된 프리셋을 덮어쓴다.)
+        for edit in (host_edit, database_edit, username_edit, password_edit, archive_path_edit):
+            edit.textChanged.connect(lambda _text, side=key: self._reset_test_result(side))
+        port_spin.valueChanged.connect(lambda _v, side=key: self._reset_test_result(side))
+        ssl_check.toggled.connect(lambda _c, side=key: self._reset_test_result(side))
 
         self.endpoint_widgets[key] = {
             "kind": kind_combo,
@@ -206,6 +243,9 @@ class ConnectionDialog(QDialog):
             "password": password_edit,
             "ssl": ssl_check,
             "compat_mode": compat_combo,
+            "test_btn": test_btn,
+            "save_preset_btn": save_preset_btn,
+            "result_lamp": result_lamp,
             "title": title,
         }
         self._refresh_presets(key)
@@ -249,6 +289,8 @@ class ConnectionDialog(QDialog):
         idx = w["compat_mode"].findText(mode_label)
         if idx >= 0:
             w["compat_mode"].setCurrentIndex(idx)
+        # 입력값이 바뀌었으니 이전 테스트 결과는 무효다.
+        self._reset_test_result(side)
 
     def _delete_selected_preset(self, side: str):
         combo = self.endpoint_widgets[side]["preset_combo"]
@@ -270,18 +312,36 @@ class ConnectionDialog(QDialog):
                 if other_side != side:
                     self._refresh_presets(other_side)
 
-    def _save_preset_on_success(self, side: str):
+    def _save_preset_clicked(self, side: str):
         config = self._get_endpoint_profile_config(side)
         if config.get("kind") == ENDPOINT_KIND_FILE:
             return
-        self.saved_conn_manager.save_connection(config)
+
+        widgets = self.endpoint_widgets[side]
+        try:
+            self.saved_conn_manager.save_connection(config)
+        except Exception as e:
+            widgets["result_lamp"].set_state("error", f"저장 실패: {e}")
+            return
+
         self._refresh_presets("source")
         self._refresh_presets("target")
+        widgets["save_preset_btn"].setVisible(False)
+        widgets["result_lamp"].set_state("ok", "저장된 연결에 추가했습니다")
 
     def on_endpoint_kind_changed(self, side: str):
         widgets = self.endpoint_widgets[side]
         kind = ConnectionMapper.endpoint_kind_from_ui(widgets["kind"])
         widgets["stack"].setCurrentIndex(1 if kind == ENDPOINT_KIND_FILE else 0)
+        # 종류를 바꾸면 이전 테스트 결과는 더 이상 이 입력에 대한 결과가 아니다.
+        self._reset_test_result(side)
+
+    def _reset_test_result(self, side: str):
+        widgets = self.endpoint_widgets.get(side)
+        if not widgets or "result_lamp" not in widgets:
+            return
+        widgets["result_lamp"].set_state("idle", "아직 확인하지 않음")
+        widgets["save_preset_btn"].setVisible(False)
 
     def load_profile_data(self):
         if not self.profile:
@@ -350,8 +410,17 @@ class ConnectionDialog(QDialog):
         }
 
     def test_connection(self, side: str):
+        """연결을 확인하고 결과를 그 탭 안에서 보여준다.
+
+        확인 결과는 창을 가로막는 대화상자가 아니라 입력값 옆에 남는다.
+        고쳐야 할 값과 결과를 한 화면에서 같이 볼 수 있다.
+        """
+        widgets = self.endpoint_widgets[side]
+        lamp = widgets["result_lamp"]
         config = self._get_endpoint_profile_config(side)
-        endpoint_title = self.endpoint_widgets[side]["title"]
+
+        lamp.set_state("busy", "확인 중...")
+        widgets["save_preset_btn"].setVisible(False)
 
         if config.get("kind") == ENDPOINT_KIND_FILE:
             must_exist = side == "source"
@@ -360,25 +429,16 @@ class ConnectionDialog(QDialog):
                 must_exist=must_exist,
             )
             if not valid:
-                QMessageBox.critical(self, "검증 실패", msg)
+                lamp.set_state("error", msg)
                 return
 
             path = Path(config["archive_path"]).expanduser()
-            if must_exist:
-                QMessageBox.information(
-                    self,
-                    "검증 성공",
-                    f"{endpoint_title} File Archive 경로를 확인했습니다.\n\n{path}",
-                )
-            else:
-                QMessageBox.information(
-                    self,
-                    "검증 성공",
-                    f"{endpoint_title} File Archive 출력 경로를 사용할 수 있습니다.\n\n{path}",
-                )
+            lamp.set_state(
+                "ok",
+                f"{'경로 확인됨' if must_exist else '출력 경로 사용 가능'} · {path}",
+            )
             return
 
-        widgets = self.endpoint_widgets[side]
         psycopg_config = ConnectionMapper.ui_to_psycopg_config(
             widgets["host"],
             widgets["port"],
@@ -388,6 +448,9 @@ class ConnectionDialog(QDialog):
             widgets["ssl"],
         )
 
+        widgets["test_btn"].setEnabled(False)
+        QApplication.setOverrideCursor(QCursor(Qt.WaitCursor))
+        QApplication.processEvents()  # '확인 중...'이 실제로 보이게 한 번 그린다
         try:
             with psycopg.connect(**psycopg_config, connect_timeout=7) as conn:
                 with conn.cursor() as cur:
@@ -395,28 +458,15 @@ class ConnectionDialog(QDialog):
                     version_str = cur.fetchone()[0]
                     version_info = parse_version_string(version_str)
         except Exception as e:
-            QMessageBox.critical(
-                self,
-                "연결 실패",
-                f"{endpoint_title} 연결에 실패했습니다:\n\n{str(e)}",
-            )
+            lamp.set_state("error", f"연결 실패 · {e}")
             return
+        finally:
+            QApplication.restoreOverrideCursor()
+            widgets["test_btn"].setEnabled(True)
 
-        reply = QMessageBox.question(
-            self,
-            "연결 성공",
-            f"{endpoint_title} PostgreSQL 연결에 성공했습니다.\n\n"
-            f"버전: {version_info}\n"
-            f"원본: {version_str}\n\n"
-            "이 연결 정보를 프리셋으로 저장하시겠습니까?",
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.Yes,
-        )
-        if reply == QMessageBox.Yes:
-            try:
-                self._save_preset_on_success(side)
-            except Exception:
-                pass
+        lamp.set_state("ok", f"연결됨 · {version_info}")
+        lamp.text_label.setToolTip(version_str)
+        widgets["save_preset_btn"].setVisible(True)
 
     def accept(self):
         name = self.name_edit.text().strip()

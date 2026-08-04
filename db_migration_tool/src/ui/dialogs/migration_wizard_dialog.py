@@ -14,13 +14,14 @@
 
 from __future__ import annotations
 
+import html
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 
 import psycopg2
 from psycopg2 import sql
-from PySide6.QtCore import QDate, QThread, Qt, QTimer, Signal
-from PySide6.QtGui import QTextCursor
+from PySide6.QtCore import QDate, Qt, QThread, QTimer, Signal
+from PySide6.QtGui import QColor, QTextCursor
 from PySide6.QtWidgets import (
     QButtonGroup,
     QCheckBox,
@@ -31,6 +32,7 @@ from PySide6.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QListWidget,
     QListWidgetItem,
     QMessageBox,
@@ -46,10 +48,16 @@ from PySide6.QtWidgets import (
 
 from src.core.copy_migration_worker import CopyMigrationWorker
 from src.core.partition_discovery import PartitionDiscovery
-from src.core.table_types import TableType, TABLE_TYPE_CONFIG, get_all_table_types
+from src.core.table_types import TABLE_TYPE_CONFIG, TableType, get_all_table_types
 from src.models.history import CheckpointManager, HistoryManager, MigrationHistoryItem
 from src.models.profile import ConnectionProfile
+from src.ui.theme import LOG_MAX_BLOCKS, TEXT_DANGER, TEXT_MUTED, log_color
+from src.ui.widgets import MetricReadout, StatusLamp, StepRail
 from src.utils.enhanced_logger import log_emitter
+
+# 화면에 그릴 파티션 최대 개수. 이보다 많으면 목록에 담기지 않고,
+# 담기지 않은 파티션은 실행 대상에서도 빠지므로 반드시 사용자에게 알린다.
+PARTITION_DISPLAY_LIMIT = 5000
 
 
 def to_qdate(d: date) -> QDate:
@@ -232,6 +240,16 @@ class RowCountVerificationWorker(QThread):
 class MigrationWizardDialog(QDialog):
     """COPY 중심 단계형 마이그레이션 마법사"""
 
+    # 실행 상태 → (램프, 표시 문구). 실행 페이지의 모든 버튼이 여기서 갈린다.
+    RUN_STATES = {
+        "idle": ("idle", "대기 중"),
+        "running": ("ok", "실행 중"),
+        "paused": ("busy", "일시정지"),
+        "done": ("ok", "완료"),
+        "stopped": ("busy", "중단됨"),
+        "failed": ("error", "오류"),
+    }
+
     def __init__(self, parent=None, profile: ConnectionProfile | None = None):
         super().__init__(parent)
         if profile is None:
@@ -249,6 +267,8 @@ class MigrationWizardDialog(QDialog):
 
         self.history_id: int | None = None
         self.resume_mode: bool = False
+        self.run_state: str = "idle"
+        self._frozen_selection: list[str] = []
 
         # 연결 상태
         self.source_connected = False
@@ -290,18 +310,19 @@ class MigrationWizardDialog(QDialog):
         self.setWindowTitle(f"마이그레이션 마법사 - {self.profile.name}")
         self.setModal(True)
         self.resize(1000, 850)
-        self.setStyleSheet(
-            "QPushButton { padding: 6px 14px; }"
-        )
 
         root = QVBoxLayout(self)
 
+        self.step_rail = StepRail(["연결 확인", "범위/파티션 선택", "실행"])
+        root.addWidget(self.step_rail)
+
         self.step_title = QLabel()
-        self.step_title.setStyleSheet("font-size: 18px; font-weight: bold;")
+        self.step_title.setProperty("role", "stepTitle")
         root.addWidget(self.step_title)
 
         self.step_hint = QLabel()
-        self.step_hint.setStyleSheet("color: #BBBBBB;")
+        self.step_hint.setProperty("role", "hint")
+        self.step_hint.setWordWrap(True)
         root.addWidget(self.step_hint)
 
         self.pages = QStackedWidget()
@@ -315,19 +336,30 @@ class MigrationWizardDialog(QDialog):
         self.pages.addWidget(self.page_scope)
         self.pages.addWidget(self.page_run)
 
+        # 확인(다음)을 오른쪽 끝에 두는 Windows 대화상자 관례를 따른다.
         nav = QHBoxLayout()
+        self.close_btn = QPushButton("닫기")
         self.back_btn = QPushButton("이전")
         self.next_btn = QPushButton("다음")
-        self.close_btn = QPushButton("닫기")
 
         self.back_btn.clicked.connect(self.go_back)
         self.next_btn.clicked.connect(self.go_next)
         self.close_btn.clicked.connect(self.close)
 
+        self.close_btn.setToolTip("마법사를 닫습니다. 실행 중에는 닫을 수 없습니다.")
+        self.back_btn.setToolTip("이전 단계로 돌아갑니다.")
+        self.next_btn.setToolTip("다음 단계로 이동합니다.")
+
+        # Enter가 엉뚱한 버튼을 누르지 않도록 기본 버튼을 '다음'으로 고정한다.
+        for btn in (self.close_btn, self.back_btn, self.next_btn):
+            btn.setAutoDefault(False)
+        self.next_btn.setAutoDefault(True)
+        self.next_btn.setDefault(True)
+
+        nav.addWidget(self.close_btn)
+        nav.addStretch(1)
         nav.addWidget(self.back_btn)
         nav.addWidget(self.next_btn)
-        nav.addStretch(1)
-        nav.addWidget(self.close_btn)
 
         root.addLayout(nav)
 
@@ -346,6 +378,11 @@ class MigrationWizardDialog(QDialog):
         actions.addWidget(self.recheck_btn)
         actions.addStretch(1)
         layout.addLayout(actions)
+
+        self.connection_hint = QLabel("")
+        self.connection_hint.setProperty("role", "hint")
+        self.connection_hint.setWordWrap(True)
+        layout.addWidget(self.connection_hint)
 
         # 미완료 작업(있을 때만)
         self.incomplete_group = QGroupBox("미완료 작업")
@@ -368,12 +405,9 @@ class MigrationWizardDialog(QDialog):
 
         layout.addWidget(self.incomplete_group)
 
-        tip = QLabel(
-            "1) 연결 확인 → 2) 범위/파티션 선택 → 3) 실행 순서로 진행합니다.\n"
-            "연결이 둘 다 성공해야 다음 단계로 넘어갈 수 있습니다."
-        )
+        tip = QLabel("소스와 대상이 모두 연결되어야 다음 단계로 넘어갈 수 있습니다.")
         tip.setWordWrap(True)
-        tip.setStyleSheet("color: #AAAAAA;")
+        tip.setProperty("role", "hint")
         layout.addWidget(tip)
 
         layout.addStretch(1)
@@ -392,6 +426,7 @@ class MigrationWizardDialog(QDialog):
         page = QWidget()
         layout = QVBoxLayout(page)
 
+        layout.addWidget(self._create_run_state_rail())
         layout.addWidget(self._create_run_summary_group())
         layout.addWidget(self._create_progress_group())
         layout.addWidget(self._create_log_group(), 1)
@@ -399,46 +434,45 @@ class MigrationWizardDialog(QDialog):
 
         return page
 
+    def _create_run_state_rail(self) -> QWidget:
+        """실행 상태를 연결 상태와 같은 램프 언어로 읽게 한다."""
+        rail = QFrame()
+        rail.setObjectName("statusRail")
+        layout = QHBoxLayout(rail)
+        layout.setContentsMargins(12, 10, 12, 10)
+
+        self.run_lamp = StatusLamp("작업 상태")
+        self.run_lamp.set_state("idle", "대기 중")
+        layout.addWidget(self.run_lamp)
+        layout.addStretch(1)
+
+        self.run_detail_label = QLabel("")
+        self.run_detail_label.setProperty("role", "muted")
+        layout.addWidget(self.run_detail_label)
+        return rail
+
     # ----------------------------
     # Common widgets
     # ----------------------------
 
     def _create_connection_status_widget(self) -> QWidget:
-        widget = QWidget()
-        layout = QHBoxLayout(widget)
-        layout.setContentsMargins(10, 8, 10, 8)
+        # QFrame + objectName 선택자를 쓴다. `QWidget {...}` 선택자는 자식 QLabel까지
+        # 매칭되어 라벨마다 테두리가 그려지므로 쓰지 않는다.
+        rail = QFrame()
+        rail.setObjectName("statusRail")
+        layout = QHBoxLayout(rail)
+        layout.setContentsMargins(12, 10, 12, 10)
 
-        def mk_block(title: str):
-            title_label = QLabel(f"{title}:")
-            title_label.setStyleSheet("font-weight: bold;")
-            icon = QLabel("●")
-            icon.setStyleSheet("color: #FFFF00; font-size: 16px;")
-            text = QLabel("확인 중...")
-            text.setStyleSheet("color: #DDDDDD;")
-            return title_label, icon, text
+        self.source_lamp = StatusLamp("소스 DB")
+        self.target_lamp = StatusLamp("대상 DB")
+        self.source_lamp.set_state("busy", "확인 중...")
+        self.target_lamp.set_state("busy", "확인 중...")
 
-        s_title, self.source_status_icon, self.source_status_text = mk_block("소스 DB")
-        t_title, self.target_status_icon, self.target_status_text = mk_block("대상 DB")
-
-        layout.addWidget(s_title)
-        layout.addWidget(self.source_status_icon)
-        layout.addWidget(self.source_status_text)
+        layout.addWidget(self.source_lamp)
         layout.addSpacing(30)
-        layout.addWidget(t_title)
-        layout.addWidget(self.target_status_icon)
-        layout.addWidget(self.target_status_text)
+        layout.addWidget(self.target_lamp)
         layout.addStretch(1)
-
-        widget.setStyleSheet(
-            """
-            QWidget {
-                background-color: #2b2b2b;
-                border: 1px solid #444;
-                border-radius: 6px;
-            }
-            """
-        )
-        return widget
+        return rail
 
     # ----------------------------
     # Step 2 widgets
@@ -491,9 +525,10 @@ class MigrationWizardDialog(QDialog):
         row_opts.addSpacing(20)
         row_opts.addWidget(QLabel("COPY 모드:"))
         self.copy_mode_combo = QComboBox()
+        # 항목은 이름만, 설명은 툴팁으로. 문장을 넣으면 콤보가 한 줄을 다 먹는다.
         self.copy_mode_combo.addItems(
             [
-                "AUTO (권장: 빠른 방식 시도 후 실패 시 Python fallback)",
+                "AUTO (권장)",
                 "Python COPY (재개 가능)",
                 "Server-side COPY (빠름, 재개 불가)",
             ]
@@ -511,7 +546,8 @@ class MigrationWizardDialog(QDialog):
         settings_layout.addLayout(row_opts)
 
         self.server_copy_warning = QLabel("⚠ Server-side COPY는 재개 모드에서 사용할 수 없습니다.")
-        self.server_copy_warning.setStyleSheet("color: #FF6600;")
+        self.server_copy_warning.setProperty("role", "lampText")
+        self.server_copy_warning.setProperty("state", "busy")
         self.server_copy_warning.setVisible(False)
         settings_layout.addWidget(self.server_copy_warning)
 
@@ -542,10 +578,15 @@ class MigrationWizardDialog(QDialog):
         self.preset_yesterday_btn.clicked.connect(lambda: self._set_preset_days(1, yesterday=True))
         self.preset_7d_btn.clicked.connect(lambda: self._set_preset_days(7))
         self.preset_30d_btn.clicked.connect(lambda: self._set_preset_days(30))
-        preset.addWidget(self.preset_today_btn)
-        preset.addWidget(self.preset_yesterday_btn)
-        preset.addWidget(self.preset_7d_btn)
-        preset.addWidget(self.preset_30d_btn)
+        for btn in (
+            self.preset_today_btn,
+            self.preset_yesterday_btn,
+            self.preset_7d_btn,
+            self.preset_30d_btn,
+        ):
+            btn.setProperty("variant", "chip")
+            btn.setAutoDefault(False)
+            preset.addWidget(btn)
         preset.addStretch(1)
         date_layout.addLayout(preset)
 
@@ -557,14 +598,19 @@ class MigrationWizardDialog(QDialog):
 
         row_actions = QHBoxLayout()
         self.discover_btn = QPushButton("파티션 찾기")
+        self.discover_btn.setObjectName("primaryAction")
+        self.discover_btn.setToolTip("선택한 항목과 날짜 범위에 해당하는 소스 파티션을 찾습니다.")
+        self.discover_btn.setAutoDefault(False)
         self.discover_btn.clicked.connect(self.discover_partitions)
         self.check_completed_btn = QPushButton("완료여부 확인(대상 DB)")
+        self.check_completed_btn.setToolTip("대상 DB에 이미 데이터가 있는 파티션을 표시합니다.")
+        self.check_completed_btn.setAutoDefault(False)
         self.check_completed_btn.clicked.connect(self.check_target_completed)
         self.check_completed_btn.setEnabled(False)
         row_actions.addWidget(self.discover_btn)
         row_actions.addWidget(self.check_completed_btn)
         self.discover_status = QLabel("날짜/항목을 선택하고 ‘파티션 찾기’를 눌러주세요.")
-        self.discover_status.setStyleSheet("color: #AAAAAA;")
+        self.discover_status.setProperty("role", "hint")
         row_actions.addWidget(self.discover_status)
         row_actions.addStretch(1)
         action_layout.addLayout(row_actions)
@@ -581,10 +627,21 @@ class MigrationWizardDialog(QDialog):
         self.select_all_btn.clicked.connect(lambda: self._bulk_check(True))
         self.select_none_btn.clicked.connect(lambda: self._bulk_check(False))
         self.select_pending_btn.clicked.connect(self._select_excluding_completed)
-        row_select.addWidget(self.select_all_btn)
-        row_select.addWidget(self.select_none_btn)
-        row_select.addWidget(self.select_pending_btn)
-        row_select.addStretch(1)
+        for btn in (self.select_all_btn, self.select_none_btn, self.select_pending_btn):
+            btn.setProperty("variant", "chip")
+            btn.setAutoDefault(False)
+            row_select.addWidget(btn)
+
+        row_select.addSpacing(16)
+        self.partition_filter = QLineEdit()
+        self.partition_filter.setPlaceholderText("이름으로 거르기 (예: 20260801)")
+        self.partition_filter.setToolTip(
+            "입력한 문자열이 들어간 파티션만 목록에 보여줍니다. "
+            "선택 상태는 그대로 유지되고, 전체 선택/해제는 보이는 항목에만 적용됩니다."
+        )
+        self.partition_filter.setClearButtonEnabled(True)
+        self.partition_filter.textChanged.connect(self._apply_partition_filter)
+        row_select.addWidget(self.partition_filter, 1)
         action_layout.addLayout(row_select)
 
         layout.addWidget(action_group)
@@ -596,14 +653,17 @@ class MigrationWizardDialog(QDialog):
         layout = QVBoxLayout(group)
 
         self.partition_list = QListWidget()
+        self.partition_list.setObjectName("partitionList")
+        self.partition_list.setUniformItemSizes(True)
         layout.addWidget(self.partition_list)
 
         info = QHBoxLayout()
         self.partition_count_label = QLabel("총 0개")
         self.partition_rows_label = QLabel("총 0 rows")
         self.partition_selected_label = QLabel("선택 0개")
-        self.partition_count_label.setStyleSheet("font-weight: bold;")
-        self.partition_selected_label.setStyleSheet("font-weight: bold;")
+        self.partition_count_label.setProperty("role", "fieldTitle")
+        self.partition_selected_label.setProperty("role", "fieldTitle")
+        self.partition_rows_label.setProperty("role", "muted")
 
         info.addWidget(self.partition_count_label)
         info.addSpacing(20)
@@ -611,6 +671,11 @@ class MigrationWizardDialog(QDialog):
         info.addSpacing(20)
         info.addWidget(self.partition_rows_label)
         info.addStretch(1)
+
+        # 색이 아니라 모양으로 구분한다(흑백 화면·색약 환경에서도 읽힌다).
+        legend = QLabel("●  실행 대상        ✓  이미 완료된 것으로 보임(기본 해제)")
+        legend.setProperty("role", "hint")
+        info.addWidget(legend)
 
         layout.addLayout(info)
         return group
@@ -620,9 +685,10 @@ class MigrationWizardDialog(QDialog):
     # ----------------------------
 
     def _create_run_summary_group(self) -> QGroupBox:
-        group = QGroupBox("3/3 실행 요약")
+        group = QGroupBox("실행 요약")
         layout = QVBoxLayout(group)
         self.summary_label = QLabel("")
+        self.summary_label.setProperty("role", "summary")
         self.summary_label.setWordWrap(True)
         layout.addWidget(self.summary_label)
         return group
@@ -636,6 +702,7 @@ class MigrationWizardDialog(QDialog):
         self.total_progress = QProgressBar()
         total_row.addWidget(self.total_progress)
         self.total_label = QLabel("0 / 0")
+        self.total_label.setProperty("role", "metricValue")
         total_row.addWidget(self.total_label)
         layout.addLayout(total_row)
 
@@ -643,19 +710,25 @@ class MigrationWizardDialog(QDialog):
         cur_row.addWidget(QLabel("현재:"))
         self.current_progress = QProgressBar()
         cur_row.addWidget(self.current_progress)
-        self.current_label = QLabel("대기중")
+        self.current_label = QLabel("대기 중")
+        self.current_label.setProperty("role", "metricValue")
         cur_row.addWidget(self.current_label)
         layout.addLayout(cur_row)
 
+        # 계기 묶음: 값은 고정폭이라 실행 중에도 자릿수가 흔들리지 않는다.
         info = QHBoxLayout()
-        self.speed_label = QLabel("처리 속도: 0 rows/sec")
-        self.data_rate_label = QLabel("전송 속도: 0 MB/sec")
-        self.eta_label = QLabel("예상 완료: 계산중...")
-        self.elapsed_label = QLabel("경과 시간: 00:00:00")
-        info.addWidget(self.speed_label)
-        info.addWidget(self.data_rate_label)
-        info.addWidget(self.eta_label)
-        info.addWidget(self.elapsed_label)
+        info.setSpacing(28)
+        self.speed_metric = MetricReadout("처리 속도")
+        self.data_rate_metric = MetricReadout("전송 속도")
+        self.eta_metric = MetricReadout("예상 완료")
+        self.elapsed_metric = MetricReadout("경과 시간", "00:00:00")
+        for metric in (
+            self.speed_metric,
+            self.data_rate_metric,
+            self.eta_metric,
+            self.elapsed_metric,
+        ):
+            info.addWidget(metric)
         info.addStretch(1)
         layout.addLayout(info)
 
@@ -665,32 +738,27 @@ class MigrationWizardDialog(QDialog):
         group = QGroupBox("실행 로그")
         layout = QVBoxLayout(group)
         self.log_text = QTextEdit()
+        self.log_text.setObjectName("runLog")
         self.log_text.setReadOnly(True)
+        self.log_text.setPlaceholderText("작업을 시작하면 실행 로그가 여기에 표시됩니다.")
+        # 장시간 실행에서 로그가 메모리를 계속 먹지 않도록 상한을 둔다.
+        self.log_text.document().setMaximumBlockCount(LOG_MAX_BLOCKS)
         layout.addWidget(self.log_text)
         return group
 
     def _create_run_controls(self) -> QWidget:
+        # 한 줄에 '채워진' 버튼은 시작 하나뿐이다. 나머지는 조용히 둔다.
         w = QWidget()
         layout = QHBoxLayout(w)
         layout.setContentsMargins(0, 0, 0, 0)
 
-        # 실행 액션 그룹
         self.start_btn = QPushButton("시작")
-        self.start_btn.setStyleSheet(
-            "QPushButton { background-color: #2d7d46; color: white; font-weight: bold;"
-            " padding: 8px 20px; border-radius: 4px; }"
-            "QPushButton:hover { background-color: #359952; }"
-            "QPushButton:disabled { background-color: #555; color: #999; }"
-        )
+        self.start_btn.setObjectName("startButton")
+        self.start_btn.setToolTip("선택한 파티션으로 COPY 마이그레이션을 시작합니다.")
         self.start_btn.clicked.connect(self.start_migration)
 
         self.pause_btn = QPushButton("일시정지")
-        self.pause_btn.setStyleSheet(
-            "QPushButton { background-color: #c48800; color: white;"
-            " padding: 8px 16px; border-radius: 4px; }"
-            "QPushButton:hover { background-color: #d69a00; }"
-            "QPushButton:disabled { background-color: #555; color: #999; }"
-        )
+        self.pause_btn.setToolTip("진행 중인 작업을 잠시 멈추거나 다시 진행합니다.")
         self.pause_btn.clicked.connect(self.pause_migration)
         self.pause_btn.setEnabled(False)
 
@@ -698,23 +766,25 @@ class MigrationWizardDialog(QDialog):
         layout.addWidget(self.pause_btn)
 
         self.verify_btn = QPushButton("검증 실행")
-        self.verify_btn.setToolTip("선택된 파티션에 대해 소스/대상 COUNT(*)로 row_count 일치 여부를 검증합니다(시간이 오래 걸릴 수 있음).")
+        self.verify_btn.setToolTip(
+            "실행한 파티션의 소스/대상 행 수를 COUNT(*)로 비교합니다. 시간이 오래 걸릴 수 있습니다."
+        )
         self.verify_btn.clicked.connect(self.run_rowcount_verification)
-        self.verify_btn.setEnabled(True)
+        self.verify_btn.setEnabled(False)
         layout.addWidget(self.verify_btn)
 
         # 파괴적 액션 분리
         layout.addStretch(1)
 
-        self.cancel_btn = QPushButton("취소")
-        self.cancel_btn.setStyleSheet(
-            "QPushButton { background-color: #c0392b; color: white; font-weight: bold;"
-            " padding: 8px 20px; border-radius: 4px; }"
-            "QPushButton:hover { background-color: #e74c3c; }"
-            "QPushButton:disabled { background-color: #555; color: #999; }"
-        )
+        self.cancel_btn = QPushButton("작업 취소")
+        self.cancel_btn.setObjectName("dangerAction")
+        self.cancel_btn.setToolTip("진행 중인 작업을 멈춥니다. 완료된 파티션은 그대로 남습니다.")
         self.cancel_btn.clicked.connect(self.cancel_migration)
+        self.cancel_btn.setEnabled(False)
         layout.addWidget(self.cancel_btn)
+
+        for btn in (self.start_btn, self.pause_btn, self.verify_btn, self.cancel_btn):
+            btn.setAutoDefault(False)
 
         return w
 
@@ -735,6 +805,15 @@ class MigrationWizardDialog(QDialog):
             self.pages.setCurrentIndex(1)
             self._load_last_completed_partitions_cache()
         elif idx == 1:
+            # 재개 모드의 실행 대상은 미완료 체크포인트지 목록의 체크 상태가 아니다.
+            # 여기서 목록 선택을 요구하면 재개 → 이전 → 다음에서 실행 페이지로
+            # 영영 못 돌아간다(목록은 탐색한 적이 없어 비어 있다).
+            if self.resume_mode and self._frozen_selection:
+                self.pages.setCurrentIndex(2)
+                self._update_step_ui()
+                self._update_nav_state()
+                return
+
             selected = self.get_selected_partition_names()
             if not selected:
                 QMessageBox.warning(self, "선택 필요", "실행할 파티션을 1개 이상 선택하세요.")
@@ -747,21 +826,37 @@ class MigrationWizardDialog(QDialog):
 
     def _update_step_ui(self):
         idx = self.pages.currentIndex()
-        titles = ["1/3 연결 확인", "2/3 범위/파티션 선택", "3/3 실행"]
+        titles = ["연결 확인", "범위/파티션 선택", "실행"]
         hints = [
-            "소스/대상 DB 연결 상태를 확인합니다.",
-            "날짜/항목을 선택하고 파티션을 탐색한 후, 일부만 체크해서 실행할 수 있습니다.",
-            "COPY 마이그레이션을 실행하고 진행/로그를 확인합니다.",
+            "소스와 대상 DB에 접속할 수 있는지 확인합니다.",
+            "날짜와 항목을 고른 뒤 파티션을 찾고, 실행할 파티션만 체크합니다.",
+            "COPY 마이그레이션을 실행하고 진행 상황과 로그를 확인합니다.",
         ]
+        self.step_rail.set_current(idx)
         self.step_title.setText(titles[idx])
         self.step_hint.setText(hints[idx])
 
         if idx == 2:
             self._refresh_summary()
 
+    def _is_running(self) -> bool:
+        if self.run_state in ("running", "paused"):
+            return True
+        return bool(self.worker and getattr(self.worker, "is_running", False))
+
     def _update_nav_state(self):
         idx = self.pages.currentIndex()
-        self.back_btn.setEnabled(idx > 0)
+        running = self._is_running()
+
+        # 한 번 실행을 시작한 마법사는 그 실행에 묶인다. 여기서 범위를 다시 고르면
+        # '되돌아가서 고른 선택'과 '이미 만들어진 작업 이력'이 어긋난다.
+        run_page_locked = idx == 2 and self.run_state != "idle"
+        self.back_btn.setEnabled(idx > 0 and not running and not run_page_locked)
+        self.back_btn.setToolTip(
+            "이미 실행한 작업입니다. 다른 범위로 실행하려면 창을 닫고 다시 여세요."
+            if run_page_locked
+            else "이전 단계로 돌아갑니다."
+        )
 
         if idx == 0:
             self.next_btn.setText("다음")
@@ -770,22 +865,49 @@ class MigrationWizardDialog(QDialog):
         elif idx == 1:
             self.next_btn.setText("다음")
             self.next_btn.setVisible(True)
-            self.next_btn.setEnabled(len(self.get_selected_partition_names()) > 0)
+            # 재개 모드는 목록이 아니라 미완료 체크포인트가 실행 대상이다.
+            has_target = bool(self.resume_mode and self._frozen_selection) or bool(
+                self.get_selected_partition_names()
+            )
+            self.next_btn.setEnabled(has_target)
         else:
-            # Page 2: 실행 페이지에서는 네비게이션 "다음" 불필요
+            # 실행 페이지에서는 네비게이션 "다음"이 필요 없다.
             self.next_btn.setVisible(False)
 
-        # 실행 중: 이동/닫기 제한
-        if self.worker and getattr(self.worker, "is_running", False):
-            self.back_btn.setEnabled(False)
-            self.next_btn.setEnabled(False)
-            self.close_btn.setEnabled(False)
-            if hasattr(self, "verify_btn"):
-                self.verify_btn.setEnabled(False)
+        self.close_btn.setEnabled(not running)
+
+    def _set_run_state(self, state: str, detail: str = ""):
+        """실행 페이지의 상태를 한 곳에서 정한다.
+
+        버튼 활성화를 여기저기서 따로 건드리면 '취소했는데 시작도 못 누르는'
+        막다른 상태가 생긴다. 상태 하나가 램프·버튼·안내를 모두 결정하게 한다.
+        """
+        lamp, text = self.RUN_STATES.get(state, self.RUN_STATES["idle"])
+        self.run_state = state
+        self.run_lamp.set_state(lamp, text)
+        self.run_detail_label.setText(detail)
+
+        running = state in ("running", "paused")
+        has_history = self.history_id is not None
+
+        start_labels = {"stopped": "이어서 시작", "failed": "다시 시도"}
+        self.start_btn.setText(start_labels.get(state, "시작"))
+        self.start_btn.setEnabled(state in ("idle", "stopped", "failed"))
+
+        self.pause_btn.setEnabled(running)
+        self.pause_btn.setText("재개" if state == "paused" else "일시정지")
+
+        self.cancel_btn.setEnabled(running)
+        self.verify_btn.setEnabled(has_history and not running)
+
+        if state == "done":
+            self.start_btn.setToolTip("완료된 작업입니다. 새로 실행하려면 창을 닫고 다시 시작하세요.")
+        elif state == "stopped":
+            self.start_btn.setToolTip("중단된 지점부터 미완료 파티션만 이어서 실행합니다.")
         else:
-            self.close_btn.setEnabled(True)
-            if hasattr(self, "verify_btn"):
-                self.verify_btn.setEnabled(self.history_id is not None)
+            self.start_btn.setToolTip("선택한 파티션으로 COPY 마이그레이션을 시작합니다.")
+
+        self._update_nav_state()
 
     # ============================
     # Connection check
@@ -810,32 +932,47 @@ class MigrationWizardDialog(QDialog):
         self.connection_checker.start()
 
     def _on_connection_checking(self):
-        self.source_status_icon.setStyleSheet("color: #FFFF00; font-size: 16px;")
-        self.source_status_text.setText("확인 중...")
-        self.target_status_icon.setStyleSheet("color: #FFFF00; font-size: 16px;")
-        self.target_status_text.setText("확인 중...")
+        self.source_lamp.set_state("busy", "확인 중...")
+        self.target_lamp.set_state("busy", "확인 중...")
+        self.connection_hint.setText("")
 
     def _on_source_connection_status(self, connected: bool, message: str):
         self.source_connected = connected
         self.source_status_message = message
         if connected:
-            self.source_status_icon.setStyleSheet("color: #00FF00; font-size: 16px;")
-            self.source_status_text.setText("연결됨")
+            self.source_lamp.set_state("ok", "연결됨")
         else:
-            self.source_status_icon.setStyleSheet("color: #FF0000; font-size: 16px;")
-            self.source_status_text.setText(message)
+            self.source_lamp.set_state("error", message)
+        self._update_connection_hint()
         self._update_nav_state()
 
     def _on_target_connection_status(self, connected: bool, message: str):
         self.target_connected = connected
         self.target_status_message = message
         if connected:
-            self.target_status_icon.setStyleSheet("color: #00FF00; font-size: 16px;")
-            self.target_status_text.setText("연결됨")
+            self.target_lamp.set_state("ok", "연결됨")
         else:
-            self.target_status_icon.setStyleSheet("color: #FF0000; font-size: 16px;")
-            self.target_status_text.setText(message)
+            self.target_lamp.set_state("error", message)
+        self._update_connection_hint()
         self._update_nav_state()
+
+    def _update_connection_hint(self):
+        """연결이 막혔을 때 다음에 뭘 해야 하는지를 그 자리에서 알려준다."""
+        failed = []
+        if not self.source_connected:
+            failed.append("소스")
+        if not self.target_connected:
+            failed.append("대상")
+
+        if not failed:
+            self.connection_hint.setText("")
+            return
+
+        self.connection_hint.setText(
+            f"{' · '.join(failed)} 연결에 실패했습니다. "
+            "주소·포트·계정을 확인한 뒤 '연결 다시 확인'을 누르세요. "
+            "연결 정보는 메인 창의 '편집'에서 고칠 수 있습니다."
+        )
 
     # ============================
     # Step 1: resume
@@ -873,6 +1010,33 @@ class MigrationWizardDialog(QDialog):
         self.select_none_btn.setEnabled(False)
         self.select_pending_btn.setEnabled(False)
 
+    def _unlock_options_for_new_run(self):
+        """재개용 잠금을 되돌린다.
+
+        '이어서 진행'을 눌렀다가 '새 작업으로 진행'으로 마음을 바꾸면
+        옵션이 잠긴 채로 남아 범위를 다시 고를 수 없게 된다.
+        """
+        self.stop_on_error_radio.setEnabled(True)
+        self.skip_on_error_radio.setEnabled(True)
+        self.copy_mode_combo.setEnabled(True)
+        self.start_date_edit.setEnabled(True)
+        self.end_date_edit.setEnabled(True)
+        self.discover_btn.setEnabled(True)
+        self.check_completed_btn.setEnabled(bool(self.discovered_partitions))
+        self.select_all_btn.setEnabled(True)
+        self.select_none_btn.setEnabled(True)
+        self.select_pending_btn.setEnabled(True)
+        # 배치 크기는 COPY 모드에 따라 달라지므로 그 규칙에 맡긴다.
+        self._on_copy_mode_changed(self.copy_mode_combo.currentIndex())
+        # 체크박스는 '마지막 하나' 규칙이 다시 정한다.
+        self._guard_last_table_type()
+
+    def _force_python_copy_for_resume(self):
+        """재개는 Python COPY만 가능하다(server-side는 중단 지점을 못 잡는다)."""
+        self.copy_mode_combo.setCurrentIndex(1)  # Python COPY (재개 가능)
+        self.copy_mode = "python"
+        self.server_copy_warning.setVisible(False)
+
     def _on_resume_clicked(self):
         if not self._incomplete_history:
             return
@@ -892,11 +1056,7 @@ class MigrationWizardDialog(QDialog):
         # 재개 모드에서는 옵션 변경 불가
         self._lock_options_for_resume()
 
-        # 재개 시 copy 모드 강제: Python (재개 가능)
-        if hasattr(self, "copy_mode_combo"):
-            self.copy_mode_combo.setCurrentIndex(1)  # Python COPY
-        self.copy_mode = "python"
-        self.server_copy_warning.setVisible(False)
+        self._force_python_copy_for_resume()
 
         pending = self.checkpoint_manager.get_pending_checkpoints(self.history_id)
         pending_names = [cp.partition_name for cp in pending]
@@ -907,14 +1067,21 @@ class MigrationWizardDialog(QDialog):
         # 실행 페이지로 이동
         self.pages.setCurrentIndex(2)
         self._update_step_ui()
-        self._update_nav_state()
+        self._set_run_state("idle", f"재개 대기 · 미완료 파티션 {len(pending_names)}개")
 
         self.add_log(f"재개 모드: 미완료 파티션 {len(pending_names)}개", "INFO")
 
     def _on_new_run_clicked(self):
+        # 아무것도 알려주지 않는 확인 창 대신, 그 자리에서 상태를 바꾼다.
         self.resume_mode = False
         self.history_id = None
-        QMessageBox.information(self, "안내", "새 작업으로 진행합니다. 다음 단계에서 범위를 선택해주세요.")
+        self._frozen_selection = []
+        self._unlock_options_for_new_run()
+        self._set_run_state("idle")
+        self.incomplete_group.setVisible(False)
+        self.connection_hint.setText(
+            "새 작업으로 진행합니다. 다음 단계에서 날짜와 파티션을 선택하세요."
+        )
 
     # ============================
     # Step 2: discovery & completed checks
@@ -938,11 +1105,22 @@ class MigrationWizardDialog(QDialog):
         self.selected_table_types = [
             tt for tt, cb in self.table_type_checkboxes.items() if cb.isChecked()
         ]
-        if not self.selected_table_types:
-            sender = self.sender()
-            if isinstance(sender, QCheckBox):
-                sender.setChecked(True)
-            QMessageBox.warning(self, "선택 오류", "최소 1개의 테이블 타입을 선택해야 합니다.")
+        self._guard_last_table_type()
+
+    def _guard_last_table_type(self):
+        """마지막 하나 남은 항목은 아예 끌 수 없게 한다.
+
+        경고 창을 띄워 되돌리는 대신, 잘못된 상태로 갈 수 없게 막는다.
+        """
+        only_one = sum(1 for cb in self.table_type_checkboxes.values() if cb.isChecked()) == 1
+        for table_type, cb in self.table_type_checkboxes.items():
+            lock = only_one and cb.isChecked()
+            cb.setEnabled(not lock and not self.resume_mode)
+            cb.setToolTip(
+                "최소 1개 항목은 선택되어 있어야 합니다."
+                if lock
+                else TABLE_TYPE_CONFIG[table_type].description
+            )
 
     def _on_error_strategy_changed(self, _checked: bool):
         self.error_strategy = "stop" if self.stop_on_error_radio.isChecked() else "skip"
@@ -1053,64 +1231,96 @@ class MigrationWizardDialog(QDialog):
         self._update_counts()
         self._update_nav_state()
 
+    def _is_completed_like(self, table_name: str) -> bool:
+        return (table_name in self._completed_from_history) or bool(
+            self._target_has_data.get(table_name)
+        )
+
     def _render_partition_list(self):
         self.partition_list.clear()
-        display_limit = 2000
+        muted = QColor(TEXT_MUTED)
 
-        for s in self.discovered_partitions[:display_limit]:
+        # addItem마다 itemChanged가 튀면 항목 수의 제곱만큼 갱신이 돈다.
+        # 수천 개를 그릴 때 창이 멈추는 원인이므로 그리는 동안은 막아둔다.
+        self.partition_list.blockSignals(True)
+        try:
+            self._fill_partition_items(muted)
+        finally:
+            self.partition_list.blockSignals(False)
+
+        self._apply_partition_filter(self.partition_filter.text())
+
+    def _fill_partition_items(self, muted: QColor):
+        for s in self.discovered_partitions[:PARTITION_DISPLAY_LIMIT]:
             cfg = TABLE_TYPE_CONFIG.get(s.table_type)
-            prefix = f"[{cfg.display_name}] " if cfg else ""
+            type_name = cfg.display_name if cfg else s.table_type
 
-            status_tags: list[str] = []
-            if s.table_name in self._completed_from_history:
-                status_tags.append("이전완료")
-            if self._target_has_data.get(s.table_name):
-                status_tags.append("대상데이터")
-
-            tag_text = f" [{'|'.join(status_tags)}]" if status_tags else ""
-            text = f"{prefix}{s.table_name} ({s.row_count:,} rows){tag_text}"
+            completed_like = self._is_completed_like(s.table_name)
+            # 상태는 색이 아니라 맨 앞의 모양으로 먼저 읽힌다.
+            marker = "✓" if completed_like else "●"
+            text = f"{marker}  {s.table_name}  ·  {s.row_count:,} rows  ·  {type_name}"
 
             item = QListWidgetItem(text)
             item.setData(Qt.UserRole, s.table_name)
             item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
 
             # 기본 체크: 완료로 판단되면 기본 해제, 그 외 체크
-            is_completed_like = (s.table_name in self._completed_from_history) or bool(
-                self._target_has_data.get(s.table_name)
-            )
-            item.setCheckState(Qt.Unchecked if is_completed_like else Qt.Checked)
+            item.setCheckState(Qt.Unchecked if completed_like else Qt.Checked)
 
-            if is_completed_like:
-                item.setForeground(Qt.gray)
-                item.setToolTip("이미 완료된 것으로 보입니다. 다시 실행하려면 체크하세요.")
+            if completed_like:
+                reasons = []
+                if s.table_name in self._completed_from_history:
+                    reasons.append("이전 작업에서 완료됨")
+                if self._target_has_data.get(s.table_name):
+                    reasons.append("대상 DB에 데이터 있음")
+                item.setForeground(muted)
+                item.setToolTip(
+                    f"{' · '.join(reasons)}\n다시 실행하려면 체크하세요."
+                )
+            else:
+                item.setToolTip(f"{s.table_name} · {s.row_count:,} rows")
 
             self.partition_list.addItem(item)
 
-        if len(self.discovered_partitions) > display_limit:
-            self.partition_list.addItem(
-                QListWidgetItem(f"... 외 {len(self.discovered_partitions) - display_limit}개")
+        # 잘린 파티션은 체크할 수 없어 실행 대상에서도 빠진다. 조용히 넘어가지 않는다.
+        hidden = len(self.discovered_partitions) - PARTITION_DISPLAY_LIMIT
+        if hidden > 0:
+            overflow = QListWidgetItem(
+                f"⚠ {hidden:,}개는 목록에 표시되지 않아 이번 실행에서 제외됩니다. "
+                "날짜 범위를 좁혀서 나눠 실행하세요."
             )
+            overflow.setForeground(QColor(TEXT_DANGER))
+            overflow.setFlags(Qt.NoItemFlags)
+            self.partition_list.addItem(overflow)
 
-    def _bulk_check(self, checked: bool):
+    def _apply_partition_filter(self, text: str):
+        """이름으로 목록을 거른다. 선택 상태는 건드리지 않는다."""
+        needle = (text or "").strip().lower()
         for i in range(self.partition_list.count()):
             item = self.partition_list.item(i)
             name = item.data(Qt.UserRole)
             if not name:
                 continue
+            item.setHidden(bool(needle) and needle not in str(name).lower())
+        self._update_counts()
+
+    def _visible_partition_items(self):
+        for i in range(self.partition_list.count()):
+            item = self.partition_list.item(i)
+            if item.data(Qt.UserRole) and not item.isHidden():
+                yield item
+
+    def _bulk_check(self, checked: bool):
+        # 거른 상태에서는 '보이는 것'에만 적용한다(안 보이는 걸 몰래 바꾸지 않는다).
+        for item in self._visible_partition_items():
             item.setCheckState(Qt.Checked if checked else Qt.Unchecked)
         self._update_counts()
         self._update_nav_state()
 
     def _select_excluding_completed(self):
-        for i in range(self.partition_list.count()):
-            item = self.partition_list.item(i)
+        for item in self._visible_partition_items():
             name = item.data(Qt.UserRole)
-            if not name:
-                continue
-            is_completed_like = (name in self._completed_from_history) or bool(
-                self._target_has_data.get(name)
-            )
-            item.setCheckState(Qt.Unchecked if is_completed_like else Qt.Checked)
+            item.setCheckState(Qt.Unchecked if self._is_completed_like(name) else Qt.Checked)
         self._update_counts()
         self._update_nav_state()
 
@@ -1127,12 +1337,44 @@ class MigrationWizardDialog(QDialog):
 
     def _update_counts(self):
         total = len(self.discovered_partitions)
-        selected = len(self.get_selected_partition_names())
-        total_rows = sum(s.row_count for s in self.discovered_partitions)
+        visible = 0
+        selected_names: set[str] = set()
+        hidden_selected = 0
 
-        self.partition_count_label.setText(f"총 {total}개")
-        self.partition_selected_label.setText(f"선택 {selected}개")
-        self.partition_rows_label.setText(f"총 {total_rows:,} rows")
+        for i in range(self.partition_list.count()):
+            item = self.partition_list.item(i)
+            name = item.data(Qt.UserRole)
+            if not name:
+                continue
+            hidden = item.isHidden()
+            if not hidden:
+                visible += 1
+            if item.checkState() == Qt.Checked:
+                selected_names.add(str(name))
+                if hidden:
+                    hidden_selected += 1
+
+        selected_rows = sum(
+            s.row_count for s in self.discovered_partitions if s.table_name in selected_names
+        )
+
+        if visible != min(total, PARTITION_DISPLAY_LIMIT):
+            self.partition_count_label.setText(f"표시 {visible}개 / 총 {total}개")
+        else:
+            self.partition_count_label.setText(f"총 {total}개")
+
+        # 걸러서 안 보이는 항목도 체크되어 있으면 실행 대상이다. 숨기지 않고 말한다.
+        selected_text = f"선택 {len(selected_names)}개"
+        if hidden_selected:
+            selected_text += f" (필터 밖 {hidden_selected}개 포함)"
+        self.partition_selected_label.setText(selected_text)
+        self.partition_selected_label.setToolTip(
+            "필터는 보기만 거릅니다. 체크된 항목은 걸러져 보이지 않아도 실행 대상입니다."
+            if hidden_selected
+            else ""
+        )
+        # 총합보다 '지금 실행하면 옮겨질 양'이 결정에 필요한 숫자다.
+        self.partition_rows_label.setText(f"선택 {selected_rows:,} rows")
 
     def check_target_completed(self):
         if not self.discovered_partitions:
@@ -1172,34 +1414,40 @@ class MigrationWizardDialog(QDialog):
     # Step 3: run
     # ============================
 
+    def _selected_row_total(self, names) -> int:
+        wanted = set(names)
+        return sum(
+            s.row_count for s in self.discovered_partitions if s.table_name in wanted
+        )
+
     def _refresh_summary(self):
+        error_text = "중단" if self.error_strategy == "stop" else "건너뛰기"
+
         if self.resume_mode:
-            parts = getattr(self, "_frozen_selection", [])
-            error_text = "중단" if self.error_strategy == "stop" else "건너뛰기"
+            parts = self._frozen_selection
             lines = [
-                f"프로필: {self.profile.name}",
-                "방식: COPY (고성능)",
-                "모드: 재개(옵션 잠금)",
-                f"파티션: {len(parts)}개(미완료만)",
-                f"에러 처리: {error_text}",
+                f"프로필      {self.profile.name}",
+                "방식        COPY (고성능) · 재개 모드(옵션 잠김)",
+                f"파티션      {len(parts):,}개 (미완료만)",
+                f"에러 처리   {error_text}",
             ]
             self.summary_label.setText("\n".join(lines))
             return
 
         start_date = self.start_date_edit.date().toPython()
         end_date = self.end_date_edit.date().toPython()
-        types_text = ", ".join([t.value for t in self.selected_table_types])
-        error_text = "중단" if self.error_strategy == "stop" else "건너뛰기"
-        parts = getattr(self, "_frozen_selection", self.get_selected_partition_names())
+        types_text = ", ".join(
+            TABLE_TYPE_CONFIG[t].display_name for t in self.selected_table_types
+        )
+        parts = self._frozen_selection or self.get_selected_partition_names()
 
         lines = [
-            f"프로필: {self.profile.name}",
-            "방식: COPY (고성능)",
-            f"에러 처리: {error_text}",
-            f"배치 크기: {int(self.batch_size_spin.value()):,} rows",
-            f"날짜: {start_date} ~ {end_date}",
-            f"테이블 타입: {types_text}",
-            f"파티션: {len(parts)}개 (선택된 항목만)",
+            f"프로필      {self.profile.name}",
+            "방식        COPY (고성능)",
+            f"날짜        {start_date} ~ {end_date}",
+            f"항목        {types_text}",
+            f"파티션      {len(parts):,}개 · {self._selected_row_total(parts):,} rows",
+            f"에러 처리   {error_text} · 배치 {int(self.batch_size_spin.value()):,} rows",
         ]
         self.summary_label.setText("\n".join(lines))
 
@@ -1211,7 +1459,20 @@ class MigrationWizardDialog(QDialog):
             QMessageBox.warning(self, "연결 필요", "소스/대상 DB가 모두 연결되어야 합니다.")
             return
 
-        partitions = getattr(self, "_frozen_selection", [])
+        # 중단된 작업을 다시 시작하는 경우: 새 이력을 만들지 않고 재개로 넘긴다.
+        # (그러지 않으면 이력이 하나 더 생기고 이미 옮긴 파티션을 다시 복사한다.)
+        if self.history_id is not None and not self.resume_mode:
+            pending = self.checkpoint_manager.get_pending_checkpoints(self.history_id)
+            if pending:
+                self.resume_mode = True
+                self._frozen_selection = [cp.partition_name for cp in pending]
+                self._force_python_copy_for_resume()
+                self.add_log(
+                    f"중단된 작업을 이어서 진행합니다 - 미완료 파티션 {len(pending)}개", "INFO"
+                )
+                self._refresh_summary()
+
+        partitions = self._frozen_selection
         if not partitions:
             QMessageBox.warning(self, "파티션 없음", "실행할 파티션이 없습니다.")
             return
@@ -1268,9 +1529,7 @@ class MigrationWizardDialog(QDialog):
         self.worker.error.connect(self.on_error)
         self.worker.performance.connect(self.on_performance_update)
 
-        self.start_btn.setEnabled(False)
-        self.pause_btn.setEnabled(True)
-        self.close_btn.setEnabled(False)
+        self._set_run_state("running", f"파티션 {len(partitions):,}개")
 
         mode_label = ("Server-side" if self.copy_mode == "server" else ("AUTO" if self.copy_mode == "auto" else "COPY"))
         self.add_log(
@@ -1279,7 +1538,6 @@ class MigrationWizardDialog(QDialog):
         )
 
         self.worker.start()
-        self._update_nav_state()
 
     def on_truncate_requested(self, table_name: str, row_count: int):
         reply = QMessageBox.question(
@@ -1303,28 +1561,30 @@ class MigrationWizardDialog(QDialog):
         if not self.worker:
             return
 
-        if self.pause_btn.text() == "일시정지":
+        if self.run_state == "running":
             self.worker.pause()
-            self.pause_btn.setText("재개")
+            self._set_run_state("paused", self.run_detail_label.text())
             self.add_log("일시정지 요청", "INFO")
         else:
             self.worker.resume()
-            self.pause_btn.setText("일시정지")
+            self._set_run_state("running", self.run_detail_label.text())
             self.add_log("재개 요청", "INFO")
 
     def cancel_migration(self):
-        if self.worker and getattr(self.worker, "is_running", False):
-            reply = QMessageBox.question(
-                self,
-                "확인",
-                "마이그레이션을 취소하시겠습니까?\n완료된 파티션은 유지되며, 나중에 이어서 진행할 수 있습니다.",
-                QMessageBox.Yes | QMessageBox.No,
-            )
-            if reply == QMessageBox.Yes:
-                self.worker.stop()
-                self.add_log("사용자가 마이그레이션을 취소했습니다", "WARNING")
-        else:
-            self.close()
+        """진행 중인 작업만 멈춘다. 창을 닫는 일은 '닫기'가 한다."""
+        if not self.worker or not self._is_running():
+            return
+
+        reply = QMessageBox.question(
+            self,
+            "작업 취소",
+            "마이그레이션을 취소하시겠습니까?\n완료된 파티션은 유지되며, 나중에 이어서 진행할 수 있습니다.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply == QMessageBox.Yes:
+            self.worker.stop()
+            self.add_log("사용자가 마이그레이션을 취소했습니다", "WARNING")
 
 
     def run_rowcount_verification(self):
@@ -1337,7 +1597,7 @@ class MigrationWizardDialog(QDialog):
             QMessageBox.warning(self, "이력 없음", "검증할 작업 이력이 없습니다. 먼저 마이그레이션을 실행하세요.")
             return
 
-        table_names = getattr(self, "_frozen_selection", None) or self.get_selected_partition_names()
+        table_names = self._frozen_selection or self.get_selected_partition_names()
         if not table_names:
             QMessageBox.warning(self, "파티션 없음", "검증할 파티션이 없습니다.")
             return
@@ -1364,7 +1624,10 @@ class MigrationWizardDialog(QDialog):
         self._verify_worker.progress.connect(self._on_verify_progress)
         self._verify_worker.result.connect(self._on_verify_result)
         self._verify_worker.error.connect(self._on_verify_error)
-        self._verify_worker.finished.connect(lambda: self.verify_btn.setEnabled(True))
+        # 버튼 활성화는 상태 머신이 정한다(실행 중에 검증 버튼이 살아나지 않도록).
+        self._verify_worker.finished.connect(
+            lambda: self._set_run_state(self.run_state, self.run_detail_label.text())
+        )
         self._verify_worker.start()
 
     def _on_verify_progress(self, done: int, total: int, table: str):
@@ -1422,9 +1685,11 @@ class MigrationWizardDialog(QDialog):
     def on_progress(self, data: dict):
         if "total_progress" in data:
             self.total_progress.setValue(int(data["total_progress"]))
-            self.total_label.setText(
-                f"{data.get('completed_partitions', 0)} / {data.get('total_partitions', 0)}"
-            )
+            done = data.get("completed_partitions", 0)
+            total = data.get("total_partitions", 0)
+            self.total_label.setText(f"{done} / {total}")
+            if self.run_state in ("running", "paused"):
+                self.run_detail_label.setText(f"파티션 {done} / {total} 완료")
 
         if "current_progress" in data:
             self.current_progress.setValue(int(data["current_progress"]))
@@ -1433,23 +1698,23 @@ class MigrationWizardDialog(QDialog):
             self.current_label.setText(f"{part} ({rows:,} rows)")
 
         if "speed" in data:
-            self.speed_label.setText(f"처리 속도: {int(data['speed']):,} rows/sec")
+            self.speed_metric.set_value(f"{int(data['speed']):,} rows/s")
 
     def on_performance_update(self, stats: dict):
         rows_per_sec = float(stats.get("instant_rows_per_sec", 0) or 0)
         if rows_per_sec >= 1_000_000:
-            speed_text = f"{rows_per_sec / 1_000_000:.1f}M rows/sec"
+            speed_text = f"{rows_per_sec / 1_000_000:.1f}M rows/s"
         elif rows_per_sec >= 1_000:
-            speed_text = f"{rows_per_sec / 1_000:.1f}K rows/sec"
+            speed_text = f"{rows_per_sec / 1_000:.1f}K rows/s"
         else:
-            speed_text = f"{rows_per_sec:.0f} rows/sec"
-        self.speed_label.setText(f"처리 속도: {speed_text}")
+            speed_text = f"{rows_per_sec:.0f} rows/s"
+        self.speed_metric.set_value(speed_text)
 
         mb_per_sec = float(stats.get("instant_mb_per_sec", 0.0) or 0.0)
-        self.data_rate_label.setText(f"전송 속도: {mb_per_sec:.1f} MB/sec")
+        self.data_rate_metric.set_value(f"{mb_per_sec:.1f} MB/s")
 
-        self.eta_label.setText(f"예상 완료: {stats.get('eta_time', '계산중...')}")
-        self.elapsed_label.setText(f"경과 시간: {stats.get('elapsed_time', '00:00:00')}")
+        self.eta_metric.set_value(str(stats.get("eta_time", "계산 중")))
+        self.elapsed_metric.set_value(str(stats.get("elapsed_time", "00:00:00")))
 
     def on_worker_thread_finished(self):
         """워커 스레드 종료 핸들러
@@ -1468,17 +1733,13 @@ class MigrationWizardDialog(QDialog):
         if self.worker:
             self.worker.is_running = False
 
-        self.pause_btn.setEnabled(False)
-        self.cancel_btn.setEnabled(False)
-        self.close_btn.setEnabled(True)
-
         # 오류 케이스는 on_error에서 status=failed 처리하므로 여기선 건드리지 않는다.
         if getattr(self, "_worker_had_error", False):
-            self._update_nav_state()
+            self._set_run_state("failed", self.run_detail_label.text())
             return
 
         if not self.worker:
-            self._update_nav_state()
+            self._set_run_state("idle")
             return
 
         rows_processed = self._get_processed_rows()
@@ -1490,10 +1751,10 @@ class MigrationWizardDialog(QDialog):
                     self.history_id, "running", processed_rows=rows_processed
                 )
             self.add_log(
-                "마이그레이션이 중단되었습니다. 나중에 '이어서 진행'으로 재개할 수 있습니다.",
+                "마이그레이션이 중단되었습니다. '이어서 시작'을 누르면 남은 파티션부터 재개합니다.",
                 "WARNING",
             )
-            self._update_nav_state()
+            self._set_run_state("stopped", f"{rows_processed:,} rows 처리 후 중단")
             return
 
         # 정상 완료: 프로그래스바 100%로 갱신
@@ -1501,6 +1762,7 @@ class MigrationWizardDialog(QDialog):
         self.current_progress.setValue(100)
         total_partitions = len(self.worker.partitions)
         self.total_label.setText(f"{total_partitions} / {total_partitions}")
+        self.current_label.setText("완료")
 
         if self.history_id:
             self.history_manager.update_history_status(
@@ -1508,17 +1770,19 @@ class MigrationWizardDialog(QDialog):
             )
 
         self.add_log("마이그레이션이 완료되었습니다", "SUCCESS")
-        QMessageBox.information(self, "완료", "마이그레이션이 성공적으로 완료되었습니다.")
-        self._update_nav_state()
+        self._set_run_state("done", f"파티션 {total_partitions:,}개 · {rows_processed:,} rows")
+        QMessageBox.information(
+            self,
+            "완료",
+            f"마이그레이션이 완료되었습니다.\n\n"
+            f"파티션 {total_partitions:,}개 · {rows_processed:,} rows\n\n"
+            "행 수가 정확히 맞는지 확인하려면 '검증 실행'을 누르세요.",
+        )
 
     def on_error(self, error_msg: str):
         self._worker_had_error = True
         if self.worker:
             self.worker.is_running = False
-
-        self.pause_btn.setEnabled(False)
-        self.cancel_btn.setEnabled(False)
-        self.close_btn.setEnabled(True)
 
         if self.history_id:
             rows_processed = self._get_processed_rows()
@@ -1527,8 +1791,8 @@ class MigrationWizardDialog(QDialog):
             )
 
         self.add_log(f"오류 발생: {error_msg}", "ERROR")
+        self._set_run_state("failed", "실행 로그에서 원인을 확인하세요")
         QMessageBox.critical(self, "오류", f"마이그레이션 중 오류가 발생했습니다:\n\n{error_msg}")
-        self._update_nav_state()
 
     def _get_processed_rows(self) -> int:
         if self.worker and hasattr(self.worker, "get_stats"):
@@ -1551,8 +1815,13 @@ class MigrationWizardDialog(QDialog):
 
     def add_log(self, message: str, level: str = "INFO"):
         timestamp = datetime.now().strftime("%H:%M:%S")
-        entry = f"[{timestamp}] {level}: {message}"
-        self.log_text.append(entry)
+        # 메시지에 <, & 같은 문자가 있어도 그대로 보이도록 이스케이프한다.
+        safe = html.escape(message).replace("\n", "<br>")
+        color = log_color(level)
+        self.log_text.append(
+            f'<span style="color:{TEXT_MUTED}">[{timestamp}]</span> '
+            f'<span style="color:{color}">{level:<7} {safe}</span>'
+        )
         self.log_text.moveCursor(QTextCursor.End)
         log_emitter.emit_log(level, message)
 
@@ -1567,16 +1836,33 @@ class MigrationWizardDialog(QDialog):
         self.partition_list.itemChanged.connect(lambda _item: (self._update_counts(), self._update_nav_state()))
 
         self.pages.setCurrentIndex(0)
+        self._guard_last_table_type()
         self._update_step_ui()
-        self._update_nav_state()
+        self._set_run_state("idle")
 
     # ============================
     # Qt lifecycle
     # ============================
 
+    def _block_close_while_running(self) -> bool:
+        if not self._is_running():
+            return False
+        QMessageBox.warning(
+            self,
+            "진행 중",
+            "마이그레이션 진행 중에는 닫을 수 없습니다.\n"
+            "먼저 '작업 취소'로 작업을 멈추세요.",
+        )
+        return True
+
+    def reject(self):
+        # Esc 키는 closeEvent를 거치지 않을 수 있으므로 여기서도 막는다.
+        if self._block_close_while_running():
+            return
+        super().reject()
+
     def closeEvent(self, event):
-        if self.worker and getattr(self.worker, "is_running", False):
-            QMessageBox.warning(self, "진행 중", "마이그레이션 진행 중에는 닫을 수 없습니다.")
+        if self._block_close_while_running():
             event.ignore()
             return
         event.accept()

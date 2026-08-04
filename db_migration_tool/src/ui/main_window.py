@@ -84,18 +84,24 @@ class MainWindow(QMainWindow):
         # 새 연결 액션
         new_connection_action = QAction("새 연결", self)
         new_connection_action.setShortcut("Ctrl+N")
+        new_connection_action.setStatusTip("새 연결 프로필을 만듭니다.")
+        new_connection_action.setToolTip("새 연결 프로필 만들기 (Ctrl+N)")
         new_connection_action.triggered.connect(self.new_connection)
         toolbar.addAction(new_connection_action)
 
         # 편집 액션
         edit_action = QAction("편집", self)
         edit_action.setShortcut("Ctrl+E")
+        edit_action.setStatusTip("선택한 연결 프로필을 편집합니다.")
+        edit_action.setToolTip("선택한 연결 프로필 편집 (Ctrl+E)")
         edit_action.triggered.connect(self.edit_connection)
         toolbar.addAction(edit_action)
 
         # 삭제 액션
         delete_action = QAction("삭제", self)
         delete_action.setShortcut("Delete")
+        delete_action.setStatusTip("선택한 연결 프로필을 삭제합니다. 작업 이력은 삭제하지 않습니다.")
+        delete_action.setToolTip("선택한 연결 프로필 삭제 (작업 이력 삭제 아님)")
         delete_action.triggered.connect(self.delete_connection)
         toolbar.addAction(delete_action)
 
@@ -104,6 +110,8 @@ class MainWindow(QMainWindow):
         # 마이그레이션 작업 설정 액션
         self.migrate_action = QAction("마이그레이션 작업 설정", self)
         self.migrate_action.setShortcut("F5")
+        self.migrate_action.setStatusTip("선택한 프로필로 마이그레이션 범위와 실행 옵션을 설정합니다.")
+        self.migrate_action.setToolTip("프로필을 선택한 뒤 마이그레이션 작업을 설정합니다. (F5)")
         self.migrate_action.triggered.connect(self.start_migration)
         toolbar.addAction(self.migrate_action)
 
@@ -112,12 +120,16 @@ class MainWindow(QMainWindow):
         # 작업 이력 액션
         history_action = QAction("작업 이력", self)
         history_action.setShortcut("Ctrl+H")
+        history_action.setStatusTip("마이그레이션 실행 이력을 확인합니다.")
+        history_action.setToolTip("작업 이력 보기 (Ctrl+H)")
         history_action.triggered.connect(self.show_history_dialog)
         toolbar.addAction(history_action)
 
         # 로그 뷰어 액션
         log_viewer_action = QAction("로그 뷰어", self)
         log_viewer_action.setShortcut("Ctrl+L")
+        log_viewer_action.setStatusTip("애플리케이션 로그를 확인합니다.")
+        log_viewer_action.setToolTip("로그 뷰어 열기 (Ctrl+L)")
         log_viewer_action.triggered.connect(self.show_log_viewer)
         toolbar.addAction(log_viewer_action)
 
@@ -141,40 +153,22 @@ class MainWindow(QMainWindow):
         # 버튼 레이아웃
         button_layout = QHBoxLayout()
 
+        # 색/크기는 전역 테마(src/ui/theme.py)에서 objectName·variant로 받는다.
         self.new_btn = QPushButton("새 연결")
-        self.new_btn.setStyleSheet("""
-            QPushButton {
-                font-size: 16px;
-                padding: 12px 20px;
-                min-height: 45px;
-                font-weight: bold;
-            }
-        """)
+        self.new_btn.setObjectName("newProfileButton")
+        self.new_btn.setToolTip("새 연결 프로필을 만듭니다.")
         self.new_btn.clicked.connect(self.new_connection)
         button_layout.addWidget(self.new_btn)
 
         self.edit_btn = QPushButton("편집")
-        self.edit_btn.setStyleSheet("""
-            QPushButton {
-                font-size: 16px;
-                padding: 12px 20px;
-                min-height: 45px;
-                font-weight: bold;
-            }
-        """)
+        self.edit_btn.setToolTip("연결 프로필을 선택하면 편집할 수 있습니다.")
         self.edit_btn.clicked.connect(self.edit_connection)
         self.edit_btn.setEnabled(False)
         button_layout.addWidget(self.edit_btn)
 
         self.delete_btn = QPushButton("삭제")
-        self.delete_btn.setStyleSheet("""
-            QPushButton {
-                font-size: 16px;
-                padding: 12px 20px;
-                min-height: 45px;
-                font-weight: bold;
-            }
-        """)
+        self.delete_btn.setObjectName("dangerAction")
+        self.delete_btn.setToolTip("연결 프로필을 선택하면 삭제할 수 있습니다. 작업 이력은 삭제하지 않습니다.")
         self.delete_btn.clicked.connect(self.delete_connection)
         self.delete_btn.setEnabled(False)
         button_layout.addWidget(self.delete_btn)
@@ -183,17 +177,14 @@ class MainWindow(QMainWindow):
 
         # 마이그레이션 작업 설정 버튼
         self.migrate_btn = QPushButton("마이그레이션 작업 설정")
-        self.migrate_btn.setStyleSheet("""
-            QPushButton {
-                font-size: 16px;
-                padding: 12px 20px;
-                min-height: 45px;
-                font-weight: bold;
-            }
-        """)
+        self.migrate_btn.setObjectName("migrationButton")
+        self.migrate_btn.setToolTip("연결 프로필을 선택하면 마이그레이션 작업을 설정할 수 있습니다.")
         self.migrate_btn.clicked.connect(self.start_migration)
         self.migrate_btn.setEnabled(False)
         layout.addWidget(self.migrate_btn)
+
+        for btn in (self.new_btn, self.edit_btn, self.delete_btn, self.migrate_btn):
+            btn.setProperty("variant", "large")
 
         group.setLayout(layout)
         return group
@@ -234,12 +225,25 @@ class MainWindow(QMainWindow):
         self.migrate_btn.setEnabled(has_profile)
         label = self._migration_mode_text(self.vm.current_profile)
         self.migrate_btn.setText(label)
+        default_migrate_tip = "연결 프로필을 선택하면 마이그레이션 작업을 설정할 수 있습니다."
+        self.migrate_btn.setToolTip(default_migrate_tip)
+        self.edit_btn.setToolTip("연결 프로필을 선택하면 편집할 수 있습니다.")
+        self.delete_btn.setToolTip("연결 프로필을 선택하면 삭제할 수 있습니다. 작업 이력은 삭제하지 않습니다.")
         if hasattr(self, "migrate_action"):
             self.migrate_action.setText(label)
+            self.migrate_action.setToolTip(default_migrate_tip)
 
     def update_profile_list(self, profiles):
         """프로필 목록 UI 업데이트"""
         self.profile_list.clear()
+
+        if not profiles:
+            # 빈 목록은 막다른 화면이 아니라 다음 할 일을 알려주는 자리다.
+            empty = QListWidgetItem("연결 프로필이 없습니다. ‘새 연결’로 시작하세요.")
+            empty.setFlags(Qt.NoItemFlags)
+            self.profile_list.addItem(empty)
+            return
+
         for profile in profiles:
             summary = self._endpoint_summary(profile)
             item = QListWidgetItem(f"{profile.name}  [{summary}]")
@@ -260,10 +264,21 @@ class MainWindow(QMainWindow):
 
         label = self._migration_mode_text(profile)
         self.migrate_btn.setText(label)
-        self.migrate_btn.setToolTip(label)
+        default_migrate_tip = "연결 프로필을 선택하면 마이그레이션 작업을 설정할 수 있습니다."
+        if has_profile:
+            migrate_tip = f"선택한 프로필 '{profile.name}'로 {label}을 시작합니다."
+            self.edit_btn.setToolTip(f"선택한 프로필 '{profile.name}'의 연결 정보를 편집합니다.")
+            self.delete_btn.setToolTip(
+                f"선택한 프로필 '{profile.name}'을 삭제합니다. 작업 이력은 삭제하지 않습니다."
+            )
+        else:
+            migrate_tip = default_migrate_tip
+            self.edit_btn.setToolTip("연결 프로필을 선택하면 편집할 수 있습니다.")
+            self.delete_btn.setToolTip("연결 프로필을 선택하면 삭제할 수 있습니다. 작업 이력은 삭제하지 않습니다.")
+        self.migrate_btn.setToolTip(migrate_tip)
         if hasattr(self, "migrate_action"):
             self.migrate_action.setText(label)
-            self.migrate_action.setToolTip(label)
+            self.migrate_action.setToolTip(migrate_tip)
 
         if has_profile:
             self.status_bar.showMessage(
@@ -311,8 +326,14 @@ class MainWindow(QMainWindow):
         if not self.vm.current_profile:
             return
 
+        # 무엇을 지우는지, 무엇이 남는지를 확인 창에서 그대로 말한다.
         reply = QMessageBox.question(
-            self, "확인", "선택한 연결을 삭제하시겠습니까?", QMessageBox.Yes | QMessageBox.No
+            self,
+            "연결 프로필 삭제",
+            f"'{self.vm.current_profile.name}' 연결 프로필을 삭제할까요?\n\n"
+            "작업 이력과 저장된 연결은 삭제되지 않습니다.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
         )
 
         if reply == QMessageBox.Yes:

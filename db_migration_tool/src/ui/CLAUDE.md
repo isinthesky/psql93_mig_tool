@@ -11,10 +11,21 @@
 
 ## 주요 구성요소
 - `main_window.py`: 애플리케이션 메인 창. 프로필 목록, 이력 테이블, 툴바를 구성하고 사용자 이벤트를 처리합니다.
-- `dialogs/connection_dialog.py`: 소스/대상 데이터베이스 연결 정보를 입력받고 검증합니다.
-- `dialogs/migration_dialog.py`: 마이그레이션 옵션(날짜 범위, 파티션 선택 등)을 설정합니다.
+- `theme.py`: 색·서체·간격 디자인 토큰과 전역 QSS를 만듭니다. `main.py`가 qdarkstyle 위에 덧씌웁니다.
+- `dialogs/connection_dialog.py`: 소스/대상 엔드포인트 연결 정보를 입력받고 탭 안에서 바로 검증합니다.
+- `dialogs/migration_wizard_dialog.py`: PostgreSQL → PostgreSQL COPY 마이그레이션 3단계 마법사입니다.
+- `dialogs/file_archive_migration_dialog.py`: PostgreSQL ↔ File Archive 마이그레이션 3단계 마법사입니다.
+- `dialogs/history_dialog.py`: 작업 이력을 조회합니다(modeless 싱글톤).
 - `dialogs/log_viewer_dialog.py`: 실시간 로그와 이력을 확인하는 창을 제공합니다.
-- `widgets/`: 공용 커스텀 위젯을 배치하기 위한 디렉터리로, 필요 시 확장 가능합니다.
+- `widgets/instruments.py`: 두 마법사가 공유하는 계기 위젯 — `StatusLamp`(상태 램프), `StepRail`(단계 표시), `MetricReadout`(속도/ETA 등 수치).
+
+## 스타일 규칙
+- 위젯에서 `setStyleSheet`으로 색을 직접 지정하지 않습니다. `theme.py`의 토큰을 objectName 또는
+  `role`/`state` 동적 프로퍼티로 받습니다. (`label.setProperty("role", "hint")`)
+- 동적 프로퍼티를 런타임에 바꾸면 `theme.repolish(widget)`을 호출해야 반영됩니다.
+- 램프 상태는 `idle`(대기) / `busy`(확인 중·일시정지) / `ok`(정상·실행 중·완료) / `error`(오류·중단) 4가지뿐입니다.
+- 한 화면에서 채워진(강조) 버튼은 하나만 둡니다. 나머지는 기본 또는 `variant="chip"`을 씁니다.
+- 실행 페이지의 버튼 활성화는 각 핸들러가 아니라 `_set_run_state()` 한 곳에서만 정합니다.
 
 ## 이벤트 흐름
 1. `MainWindow`가 `ProfileManager`, `HistoryManager`를 이용해 초기 데이터를 채웁니다.
