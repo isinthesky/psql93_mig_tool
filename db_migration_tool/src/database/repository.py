@@ -4,8 +4,11 @@ CRUD 공통 로직을 제공하는 베이스 리포지토리와
 엔티티별 전용 리포지토리를 정의합니다.
 """
 
+from collections.abc import Iterator
 from contextlib import contextmanager
 from typing import Generic, TypeVar
+
+from sqlalchemy.orm import Session
 
 from .local_db import Checkpoint, MigrationHistory, get_db
 
@@ -36,10 +39,12 @@ class BaseRepository(Generic[T]):
         self.db = db or get_db()
 
     @contextmanager
-    def _session_scope(self):
+    def _session_scope(self) -> Iterator[Session]:
         """트랜잭션 컨텍스트 매니저
 
         자동으로 commit/rollback/close를 처리합니다.
+
+        반환 타입을 명시해야 self.db가 Any여도 세션 이후 체인이 T로 좁혀진다.
         """
         with self.db.session_scope() as session:
             yield session

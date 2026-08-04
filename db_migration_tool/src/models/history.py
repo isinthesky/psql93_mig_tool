@@ -3,6 +3,7 @@
 """
 
 from datetime import datetime
+from typing import Any
 
 from src.database.local_db import Checkpoint, MigrationHistory
 from src.database.repository import CheckpointRepository, HistoryRepository
@@ -39,11 +40,11 @@ class MigrationHistoryItem:
         return cls(
             id=db_history.id,
             profile_id=db_history.profile_id,
-            start_date=db_history.start_date,
-            end_date=db_history.end_date,
+            start_date=db_history.start_date or "",
+            end_date=db_history.end_date or "",
             started_at=db_history.started_at,
             completed_at=db_history.completed_at,
-            status=db_history.status,
+            status=db_history.status or "pending",
             total_rows=db_history.total_rows or 0,
             processed_rows=db_history.processed_rows or 0,
         )
@@ -85,7 +86,7 @@ class CheckpointItem:
             id=db_checkpoint.id,
             history_id=db_checkpoint.history_id,
             partition_name=db_checkpoint.partition_name,
-            status=db_checkpoint.status,
+            status=db_checkpoint.status or "pending",
             rows_processed=db_checkpoint.rows_processed or 0,
             error_message=db_checkpoint.error_message or "",
             last_path_id=db_checkpoint.last_path_id,
@@ -107,8 +108,8 @@ class HistoryManager:
         profile_id: int,
         start_date: str,
         end_date: str,
-        source_status: str = None,
-        target_status: str = None,
+        source_status: str | None = None,
+        target_status: str | None = None,
     ) -> MigrationHistoryItem:
         """새 이력 생성"""
         db_history = self.repo.create(
@@ -136,10 +137,10 @@ class HistoryManager:
         return [MigrationHistoryItem.from_db_model(h) for h in db_histories]
 
     def update_history_status(
-        self, history_id: int, status: str, processed_rows: int = None
+        self, history_id: int, status: str, processed_rows: int | None = None
     ) -> bool:
         """이력 상태 업데이트"""
-        updates = {"status": status}
+        updates: dict[str, Any] = {"status": status}
         if processed_rows is not None:
             updates["processed_rows"] = processed_rows
 
@@ -183,16 +184,16 @@ class CheckpointManager:
         self,
         checkpoint_id: int,
         status: str,
-        rows_processed: int = None,
-        error_message: str = None,
-        last_path_id: int = None,
-        last_issued_date: int = None,
-        last_issued_date_text: str = None,
-        copy_method: str = None,
-        bytes_transferred: int = None,
+        rows_processed: int | None = None,
+        error_message: str | None = None,
+        last_path_id: int | None = None,
+        last_issued_date: int | None = None,
+        last_issued_date_text: str | None = None,
+        copy_method: str | None = None,
+        bytes_transferred: int | None = None,
     ) -> bool:
         """체크포인트 상태 업데이트"""
-        updates = {"status": status}
+        updates: dict[str, Any] = {"status": status}
         if rows_processed is not None:
             updates["rows_processed"] = rows_processed
         if error_message is not None:

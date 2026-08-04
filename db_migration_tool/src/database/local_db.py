@@ -3,15 +3,22 @@
 """
 
 import threading
+from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import datetime
 
-from sqlalchemy import Column, DateTime, Integer, String, Text, create_engine, text
-from sqlalchemy.orm import declarative_base, sessionmaker
+from sqlalchemy import DateTime, Engine, Integer, String, Text, create_engine, text
+from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
 from src.utils.app_paths import AppPaths
 
-Base = declarative_base()
+
+class Base(DeclarativeBase):
+    """SQLAlchemy 2.0 선언적 베이스.
+
+    Mapped[X] 는 NOT NULL, Mapped[X | None] 은 nullable 로 매핑된다.
+    기존 스키마와 어긋나면 안 되므로 어노테이션은 원래 nullable 설정을 그대로 따른다.
+    """
 
 
 class Profile(Base):
@@ -19,12 +26,14 @@ class Profile(Base):
 
     __tablename__ = "profiles"
 
-    id = Column(Integer, primary_key=True)
-    name = Column(String(100), unique=True, nullable=False)
-    source_config = Column(Text, nullable=False)  # JSON (암호화)
-    target_config = Column(Text, nullable=False)  # JSON (암호화)
-    created_at = Column(DateTime, default=datetime.now)
-    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    name: Mapped[str] = mapped_column(String(100), unique=True, nullable=False)
+    source_config: Mapped[str] = mapped_column(Text, nullable=False)  # JSON (암호화)
+    target_config: Mapped[str] = mapped_column(Text, nullable=False)  # JSON (암호화)
+    created_at: Mapped[datetime | None] = mapped_column(DateTime, default=datetime.now)
+    updated_at: Mapped[datetime | None] = mapped_column(
+        DateTime, default=datetime.now, onupdate=datetime.now
+    )
 
 
 class MigrationHistory(Base):
@@ -32,19 +41,20 @@ class MigrationHistory(Base):
 
     __tablename__ = "migration_history"
 
-    id = Column(Integer, primary_key=True)
-    profile_id = Column(Integer, nullable=False)
-    start_date = Column(String(10))  # YYYY-MM-DD
-    end_date = Column(String(10))  # YYYY-MM-DD
-    started_at = Column(DateTime)
-    completed_at = Column(DateTime)
-    status = Column(String(20))  # completed, failed, cancelled, running
-    total_rows = Column(Integer)
-    processed_rows = Column(Integer)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    profile_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    start_date: Mapped[str | None] = mapped_column(String(10))  # YYYY-MM-DD
+    end_date: Mapped[str | None] = mapped_column(String(10))  # YYYY-MM-DD
+    started_at: Mapped[datetime | None] = mapped_column(DateTime)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime)
+    # completed, failed, cancelled, running
+    status: Mapped[str | None] = mapped_column(String(20))
+    total_rows: Mapped[int | None] = mapped_column(Integer)
+    processed_rows: Mapped[int | None] = mapped_column(Integer)
     # 연결 상태 필드 추가
-    source_connection_status = Column(Text)  # 연결 성공/실패 메시지
-    target_connection_status = Column(Text)  # 연결 성공/실패 메시지
-    connection_check_time = Column(DateTime)  # 연결 확인 시간
+    source_connection_status: Mapped[str | None] = mapped_column(Text)  # 연결 성공/실패 메시지
+    target_connection_status: Mapped[str | None] = mapped_column(Text)  # 연결 성공/실패 메시지
+    connection_check_time: Mapped[datetime | None] = mapped_column(DateTime)  # 연결 확인 시간
 
 
 class Checkpoint(Base):
@@ -52,19 +62,19 @@ class Checkpoint(Base):
 
     __tablename__ = "checkpoints"
 
-    id = Column(Integer, primary_key=True)
-    history_id = Column(Integer, nullable=False)
-    partition_name = Column(String(100), nullable=False)
-    status = Column(String(20))  # pending, completed, failed
-    rows_processed = Column(Integer, default=0)
-    error_message = Column(Text)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    history_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    partition_name: Mapped[str] = mapped_column(String(100), nullable=False)
+    status: Mapped[str | None] = mapped_column(String(20))  # pending, completed, failed
+    rows_processed: Mapped[int | None] = mapped_column(Integer, default=0)
+    error_message: Mapped[str | None] = mapped_column(Text)
     # 새 필드: COPY 방식 재개를 위한 마지막 처리 키
-    last_path_id = Column(Integer)
-    last_issued_date = Column(Integer)
+    last_path_id: Mapped[int | None] = mapped_column(Integer)
+    last_issued_date: Mapped[int | None] = mapped_column(Integer)
     # timestamp 타입(예: energy_display)의 재개를 위해 문자열 컬럼을 추가
-    last_issued_date_text = Column(Text)
-    copy_method = Column(String(10), default="INSERT")  # COPY or INSERT
-    bytes_transferred = Column(Integer, default=0)
+    last_issued_date_text: Mapped[str | None] = mapped_column(Text)
+    copy_method: Mapped[str | None] = mapped_column(String(10), default="INSERT")  # COPY or INSERT
+    bytes_transferred: Mapped[int | None] = mapped_column(Integer, default=0)
 
 
 class SavedConnection(Base):
@@ -72,16 +82,16 @@ class SavedConnection(Base):
 
     __tablename__ = "saved_connections"
 
-    id = Column(Integer, primary_key=True)
-    host = Column(String(255), nullable=False)
-    port = Column(Integer, nullable=False, default=5432)
-    database = Column(String(100), nullable=False)
-    username = Column(String(100), nullable=False)
-    password = Column(Text, default="")  # 암호화
-    ssl = Column(Integer, default=0)  # 0=False, 1=True
-    compat_mode = Column(String(10), default="auto")
-    last_used = Column(DateTime, default=datetime.now)
-    created_at = Column(DateTime, default=datetime.now)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    host: Mapped[str] = mapped_column(String(255), nullable=False)
+    port: Mapped[int] = mapped_column(Integer, nullable=False, default=5432)
+    database: Mapped[str] = mapped_column(String(100), nullable=False)
+    username: Mapped[str] = mapped_column(String(100), nullable=False)
+    password: Mapped[str | None] = mapped_column(Text, default="")  # 암호화
+    ssl: Mapped[int | None] = mapped_column(Integer, default=0)  # 0=False, 1=True
+    compat_mode: Mapped[str | None] = mapped_column(String(10), default="auto")
+    last_used: Mapped[datetime | None] = mapped_column(DateTime, default=datetime.now)
+    created_at: Mapped[datetime | None] = mapped_column(DateTime, default=datetime.now)
 
 
 class LogEntry(Base):
@@ -89,13 +99,13 @@ class LogEntry(Base):
 
     __tablename__ = "logs"
 
-    id = Column(Integer, primary_key=True)
-    timestamp = Column(DateTime, nullable=False, index=True)
-    session_id = Column(String(20), index=True)
-    level = Column(String(10), nullable=False, index=True)
-    logger_name = Column(String(50))
-    message = Column(Text, nullable=False)
-    created_at = Column(DateTime, default=datetime.now)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    timestamp: Mapped[datetime] = mapped_column(DateTime, nullable=False, index=True)
+    session_id: Mapped[str | None] = mapped_column(String(20), index=True)
+    level: Mapped[str] = mapped_column(String(10), nullable=False, index=True)
+    logger_name: Mapped[str | None] = mapped_column(String(50))
+    message: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime | None] = mapped_column(DateTime, default=datetime.now)
 
 
 class LocalDatabase:
@@ -103,8 +113,8 @@ class LocalDatabase:
 
     def __init__(self):
         self.db_path = self._get_db_path()
-        self.engine = None
-        self.Session = None
+        self.engine: Engine | None = None
+        self.Session: sessionmaker[Session] | None = None
 
     def _get_db_path(self):
         """데이터베이스 파일 경로 가져오기 (AppPaths 활용)"""
@@ -127,14 +137,14 @@ class LocalDatabase:
         # 세션 팩토리 생성
         self.Session = sessionmaker(bind=self.engine)
 
-    def get_session(self):
+    def get_session(self) -> Session:
         """데이터베이스 세션 반환"""
         if not self.Session:
             raise RuntimeError("데이터베이스가 초기화되지 않았습니다.")
         return self.Session()
 
     @contextmanager
-    def session_scope(self):
+    def session_scope(self) -> Iterator[Session]:
         """트랜잭션 컨텍스트 매니저
 
         자동으로 commit/rollback/close를 처리합니다.
@@ -162,6 +172,8 @@ class LocalDatabase:
 
     def _migrate_schema(self):
         """기존 데이터베이스 스키마 마이그레이션"""
+        if self.engine is None:
+            raise RuntimeError("데이터베이스가 초기화되지 않았습니다.")
         try:
             with self.engine.connect() as conn:
                 # checkpoints 테이블에 새 컬럼 추가
@@ -191,11 +203,11 @@ class LocalDatabase:
 
 
 # 전역 데이터베이스 인스턴스 (스레드 안전 초기화)
-_db_instance = None
+_db_instance: LocalDatabase | None = None
 _db_lock = threading.Lock()
 
 
-def get_db():
+def get_db() -> LocalDatabase:
     """데이터베이스 인스턴스 반환 (스레드 안전)"""
     global _db_instance
     if _db_instance is None:

@@ -112,7 +112,7 @@ class SavedConnectionManager:
             "port": row.port,
             "database": row.database,
             "username": row.username,
-            "password": self._decrypt(row.password),
+            "password": self._decrypt(row.password or ""),
             "ssl": bool(row.ssl),
             "compat_mode": row.compat_mode or "auto",
             "last_used": row.last_used,

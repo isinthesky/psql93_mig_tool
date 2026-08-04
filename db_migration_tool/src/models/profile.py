@@ -78,11 +78,11 @@ class ConnectionProfile:
 
     @property
     def source_kind(self) -> str:
-        return self.source_config.get("kind", ENDPOINT_KIND_POSTGRES)
+        return str(self.source_config.get("kind", ENDPOINT_KIND_POSTGRES))
 
     @property
     def target_kind(self) -> str:
-        return self.target_config.get("kind", ENDPOINT_KIND_POSTGRES)
+        return str(self.target_config.get("kind", ENDPOINT_KIND_POSTGRES))
 
     @property
     def migration_mode(self) -> str:
