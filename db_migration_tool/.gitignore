@@ -257,6 +257,8 @@ docs/_templates/
 # PyInstaller build files
 build/
 dist/
+build_*/
+dist_*/
 # *.spec - Keep spec files in version control
 
 # Local development
