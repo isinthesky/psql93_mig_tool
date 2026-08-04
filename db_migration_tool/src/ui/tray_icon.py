@@ -35,7 +35,8 @@ class TrayIconManager(QObject):
         super().__init__()
         self.app = app
         self.main_window = main_window
-        self.tray_icon = None
+        # cleanup() 후에는 다시 None이 되므로 사용 전 항상 확인한다.
+        self.tray_icon: QSystemTrayIcon | None = None
         self.is_migration_running = False
 
         # 아이콘 경로 저장 (main.py의 get_resource_path 사용)
@@ -114,7 +115,8 @@ class TrayIconManager(QObject):
         quit_action.triggered.connect(self._quit_app)
         menu.addAction(quit_action)
 
-        self.tray_icon.setContextMenu(menu)
+        if self.tray_icon:
+            self.tray_icon.setContextMenu(menu)
 
     def _on_activated(self, reason):
         """트레이 아이콘 클릭 처리
@@ -226,10 +228,13 @@ class TrayIconManager(QObject):
 
         if is_running:
             self._set_running_icon()
-            self.tray_icon.setToolTip("DB Migration Tool - 마이그레이션 실행 중")
+            tooltip = "DB Migration Tool - 마이그레이션 실행 중"
         else:
             self._set_normal_icon()
-            self.tray_icon.setToolTip("DB Migration Tool - 대기 중")
+            tooltip = "DB Migration Tool - 대기 중"
+
+        if self.tray_icon:
+            self.tray_icon.setToolTip(tooltip)
 
     def notify_migration_started(self, profile_name: str):
         """마이그레이션 시작 알림
@@ -288,6 +293,8 @@ class TrayIconManager(QObject):
         """일반 아이콘 설정"""
         import os
 
+        if not self.tray_icon:
+            return
         if os.path.exists(self.icon_normal):
             self.tray_icon.setIcon(QIcon(self.icon_normal))
         else:
@@ -298,6 +305,8 @@ class TrayIconManager(QObject):
         """실행 중 아이콘 설정"""
         import os
 
+        if not self.tray_icon:
+            return
         if os.path.exists(self.icon_running):
             self.tray_icon.setIcon(QIcon(self.icon_running))
         else:
@@ -308,6 +317,7 @@ class TrayIconManager(QObject):
         """트레이 아이콘 정리"""
         if self.tray_icon:
             self.tray_icon.hide()
-            self.tray_icon.setContextMenu(None)
+            # None을 넘겨 메뉴 연결을 끊는 것은 Qt에서 유효하지만 스텁이 QMenu만 받는다.
+            self.tray_icon.setContextMenu(None)  # type: ignore[arg-type]
             self.tray_icon.deleteLater()
             self.tray_icon = None

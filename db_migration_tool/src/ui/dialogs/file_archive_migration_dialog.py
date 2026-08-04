@@ -5,11 +5,12 @@ from __future__ import annotations
 import html
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
+from typing import cast
 
 import psycopg
 from psycopg import sql
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import Qt, QThread, QTimer
 from PySide6.QtGui import QColor, QCursor, QTextCursor
 from PySide6.QtWidgets import (
     QApplication,
@@ -35,7 +36,11 @@ from PySide6.QtWidgets import (
 )
 
 from src.core.archive_manifest import ArchiveManifestStore
-from src.core.file_archive_workers import FileToPostgresArchiveWorker, PostgresToFileArchiveWorker
+from src.core.file_archive_workers import (
+    ArchiveMigrationWorkerBase,
+    FileToPostgresArchiveWorker,
+    PostgresToFileArchiveWorker,
+)
 from src.core.partition_discovery import PartitionDiscovery
 from src.core.table_types import TABLE_TYPE_CONFIG, TableType, get_all_table_types
 from src.database.postgres_utils import PostgresOptimizer
@@ -60,6 +65,20 @@ def to_qdate(py_date):
     return QDate(py_date.year, py_date.month, py_date.day)
 
 
+# 끝내 멈추지 않은 조회 워커를 붙들어 두는 곳.
+#
+# 실행 중인 QThread의 마지막 파이썬 참조가 사라지면 프로세스가 즉사한다.
+# 창을 닫을 때 워커가 아직 살아 있으면 여기로 옮겨서, 창이 사라져도
+# 스레드가 제 발로 끝날 때까지 참조를 유지한다.
+_ORPHANED_SCAN_WORKERS: set[QThread] = set()
+
+
+def _park_orphan_worker(worker: QThread) -> None:
+    """멈추지 않는 워커를 전역에 맡기고 스스로 정리되게 한다."""
+    _ORPHANED_SCAN_WORKERS.add(worker)
+    worker.finished.connect(lambda: _ORPHANED_SCAN_WORKERS.discard(worker))
+
+
 class FileArchiveMigrationDialog(QDialog):
     # 실행 상태 → (램프, 표시 문구). 마이그레이션 마법사와 같은 언어를 쓴다.
     RUN_STATES = {
@@ -78,7 +97,7 @@ class FileArchiveMigrationDialog(QDialog):
         self.history_manager = HistoryManager()
         self.checkpoint_manager = CheckpointManager()
 
-        self.worker = None
+        self.worker: ArchiveMigrationWorkerBase | None = None
         self.history_id: int | None = None
         self.resume_mode = False
         self._incomplete_history: MigrationHistoryItem | None = None
@@ -94,6 +113,20 @@ class FileArchiveMigrationDialog(QDialog):
         self.discovered_partitions: list[PartitionSummary] = []
         self._target_has_data: dict[str, bool] = {}
         self.run_state = "idle"
+
+        # ── 조회(scan) 작업 상태 ────────────────────────────────────────
+        # 탐색/확인을 워커 스레드로 옮기기 위한 공통 골격. 아직 워커는 없고,
+        # 지금은 동기 경로가 이 상태를 갱신한다.
+        #
+        # _scan_gen: 요청 세대. 조건이 바뀌면 올라가고, 늦게 도착한 결과는
+        #   자기 세대가 아니면 버린다.
+        # _selection_verified: 지금 목록에 대해 '대상 완료 여부 확인'이 끝났는가.
+        #   이게 False면 '다음'을 막는다. 확인 전에는 모든 파티션이 체크된 상태로
+        #   보이는데, 그대로 실행하면 이미 완료된 파티션까지 TRUNCATE 후 재적재된다.
+        self._scan_gen: int = 0
+        self._scan_workers: dict[str, QThread] = {}
+        self._inflight: set[str] = set()
+        self._selection_verified: bool = False
 
         self.setWindowTitle(self._build_title())
         self.resize(980, 760)
@@ -403,6 +436,9 @@ class FileArchiveMigrationDialog(QDialog):
         today = datetime.now().date()
         self.start_date_edit.setDate(to_qdate(today))
         self.end_date_edit.setDate(to_qdate(today))
+        # 초기값을 넣은 뒤에 연결한다(설정 자체로 세대가 올라가지 않도록).
+        self.start_date_edit.dateChanged.connect(self._on_scan_condition_changed)
+        self.end_date_edit.dateChanged.connect(self._on_scan_condition_changed)
         row_dates.addWidget(QLabel("시작"))
         row_dates.addWidget(self.start_date_edit)
         row_dates.addWidget(QLabel("종료"))
@@ -451,7 +487,7 @@ class FileArchiveMigrationDialog(QDialog):
         ag.addLayout(row_actions)
 
         separator = QFrame()
-        separator.setFrameShape(QFrame.HLine)
+        separator.setFrameShape(QFrame.Shape.HLine)
         ag.addWidget(separator)
 
         row_select = QHBoxLayout()
@@ -535,6 +571,16 @@ class FileArchiveMigrationDialog(QDialog):
         if selected:
             self.selected_table_types = selected
         self._guard_last_table_type()
+        # 항목이 바뀌면 지금 목록은 더 이상 이 조건의 결과가 아니다.
+        self._bump_generation()
+
+    def _on_scan_condition_changed(self, *_args):
+        """날짜 등 탐색 조건이 바뀌면 확인 상태를 무효화한다.
+
+        이름 필터(`partition_filter`)는 여기 연결하지 않는다. 보기만 거르고
+        선택 상태는 건드리지 않으므로, 필터를 칠 때마다 재탐색을 강요하게 된다.
+        """
+        self._bump_generation()
 
     def _guard_last_table_type(self):
         """마지막 하나 남은 항목은 아예 끌 수 없게 한다(경고창 대신 예방)."""
@@ -552,6 +598,9 @@ class FileArchiveMigrationDialog(QDialog):
         self.error_strategy = "stop" if self.stop_on_error_radio.isChecked() else "skip"
 
     def _check_incomplete_migration(self):
+        if self.profile.id is None:
+            self.incomplete_group.setVisible(False)
+            return
         incomplete = self.history_manager.get_incomplete_history(self.profile.id)
         self._incomplete_history = incomplete
         if not incomplete:
@@ -566,7 +615,7 @@ class FileArchiveMigrationDialog(QDialog):
         )
 
     def _on_resume_clicked(self):
-        if not self._incomplete_history:
+        if not self._incomplete_history or self._incomplete_history.id is None:
             return
         self.resume_mode = True
         self.history_id = self._incomplete_history.id
@@ -611,7 +660,7 @@ class FileArchiveMigrationDialog(QDialog):
         nav_buttons = (self.back_btn, self.next_btn, self.close_btn)
         for btn in (*buttons, *nav_buttons):
             btn.setEnabled(False)
-        QApplication.setOverrideCursor(QCursor(Qt.WaitCursor))
+        QApplication.setOverrideCursor(QCursor(Qt.CursorShape.WaitCursor))
         QApplication.processEvents()
         try:
             yield
@@ -629,7 +678,7 @@ class FileArchiveMigrationDialog(QDialog):
         # 확인이 끝나기 전에 큐에 있던 '다음'이 배달되지 않도록 같이 잠근다.
         for btn in (self.back_btn, self.next_btn, self.close_btn):
             btn.setEnabled(False)
-        QApplication.setOverrideCursor(QCursor(Qt.WaitCursor))
+        QApplication.setOverrideCursor(QCursor(Qt.CursorShape.WaitCursor))
         QApplication.processEvents()
 
         try:
@@ -650,9 +699,17 @@ class FileArchiveMigrationDialog(QDialog):
                     must_exist=False,
                 )
                 t_msg = "출력 경로 사용 가능" if t_ok else t_msg
+        except Exception as e:
+            # 예외가 나도 창은 계속 쓸 수 있어야 하고, 램프가 '확인 중...'에
+            # 멈춰 있으면 안 된다.
+            self._update_connection_ui(False, False, f"확인 실패: {e}", f"확인 실패: {e}")
+            return
         finally:
             QApplication.restoreOverrideCursor()
             self.recheck_btn.setEnabled(True)
+            # 잠근 네비게이션은 성공 경로가 아니라 여기서 되돌린다.
+            # (성공 시에만 복구하면 예외 발생 시 '닫기'까지 영구 비활성이 된다)
+            self._update_nav_state()
 
         self._update_connection_ui(s_ok, t_ok, s_msg, t_msg)
 
@@ -685,11 +742,15 @@ class FileArchiveMigrationDialog(QDialog):
             QMessageBox.warning(self, "연결 필요", "먼저 양쪽 엔드포인트를 확인하세요.")
             return
 
-        start_date = self.start_date_edit.date().toPython()
-        end_date = self.end_date_edit.date().toPython()
+        # QDate.toPython()의 스텁 반환형은 object라 비교/전달 전에 좁혀 준다.
+        start_date = cast(date, self.start_date_edit.date().toPython())
+        end_date = cast(date, self.end_date_edit.date().toPython())
         if start_date > end_date:
             QMessageBox.warning(self, "날짜 오류", "시작 날짜가 종료 날짜보다 늦습니다.")
             return
+
+        # 새 탐색이 시작되면 지금 목록은 더 이상 '확인된' 목록이 아니다.
+        self._bump_generation()
 
         with self._busy("파티션 탐색 중...", self.discover_btn, self.check_completed_btn):
             if self.profile.source_kind == ENDPOINT_KIND_POSTGRES:
@@ -746,9 +807,9 @@ class FileArchiveMigrationDialog(QDialog):
                 f"{marker}  {summary.table_name}  ·  {summary.row_count:,} rows  ·  "
                 f"{cfg.display_name}"
             )
-            item.setData(Qt.UserRole, summary.table_name)
-            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
-            item.setCheckState(Qt.Unchecked if completed_like else Qt.Checked)
+            item.setData(Qt.ItemDataRole.UserRole, summary.table_name)
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(Qt.CheckState.Unchecked if completed_like else Qt.CheckState.Checked)
             if completed_like:
                 item.setForeground(muted)
                 item.setToolTip("대상에 이미 데이터가 있습니다. 다시 실행하려면 체크하세요.")
@@ -761,7 +822,7 @@ class FileArchiveMigrationDialog(QDialog):
         needle = (text or "").strip().lower()
         for idx in range(self.partition_list.count()):
             item = self.partition_list.item(idx)
-            name = item.data(Qt.UserRole)
+            name = item.data(Qt.ItemDataRole.UserRole)
             if not name:
                 continue
             item.setHidden(bool(needle) and needle not in str(name).lower())
@@ -770,20 +831,24 @@ class FileArchiveMigrationDialog(QDialog):
     def _visible_partition_items(self):
         for idx in range(self.partition_list.count()):
             item = self.partition_list.item(idx)
-            if item.data(Qt.UserRole) and not item.isHidden():
+            if item.data(Qt.ItemDataRole.UserRole) and not item.isHidden():
                 yield item
 
     def _bulk_check(self, checked: bool):
         # 거른 상태에서는 '보이는 것'에만 적용한다(안 보이는 걸 몰래 바꾸지 않는다).
         for item in self._visible_partition_items():
-            item.setCheckState(Qt.Checked if checked else Qt.Unchecked)
+            item.setCheckState(Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked)
         self._update_counts()
         self._update_nav_state()
 
     def _select_excluding_completed(self):
         for item in self._visible_partition_items():
-            name = item.data(Qt.UserRole)
-            item.setCheckState(Qt.Unchecked if self._target_has_data.get(name) else Qt.Checked)
+            name = item.data(Qt.ItemDataRole.UserRole)
+            item.setCheckState(
+                Qt.CheckState.Unchecked
+                if self._target_has_data.get(name)
+                else Qt.CheckState.Checked
+            )
         self._update_counts()
         self._update_nav_state()
 
@@ -791,8 +856,8 @@ class FileArchiveMigrationDialog(QDialog):
         selected = []
         for idx in range(self.partition_list.count()):
             item = self.partition_list.item(idx)
-            name = item.data(Qt.UserRole)
-            if name and item.checkState() == Qt.Checked:
+            name = item.data(Qt.ItemDataRole.UserRole)
+            if name and item.checkState() == Qt.CheckState.Checked:
                 selected.append(str(name))
         return selected
 
@@ -804,13 +869,13 @@ class FileArchiveMigrationDialog(QDialog):
 
         for idx in range(self.partition_list.count()):
             item = self.partition_list.item(idx)
-            name = item.data(Qt.UserRole)
+            name = item.data(Qt.ItemDataRole.UserRole)
             if not name:
                 continue
             hidden = item.isHidden()
             if not hidden:
                 visible += 1
-            if item.checkState() == Qt.Checked:
+            if item.checkState() == Qt.CheckState.Checked:
                 selected_names.add(str(name))
                 if hidden:
                     hidden_selected += 1
@@ -844,34 +909,57 @@ class FileArchiveMigrationDialog(QDialog):
         if not names:
             return
 
-        with self._busy(
-            f"대상 확인 중... (파티션 {len(names)}개)",
-            self.discover_btn,
-            self.check_completed_btn,
-        ):
-            if self.profile.target_kind == ENDPOINT_KIND_FILE:
-                store = ArchiveManifestStore(self.profile.target_config["archive_path"])
-                try:
-                    self._target_has_data = store.get_completed_status(names)
-                except FileNotFoundError:
-                    self._target_has_data = dict.fromkeys(names, False)
-            else:
-                self._target_has_data = self._check_target_postgres_partitions(names)
+        gen = self._scan_gen
+        self._mark_scan_started("target")
+        try:
+            with self._busy(
+                f"대상 확인 중... (파티션 {len(names)}개)",
+                self.discover_btn,
+                self.check_completed_btn,
+            ):
+                if self.profile.target_kind == ENDPOINT_KIND_FILE:
+                    store = ArchiveManifestStore(self.profile.target_config["archive_path"])
+                    try:
+                        self._target_has_data = store.get_completed_status(names)
+                    except FileNotFoundError:
+                        # manifest가 없으면 '아무것도 완료되지 않음'이 맞다.
+                        self._target_has_data = dict.fromkeys(names, False)
+                else:
+                    self._target_has_data = self._check_target_postgres_partitions(names)
 
+                self._render_partition_list()
+                self._update_counts()
+        except Exception as e:
+            # 확인에 실패하면 _target_has_data를 믿을 수 없다. 이 상태로 진행하면
+            # 전 파티션이 미완료로 보여 이미 옮긴 것까지 다시 적재된다.
+            # _selection_verified를 올리지 않아 '다음'이 잠긴 채로 남는다.
+            self._target_has_data = {}
+            self.discover_status.setText("대상 확인 실패 — 다시 시도하세요")
+            self.add_log(f"완료 여부 확인 실패: {e}", "ERROR")
             self._render_partition_list()
             self._update_counts()
             self._update_nav_state()
+            return
+        finally:
+            self._mark_scan_finished("target")
 
+        if not self._is_current_generation(gen):
+            # 확인하는 동안 조건이 바뀌었다. 이 결과는 지금 목록의 것이 아니다.
+            return
+
+        self._selection_verified = True
+        self._update_nav_state()
         self.discover_status.setText("대상 확인 완료")
         self.add_log("완료 여부 확인 완료", "INFO")
 
     def _check_target_postgres_partitions(self, names: list[str]) -> dict[str, bool]:
+        # 워커들과 같은 기본값 규칙을 쓴다 (키가 비어도 KeyError/None 전달로 깨지지 않게)
         conn_params = {
-            "host": self.profile.target_config.get("host"),
-            "port": self.profile.target_config.get("port"),
-            "dbname": self.profile.target_config.get("database"),
-            "user": self.profile.target_config.get("username"),
-            "password": self.profile.target_config.get("password"),
+            "host": self.profile.target_config.get("host", "localhost"),
+            "port": self.profile.target_config.get("port", 5432),
+            "dbname": self.profile.target_config.get("database", ""),
+            "user": self.profile.target_config.get("username", ""),
+            "password": self.profile.target_config.get("password", ""),
         }
         if self.profile.target_config.get("ssl"):
             conn_params["sslmode"] = "require"
@@ -890,7 +978,8 @@ class FileArchiveMigrationDialog(QDialog):
                         """,
                         (name,),
                     )
-                    exists = bool(cur.fetchone()[0])
+                    exists_row = cur.fetchone()
+                    exists = bool(exists_row and exists_row[0])
                     if not exists:
                         continue
                     try:
@@ -931,6 +1020,19 @@ class FileArchiveMigrationDialog(QDialog):
             if not selected:
                 QMessageBox.warning(self, "선택 오류", "실행할 파티션을 1개 이상 선택하세요.")
                 return
+
+            # 버튼 상태만 믿지 않는다. 큐에 남아 있던 클릭이 뒤늦게 배달될 수 있어
+            # 실제로 대상을 굳히는 이 지점에서 한 번 더 막는다.
+            if not self._can_freeze_selection():
+                QMessageBox.warning(
+                    self,
+                    "대상 확인 필요",
+                    "대상에 이미 있는 파티션을 확인하기 전에는 진행할 수 없습니다.\n\n"
+                    "'완료여부 확인'을 먼저 실행하세요. 확인하지 않고 진행하면 "
+                    "이미 완료된 파티션까지 다시 적재됩니다.",
+                )
+                return
+
             self._frozen_selection = selected
             self.pages.setCurrentIndex(2)
             self._refresh_summary()
@@ -948,6 +1050,77 @@ class FileArchiveMigrationDialog(QDialog):
         self.step_rail.set_current(idx)
         self.step_title.setText(titles[idx])
         self.step_hint.setText(hints[idx])
+
+    # ============================
+    # 조회(scan) 작업 골격
+    # ============================
+
+    def _bump_generation(self) -> int:
+        """조회 조건이 바뀌었음을 알린다.
+
+        늦게 도착하는 이전 세대의 결과는 버려지고, 지금 목록은 더 이상
+        '확인된' 목록이 아니게 된다.
+        """
+        self._scan_gen += 1
+        self._selection_verified = False
+        self._update_nav_state()
+        return self._scan_gen
+
+    def _is_current_generation(self, gen: int) -> bool:
+        return gen == self._scan_gen
+
+    def _has_active_scan(self) -> bool:
+        """탐색/확인 작업이 돌고 있는가.
+
+        마이그레이션 실행(`_is_running`)과 구분한다. 실행은 닫기를 막지만,
+        조회는 파괴적이지 않으므로 닫기를 허용하고 대신 정리한다.
+        """
+        return any(w is not None and w.isRunning() for w in self._scan_workers.values())
+
+    def _mark_scan_started(self, kind: str) -> None:
+        self._inflight.add(kind)
+
+    def _mark_scan_finished(self, kind: str) -> None:
+        self._inflight.discard(kind)
+
+    def _is_scan_inflight(self, kind: str) -> bool:
+        """해당 종류의 조회가 진행 중인가.
+
+        `isRunning()`만으로는 run()이 끝나고 결과 슬롯이 아직 안 돈 구간을
+        놓친다. 그 틈에 두 번째 요청이 들어가면 워커가 둘이 된다.
+        """
+        if kind in self._inflight:
+            return True
+        worker = self._scan_workers.get(kind)
+        return bool(worker is not None and worker.isRunning())
+
+    def _shutdown_scans(self, timeout_ms: int = 3000) -> bool:
+        """진행 중인 조회 워커를 정리한다.
+
+        `terminate()`는 쓰지 않는다. psycopg 커넥션과 아카이브 파일 락이
+        정리되지 않은 채 남아 이후 저장이 실패한다.
+
+        Returns:
+            제한 시간 안에 전부 멈췄으면 True.
+        """
+        workers = [w for w in self._scan_workers.values() if w is not None and w.isRunning()]
+        for worker in workers:
+            worker.requestInterruption()
+            cancel = getattr(worker, "cancel_query", None)
+            if callable(cancel):
+                try:
+                    cancel()
+                except Exception:
+                    pass
+
+        all_stopped = True
+        for worker in workers:
+            if not worker.wait(timeout_ms):
+                all_stopped = False
+
+        if all_stopped:
+            self._inflight.clear()
+        return all_stopped
 
     def _is_running(self) -> bool:
         if self.run_state in ("running", "paused"):
@@ -975,10 +1148,25 @@ class FileArchiveMigrationDialog(QDialog):
             has_target = bool(self.resume_mode and self._frozen_selection) or bool(
                 self.get_selected_partition_names()
             )
-            self.next_btn.setEnabled(has_target)
+            # 대상 확인이 끝나지 않은 목록으로는 넘어갈 수 없다. 확인 전에는
+            # 모든 파티션이 체크된 것처럼 보이고, 그대로 실행하면 이미 완료된
+            # 파티션까지 TRUNCATE 후 재적재된다.
+            self.next_btn.setEnabled(has_target and self._can_freeze_selection())
+            self.next_btn.setToolTip(
+                "대상 확인이 끝나야 다음 단계로 넘어갈 수 있습니다. '완료여부 확인'을 눌러주세요."
+                if has_target and not self._can_freeze_selection()
+                else "현재 설정을 확인하고 다음 단계로 이동합니다."
+            )
         else:
             self.next_btn.setVisible(False)
         self.close_btn.setEnabled(not running)
+
+    def _can_freeze_selection(self) -> bool:
+        """지금 목록을 실행 대상으로 굳혀도 되는가.
+
+        재개 모드의 실행 대상은 미완료 체크포인트라 목록과 무관하므로 통과시킨다.
+        """
+        return self.resume_mode or self._selection_verified
 
     def _selected_row_total(self, names) -> int:
         wanted = set(names)
@@ -1020,8 +1208,13 @@ class FileArchiveMigrationDialog(QDialog):
             return
 
         if not self.resume_mode:
-            start_date = self.start_date_edit.date().toPython()
-            end_date = self.end_date_edit.date().toPython()
+            if self.profile.id is None:
+                QMessageBox.warning(
+                    self, "프로필 오류", "저장되지 않은 프로필로는 실행할 수 없습니다."
+                )
+                return
+            start_date = cast(date, self.start_date_edit.date().toPython())
+            end_date = cast(date, self.end_date_edit.date().toPython())
             history = self.history_manager.create_history(
                 self.profile.id,
                 start_date.strftime("%Y-%m-%d"),
@@ -1029,9 +1222,16 @@ class FileArchiveMigrationDialog(QDialog):
                 source_status=self.source_status_message,
                 target_status=self.target_status_message,
             )
+            if history.id is None:
+                QMessageBox.critical(self, "이력 생성 실패", "작업 이력을 만들지 못했습니다.")
+                return
             self.history_id = history.id
             for partition in partitions:
                 self.checkpoint_manager.create_checkpoint(self.history_id, partition)
+
+        if self.history_id is None:
+            QMessageBox.critical(self, "이력 없음", "실행할 작업 이력이 없습니다.")
+            return
 
         if self.profile.migration_mode == "postgres_to_file":
             self.worker = PostgresToFileArchiveWorker(
@@ -1081,10 +1281,10 @@ class FileArchiveMigrationDialog(QDialog):
             self,
             "작업 취소",
             "작업을 취소하시겠습니까? 완료된 파티션은 유지됩니다.",
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.No,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
         )
-        if reply == QMessageBox.Yes:
+        if reply == QMessageBox.StandardButton.Yes:
             self.worker.stop(reason="user_cancel")
             self.add_log("사용자가 작업을 취소했습니다", "WARNING")
 
@@ -1149,9 +1349,9 @@ class FileArchiveMigrationDialog(QDialog):
         total = len(self.worker.partitions) if self.worker else 0
         self.total_label.setText(f"{total} / {total}")
 
-        has_failures = bool(self.worker and getattr(self.worker, "partition_failures", []))
-        if has_failures:
-            failed_count = len(self.worker.partition_failures)
+        failures = self.worker.partition_failures if self.worker else []
+        if failures:
+            failed_count = len(failures)
             if self.history_id:
                 self.history_manager.update_history_status(
                     self.history_id,
@@ -1203,7 +1403,7 @@ class FileArchiveMigrationDialog(QDialog):
             f'<span style="color:{TEXT_MUTED}">[{timestamp}]</span> '
             f'<span style="color:{log_color(level)}">{level:<7} {safe}</span>'
         )
-        self.log_text.moveCursor(QTextCursor.End)
+        self.log_text.moveCursor(QTextCursor.MoveOperation.End)
         log_emitter.emit_log(level, message)
 
     def _block_close_while_running(self) -> bool:
@@ -1220,10 +1420,23 @@ class FileArchiveMigrationDialog(QDialog):
         # Esc 키는 closeEvent를 거치지 않을 수 있으므로 여기서도 막는다.
         if self._block_close_while_running():
             return
+        if not self._shutdown_scans():
+            # 아직 멈추지 않았다. 잠시 뒤 다시 시도한다(창은 열어둔다).
+            self.discover_status.setText("조회 작업 정리 중...")
+            QTimer.singleShot(200, self.reject)
+            return
         super().reject()
 
     def closeEvent(self, event):
         if self._block_close_while_running():
             event.ignore()
+            return
+        # 조회 작업은 닫기를 막지 않는다(파괴적이지 않다). 대신 먼저 정리한다.
+        # 정리하지 않고 닫으면 워커가 파괴된 위젯을 갱신하거나,
+        # QThread가 실행 중인 채로 파괴돼 프로세스가 죽는다.
+        if not self._shutdown_scans():
+            self.discover_status.setText("조회 작업 정리 중...")
+            event.ignore()
+            QTimer.singleShot(200, self.close)
             return
         event.accept()

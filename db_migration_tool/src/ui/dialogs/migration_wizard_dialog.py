@@ -17,6 +17,7 @@ from __future__ import annotations
 import html
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
+from typing import cast
 
 import psycopg2
 from psycopg2 import sql
@@ -618,8 +619,8 @@ class MigrationWizardDialog(QDialog):
         action_layout.addLayout(row_actions)
 
         separator = QFrame()
-        separator.setFrameShape(QFrame.HLine)
-        separator.setFrameShadow(QFrame.Sunken)
+        separator.setFrameShape(QFrame.Shape.HLine)
+        separator.setFrameShadow(QFrame.Shadow.Sunken)
         action_layout.addWidget(separator)
 
         row_select = QHBoxLayout()
@@ -983,7 +984,11 @@ class MigrationWizardDialog(QDialog):
     # ============================
 
     def _check_incomplete_migration(self):
-        incomplete = self.history_manager.get_incomplete_history(self.profile.id)
+        incomplete = (
+            self.history_manager.get_incomplete_history(self.profile.id)
+            if self.profile.id is not None
+            else None
+        )
         self._incomplete_history: MigrationHistoryItem | None = incomplete
 
         if not incomplete:
@@ -1042,7 +1047,7 @@ class MigrationWizardDialog(QDialog):
         self.server_copy_warning.setVisible(False)
 
     def _on_resume_clicked(self):
-        if not self._incomplete_history:
+        if not self._incomplete_history or self._incomplete_history.id is None:
             return
 
         self.resume_mode = True
@@ -1093,13 +1098,16 @@ class MigrationWizardDialog(QDialog):
 
     def _load_last_completed_partitions_cache(self):
         """프로필의 모든 완료 이력에서 completed 파티션 캐시"""
+        if self.profile.id is None:
+            self._completed_from_history = set()
+            return
         try:
             completed_histories = self.history_manager.get_completed_histories(self.profile.id)
             if not completed_histories:
                 self._completed_from_history = set()
                 return
 
-            history_ids = [h.id for h in completed_histories]
+            history_ids = [h.id for h in completed_histories if h.id is not None]
             self._completed_from_history = self.checkpoint_manager.get_completed_partition_names(
                 history_ids
             )
@@ -1167,8 +1175,9 @@ class MigrationWizardDialog(QDialog):
             QMessageBox.warning(self, "연결 필요", "먼저 소스/대상 DB 연결이 모두 성공해야 합니다.")
             return
 
-        start_date = self.start_date_edit.date().toPython()
-        end_date = self.end_date_edit.date().toPython()
+        # QDate.toPython()의 스텁 반환형은 object라 비교/전달 전에 좁혀 준다.
+        start_date = cast(date, self.start_date_edit.date().toPython())
+        end_date = cast(date, self.end_date_edit.date().toPython())
         if start_date > end_date:
             QMessageBox.warning(self, "날짜 오류", "시작 날짜가 종료 날짜보다 늦습니다.")
             return
@@ -1266,11 +1275,11 @@ class MigrationWizardDialog(QDialog):
             text = f"{marker}  {s.table_name}  ·  {s.row_count:,} rows  ·  {type_name}"
 
             item = QListWidgetItem(text)
-            item.setData(Qt.UserRole, s.table_name)
-            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            item.setData(Qt.ItemDataRole.UserRole, s.table_name)
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
 
             # 기본 체크: 완료로 판단되면 기본 해제, 그 외 체크
-            item.setCheckState(Qt.Unchecked if completed_like else Qt.Checked)
+            item.setCheckState(Qt.CheckState.Unchecked if completed_like else Qt.CheckState.Checked)
 
             if completed_like:
                 reasons = []
@@ -1293,7 +1302,7 @@ class MigrationWizardDialog(QDialog):
                 "날짜 범위를 좁혀서 나눠 실행하세요."
             )
             overflow.setForeground(QColor(TEXT_DANGER))
-            overflow.setFlags(Qt.NoItemFlags)
+            overflow.setFlags(Qt.ItemFlag.NoItemFlags)
             self.partition_list.addItem(overflow)
 
     def _apply_partition_filter(self, text: str):
@@ -1301,7 +1310,7 @@ class MigrationWizardDialog(QDialog):
         needle = (text or "").strip().lower()
         for i in range(self.partition_list.count()):
             item = self.partition_list.item(i)
-            name = item.data(Qt.UserRole)
+            name = item.data(Qt.ItemDataRole.UserRole)
             if not name:
                 continue
             item.setHidden(bool(needle) and needle not in str(name).lower())
@@ -1310,20 +1319,22 @@ class MigrationWizardDialog(QDialog):
     def _visible_partition_items(self):
         for i in range(self.partition_list.count()):
             item = self.partition_list.item(i)
-            if item.data(Qt.UserRole) and not item.isHidden():
+            if item.data(Qt.ItemDataRole.UserRole) and not item.isHidden():
                 yield item
 
     def _bulk_check(self, checked: bool):
         # 거른 상태에서는 '보이는 것'에만 적용한다(안 보이는 걸 몰래 바꾸지 않는다).
         for item in self._visible_partition_items():
-            item.setCheckState(Qt.Checked if checked else Qt.Unchecked)
+            item.setCheckState(Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked)
         self._update_counts()
         self._update_nav_state()
 
     def _select_excluding_completed(self):
         for item in self._visible_partition_items():
-            name = item.data(Qt.UserRole)
-            item.setCheckState(Qt.Unchecked if self._is_completed_like(name) else Qt.Checked)
+            name = item.data(Qt.ItemDataRole.UserRole)
+            item.setCheckState(
+                Qt.CheckState.Unchecked if self._is_completed_like(name) else Qt.CheckState.Checked
+            )
         self._update_counts()
         self._update_nav_state()
 
@@ -1331,10 +1342,10 @@ class MigrationWizardDialog(QDialog):
         selected: list[str] = []
         for i in range(self.partition_list.count()):
             item = self.partition_list.item(i)
-            name = item.data(Qt.UserRole)
+            name = item.data(Qt.ItemDataRole.UserRole)
             if not name:
                 continue
-            if item.checkState() == Qt.Checked:
+            if item.checkState() == Qt.CheckState.Checked:
                 selected.append(str(name))
         return selected
 
@@ -1346,13 +1357,13 @@ class MigrationWizardDialog(QDialog):
 
         for i in range(self.partition_list.count()):
             item = self.partition_list.item(i)
-            name = item.data(Qt.UserRole)
+            name = item.data(Qt.ItemDataRole.UserRole)
             if not name:
                 continue
             hidden = item.isHidden()
             if not hidden:
                 visible += 1
-            if item.checkState() == Qt.Checked:
+            if item.checkState() == Qt.CheckState.Checked:
                 selected_names.add(str(name))
                 if hidden:
                     hidden_selected += 1
@@ -1484,9 +1495,13 @@ class MigrationWizardDialog(QDialog):
                 QMessageBox.critical(self, "오류", "재개 이력 ID가 없습니다.")
                 return
         else:
+            if self.profile.id is None:
+                QMessageBox.critical(self, "오류", "저장되지 않은 프로필로는 실행할 수 없습니다.")
+                return
+
             # 새 이력 생성 + 체크포인트 생성
-            start_date = self.start_date_edit.date().toPython()
-            end_date = self.end_date_edit.date().toPython()
+            start_date = cast(date, self.start_date_edit.date().toPython())
+            end_date = cast(date, self.end_date_edit.date().toPython())
 
             source_status = "연결 성공" if self.source_connected else self.source_status_message
             target_status = "연결 성공" if self.target_connected else self.target_status_message
@@ -1498,6 +1513,9 @@ class MigrationWizardDialog(QDialog):
                 source_status=source_status,
                 target_status=target_status,
             )
+            if history.id is None:
+                QMessageBox.critical(self, "오류", "작업 이력을 만들지 못했습니다.")
+                return
             self.history_id = history.id
 
             for p in partitions:
@@ -1552,13 +1570,13 @@ class MigrationWizardDialog(QDialog):
             "삭제(TRUNCATE)하고 계속 진행할까요?\n\n"
             "Yes: 삭제 후 진행\n"
             "No: 해당 파티션 실패 처리(에러 전략에 따라 중단/스킵)",
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.No,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
         )
 
         if self.worker:
-            self.worker.truncate_permission = reply == QMessageBox.Yes
-            if reply == QMessageBox.No and not self.worker.skip_on_error:
+            self.worker.truncate_permission = reply == QMessageBox.StandardButton.Yes
+            if reply == QMessageBox.StandardButton.No and not self.worker.skip_on_error:
                 # 중단 모드면 즉시 stop(대화상자 반환 후 워커가 예외 처리)
                 self.worker.stop()
 
@@ -1584,10 +1602,10 @@ class MigrationWizardDialog(QDialog):
             self,
             "작업 취소",
             "마이그레이션을 취소하시겠습니까?\n완료된 파티션은 유지되며, 나중에 이어서 진행할 수 있습니다.",
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.No,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
         )
-        if reply == QMessageBox.Yes:
+        if reply == QMessageBox.StandardButton.Yes:
             self.worker.stop()
             self.add_log("사용자가 마이그레이션을 취소했습니다", "WARNING")
 
@@ -1614,10 +1632,10 @@ class MigrationWizardDialog(QDialog):
             self,
             "검증 실행",
             "COUNT(*) 기반 검증은 시간이 오래 걸릴 수 있습니다.\n\n계속 진행할까요?",
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.No,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
         )
-        if reply != QMessageBox.Yes:
+        if reply != QMessageBox.StandardButton.Yes:
             return
 
         self.add_log(f"row_count 검증 시작 - 파티션 {len(table_names)}개", "INFO")
@@ -1649,6 +1667,8 @@ class MigrationWizardDialog(QDialog):
         mismatches = [r for r in (results or []) if not r.get("ok")]
 
         # mismatch는 해당 파티션만 failed로 마킹하고 history는 completed 유지
+        if self.history_id is None:
+            return
         try:
             cps = self.checkpoint_manager.get_checkpoints(self.history_id)
             by_name = {cp.partition_name: cp for cp in cps}
@@ -1656,7 +1676,7 @@ class MigrationWizardDialog(QDialog):
             for r in mismatches:
                 name = r.get("table")
                 cp = by_name.get(name)
-                if not cp:
+                if not cp or cp.id is None:
                     continue
                 self.checkpoint_manager.update_checkpoint_status(
                     cp.id,
@@ -1830,7 +1850,7 @@ class MigrationWizardDialog(QDialog):
             f'<span style="color:{TEXT_MUTED}">[{timestamp}]</span> '
             f'<span style="color:{color}">{level:<7} {safe}</span>'
         )
-        self.log_text.moveCursor(QTextCursor.End)
+        self.log_text.moveCursor(QTextCursor.MoveOperation.End)
         log_emitter.emit_log(level, message)
 
     # ============================

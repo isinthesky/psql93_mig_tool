@@ -3,7 +3,8 @@
 """
 
 import html
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
+from typing import cast
 
 from PySide6.QtCore import QDate, Qt, QTimer, Slot
 from PySide6.QtGui import QAction, QTextCursor
@@ -50,7 +51,9 @@ class LogViewerDialog(QDialog):
         """UI 초기화"""
         self.setWindowTitle("로그 뷰어")
         self.setWindowFlags(
-            self.windowFlags() | Qt.WindowMinimizeButtonHint | Qt.WindowMaximizeButtonHint
+            self.windowFlags()
+            | Qt.WindowType.WindowMinimizeButtonHint
+            | Qt.WindowType.WindowMaximizeButtonHint
         )
         self.resize(900, 600)
 
@@ -229,8 +232,9 @@ class LogViewerDialog(QDialog):
         조회(apply_filters)와 증분 폴링(check_new_logs)이 반드시 같은 조건을 써야
         하므로 한 곳에서만 만든다.
         """
-        start_date = self.start_date.date().toPython()
-        end_date = self.end_date.date().toPython() + timedelta(days=1)
+        # QDate.toPython()의 스텁 반환형은 object라 datetime 연산 전에 좁혀 준다.
+        start_date = cast(date, self.start_date.date().toPython())
+        end_date = cast(date, self.end_date.date().toPython()) + timedelta(days=1)
         conditions = [LogEntry.timestamp >= start_date, LogEntry.timestamp < end_date]
 
         level_text = self.level_filter.currentText()
@@ -413,14 +417,14 @@ class LogViewerDialog(QDialog):
         )
 
         cursor = self.log_text.textCursor()
-        cursor.movePosition(QTextCursor.End)
+        cursor.movePosition(QTextCursor.MoveOperation.End)
         if not self.log_text.document().isEmpty():
             cursor.insertBlock()
         cursor.insertHtml(line)
 
         # 자동 스크롤
         if self.auto_scroll:
-            self.log_text.moveCursor(QTextCursor.End)
+            self.log_text.moveCursor(QTextCursor.MoveOperation.End)
 
     def append_log_entry(self, log_entry):
         """로그 엔트리 추가"""

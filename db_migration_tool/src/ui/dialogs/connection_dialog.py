@@ -82,16 +82,18 @@ class ConnectionDialog(QDialog):
         layout.addWidget(self.tab_widget)
 
         # 저장/취소만 남긴다. 연결 테스트는 테스트하는 탭 안으로 옮겼다.
-        button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        button_box = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
         button_box.accepted.connect(self.accept)
         button_box.rejected.connect(self.reject)
 
-        ok_btn = button_box.button(QDialogButtonBox.Ok)
+        ok_btn = button_box.button(QDialogButtonBox.StandardButton.Ok)
         ok_btn.setText("저장")
         ok_btn.setObjectName("primaryAction")
         ok_btn.setToolTip("입력한 연결 정보를 확인한 뒤 프로필로 저장합니다.")
         ok_btn.setDefault(True)
-        button_box.button(QDialogButtonBox.Cancel).setText("취소")
+        button_box.button(QDialogButtonBox.StandardButton.Cancel).setText("취소")
 
         layout.addWidget(button_box)
 
@@ -156,7 +158,7 @@ class ConnectionDialog(QDialog):
         postgres_layout.addRow("사용자명:", username_edit)
 
         password_edit = QLineEdit()
-        password_edit.setEchoMode(QLineEdit.Password)
+        password_edit.setEchoMode(QLineEdit.EchoMode.Password)
         password_edit.setPlaceholderText("비밀번호 입력")
         password_edit.setToolTip(
             "PostgreSQL 접속 비밀번호를 입력하세요. 저장 정책은 기존 설정을 따릅니다."
@@ -311,9 +313,9 @@ class ConnectionDialog(QDialog):
             self,
             "프리셋 삭제",
             f"'{preset['label']}'을(를) 삭제하시겠습니까?",
-            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
         )
-        if reply == QMessageBox.Yes:
+        if reply == QMessageBox.StandardButton.Yes:
             self.saved_conn_manager.delete(preset["id"])
             self._refresh_presets(side)
             for other_side in ("source", "target"):
@@ -457,13 +459,17 @@ class ConnectionDialog(QDialog):
         )
 
         widgets["test_btn"].setEnabled(False)
-        QApplication.setOverrideCursor(QCursor(Qt.WaitCursor))
+        QApplication.setOverrideCursor(QCursor(Qt.CursorShape.WaitCursor))
         QApplication.processEvents()  # '확인 중...'이 실제로 보이게 한 번 그린다
         try:
             with psycopg.connect(**psycopg_config, connect_timeout=7) as conn:
                 with conn.cursor() as cur:
                     cur.execute("SELECT version()")
-                    version_str = cur.fetchone()[0]
+                    version_row = cur.fetchone()
+                    if not version_row:
+                        lamp.set_state("error", "연결 실패 · 서버 버전을 읽지 못했습니다")
+                        return
+                    version_str = version_row[0]
                     version_info = parse_version_string(version_str)
         except Exception as e:
             lamp.set_state("error", f"연결 실패 · {e}")

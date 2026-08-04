@@ -5,6 +5,7 @@
 from PySide6.QtCore import QEvent, Qt, QTimer, Signal
 from PySide6.QtGui import QAction, QCloseEvent
 from PySide6.QtWidgets import (
+    QDialog,
     QGroupBox,
     QHBoxLayout,
     QListWidget,
@@ -250,7 +251,7 @@ class MainWindow(QMainWindow):
         if not profiles:
             # 빈 목록은 막다른 화면이 아니라 다음 할 일을 알려주는 자리다.
             empty = QListWidgetItem("연결 프로필이 없습니다. ‘새 연결’로 시작하세요.")
-            empty.setFlags(Qt.NoItemFlags)
+            empty.setFlags(Qt.ItemFlag.NoItemFlags)
             self.profile_list.addItem(empty)
             return
 
@@ -262,7 +263,7 @@ class MainWindow(QMainWindow):
                 f"마이그레이션 경로: {summary}\n"
                 f"실행 동작: {self._migration_mode_text(profile)}"
             )
-            item.setData(Qt.UserRole, profile.id)
+            item.setData(Qt.ItemDataRole.UserRole, profile.id)
             self.profile_list.addItem(item)
 
     def update_profile_selection(self, profile):
@@ -311,7 +312,7 @@ class MainWindow(QMainWindow):
         """프로필 선택 이벤트 (ViewModel로 위임)"""
         selected_items = self.profile_list.selectedItems()
         if selected_items:
-            profile_id = selected_items[0].data(Qt.UserRole)
+            profile_id = selected_items[0].data(Qt.ItemDataRole.UserRole)
             self.vm.select_profile(profile_id)
         else:
             self.vm.select_profile(None)  # 선택 해제 시 None 전달
@@ -325,17 +326,19 @@ class MainWindow(QMainWindow):
 
     def edit_connection(self):
         """연결 편집 (ViewModel로 위임)"""
-        if not self.vm.current_profile:
+        profile = self.vm.current_profile
+        # 저장 전 프로필은 id가 없어 갱신 대상이 될 수 없다.
+        if profile is None or profile.id is None:
             return
 
-        dialog = ConnectionDialog(self, self.vm.current_profile)
+        dialog = ConnectionDialog(self, profile)
         if dialog.exec():
             profile_data = dialog.get_profile_data()
-            self.vm.update_profile(self.vm.current_profile.id, profile_data)
+            self.vm.update_profile(profile.id, profile_data)
 
     def delete_connection(self):
         """연결 삭제 (ViewModel로 위임)"""
-        if not self.vm.current_profile:
+        if self.vm.current_profile is None or self.vm.current_profile.id is None:
             return
 
         # 무엇을 지우는지, 무엇이 남는지를 확인 창에서 그대로 말한다.
@@ -344,11 +347,11 @@ class MainWindow(QMainWindow):
             "연결 프로필 삭제",
             f"'{self.vm.current_profile.name}' 연결 프로필을 삭제할까요?\n\n"
             "작업 이력과 저장된 연결은 삭제되지 않습니다.",
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.No,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
         )
 
-        if reply == QMessageBox.Yes:
+        if reply == QMessageBox.StandardButton.Yes:
             self.vm.delete_profile(self.vm.current_profile.id)
 
     def start_migration(self):
@@ -360,11 +363,16 @@ class MainWindow(QMainWindow):
         self.status_bar.showMessage(
             f"{self._migration_mode_text(profile)} 실행 준비 · {self._endpoint_summary(profile)}"
         )
+        dialog: QDialog
         if profile.source_kind == "postgres" and profile.target_kind == "postgres":
             dialog = MigrationWizardDialog(self, profile)
         else:
             dialog = FileArchiveMigrationDialog(self, profile)
         dialog.exec()
+        # 다이얼로그는 이 창의 자식이라 exec()가 끝나도 살아 있다.
+        # 정리하지 않으면 마이그레이션을 열 때마다 쌓이고, 워커 결과가
+        # 숨겨진 창으로 계속 배달된다.
+        dialog.deleteLater()
 
         if self.history_dialog and not self.history_dialog.isHidden():
             self.history_dialog.refresh()
