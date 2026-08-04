@@ -5,15 +5,15 @@ Defines constants and metadata for different partition table types
 supported by the migration tool.
 """
 
-from enum import Enum
+import calendar
 from dataclasses import dataclass
 from datetime import datetime
-import calendar
-from typing import List, Tuple, Optional
+from enum import StrEnum
 
 
-class TableType(str, Enum):
+class TableType(StrEnum):
     """Supported partition table types"""
+
     POINT_HISTORY = "PH"
     POINT_SEC_HISTORY = "PS"
     TREND_HISTORY = "TH"
@@ -51,7 +51,7 @@ class TableType(str, Enum):
         return TABLE_TYPE_CONFIG[self].date_is_timestamp
 
     @property
-    def columns(self) -> List[str]:
+    def columns(self) -> list[str]:
         """Get the list of column names"""
         return TABLE_TYPE_CONFIG[self].columns
 
@@ -64,13 +64,14 @@ class TableType(str, Enum):
 @dataclass
 class TableTypeConfig:
     """Configuration for a specific table type"""
+
     table_name: str
     display_name: str
     uses_trigger: bool
     uses_rules: bool
     date_column: str
     date_is_timestamp: bool  # True for timestamp, False for bigint
-    columns: List[str]
+    columns: list[str]
     description: str
     partition_suffix: str  # daily | monthly
 
@@ -88,7 +89,6 @@ TABLE_TYPE_CONFIG = {
         description="Point history data with TRIGGER-based partitioning",
         partition_suffix="daily",
     ),
-
     TableType.POINT_SEC_HISTORY: TableTypeConfig(
         table_name="point_sec_history",
         display_name="Point Sec History",
@@ -100,7 +100,6 @@ TABLE_TYPE_CONFIG = {
         description="Point second history data with TRIGGER-based partitioning",
         partition_suffix="daily",
     ),
-
     TableType.TREND_HISTORY: TableTypeConfig(
         table_name="trend_history",
         display_name="Trend History",
@@ -112,7 +111,6 @@ TABLE_TYPE_CONFIG = {
         description="Trend history data with RULE-based partitioning",
         partition_suffix="monthly",
     ),
-
     TableType.ENERGY_DISPLAY: TableTypeConfig(
         table_name="energy_display",
         display_name="Energy Display",
@@ -124,7 +122,6 @@ TABLE_TYPE_CONFIG = {
         description="Energy display data with RULE-based partitioning (timestamp)",
         partition_suffix="monthly",
     ),
-
     TableType.RUNNING_TIME_HISTORY: TableTypeConfig(
         table_name="running_time_history",
         display_name="Running Time History",
@@ -133,9 +130,16 @@ TABLE_TYPE_CONFIG = {
         date_column="issued_date",
         date_is_timestamp=False,  # bigint (Unix timestamp ms)
         columns=[
-            "path_id", "issued_date", "save_type", "checked_time",
-            "running_time", "accu_time", "running_count",
-            "eng_value", "eng_accu_value", "previous_weight_value"
+            "path_id",
+            "issued_date",
+            "save_type",
+            "checked_time",
+            "running_time",
+            "accu_time",
+            "running_count",
+            "eng_value",
+            "eng_accu_value",
+            "previous_weight_value",
         ],
         description="Running time history data with RULE-based partitioning",
         partition_suffix="monthly",
@@ -167,17 +171,19 @@ def get_table_name(table_type: TableType) -> str:
     return TABLE_TYPE_CONFIG[table_type].table_name
 
 
-def get_all_table_types() -> List[TableType]:
+def get_all_table_types() -> list[TableType]:
     """Get list of all supported table types"""
     return list(TableType)
 
 
-def get_all_table_names() -> List[str]:
+def get_all_table_names() -> list[str]:
     """Get list of all supported table names"""
     return [config.table_name for config in TABLE_TYPE_CONFIG.values()]
 
 
-def infer_partition_range(table_type: TableType, partition_name: str) -> Tuple[Optional[int], Optional[int]]:
+def infer_partition_range(
+    table_type: TableType, partition_name: str
+) -> tuple[int | None, int | None]:
     """Infer partition [from_ms, to_ms] from partition suffix.
 
     - daily: point_history_YYMMDD / point_sec_history_YYMMDD
@@ -188,7 +194,7 @@ def infer_partition_range(table_type: TableType, partition_name: str) -> Tuple[O
     if not partition_name.startswith(prefix):
         return None, None
 
-    suffix = partition_name[len(prefix):]
+    suffix = partition_name[len(prefix) :]
     try:
         if config.partition_suffix == "daily":
             if len(suffix) != 6:
@@ -215,9 +221,13 @@ def infer_partition_range(table_type: TableType, partition_name: str) -> Tuple[O
     return None, None
 
 
-def get_partition_primary_key_columns(table_type: TableType) -> List[str]:
+def get_partition_primary_key_columns(table_type: TableType) -> list[str]:
     """Return per-partition PK columns based on historical DDL conventions."""
-    if table_type in (TableType.POINT_HISTORY, TableType.POINT_SEC_HISTORY, TableType.TREND_HISTORY):
+    if table_type in (
+        TableType.POINT_HISTORY,
+        TableType.POINT_SEC_HISTORY,
+        TableType.TREND_HISTORY,
+    ):
         return ["path_id", "issued_date"]
     if table_type == TableType.ENERGY_DISPLAY:
         return ["sensor_id", "issued_date"]

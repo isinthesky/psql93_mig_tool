@@ -6,7 +6,7 @@ import os
 import threading
 import time
 from queue import Empty, Queue
-from typing import Any, Union
+from typing import Any
 
 import psycopg2
 from psycopg2 import sql
@@ -15,7 +15,11 @@ from PySide6.QtCore import Signal
 from src.core.base_migration_worker import BaseMigrationWorker
 from src.core.performance_metrics import PerformanceMetrics
 from src.core.table_creator import TableCreator
-from src.core.table_types import TABLE_TYPE_CONFIG, TableType, get_table_type, get_partition_primary_key_columns
+from src.core.table_types import (
+    TABLE_TYPE_CONFIG,
+    get_partition_primary_key_columns,
+    get_table_type,
+)
 from src.database.postgres_utils import PostgresOptimizer
 from src.database.version_info import PgVersionInfo
 from src.models.profile import ConnectionProfile
@@ -41,7 +45,7 @@ class CopyStreamBuffer:
             extra_track_indices: CSV에서 추가로 추적할 컬럼 인덱스 목록
                 (예: save_type이 columns[2]이면 [2] 전달)
         """
-        self.queue: Queue[Union[str, bytes, None]] = Queue(maxsize=max_queue_size)
+        self.queue: Queue[str | bytes | None] = Queue(maxsize=max_queue_size)
         self.last_key: str | None = None
         self.last_date: str | None = None
         self.last_extra: dict[int, str] = {}  # {csv_index: last_value}
@@ -53,7 +57,7 @@ class CopyStreamBuffer:
         self._cancel = threading.Event()
         self.error: Exception | None = None
 
-    def write(self, data: Union[str, bytes]):
+    def write(self, data: str | bytes):
         """COPY OUT이 호출하는 write; 청크를 큐에 적재
 
         교착 방지: 큐가 가득 찬 상태에서 _WRITE_TIMEOUT 초 대기 후 예외 발생
@@ -244,9 +248,7 @@ class CopyMigrationWorker(BaseMigrationWorker):
                 "Server-side COPY는 재개 모드 미지원. Python COPY로 전환합니다.",
                 "WARNING",
             )
-            log_emitter.emit_log(
-                "WARNING", "Server-side COPY → Python COPY 자동 전환 (resume)"
-            )
+            log_emitter.emit_log("WARNING", "Server-side COPY → Python COPY 자동 전환 (resume)")
             self.copy_mode = "python"
 
         try:
@@ -475,6 +477,7 @@ class CopyMigrationWorker(BaseMigrationWorker):
         if is_timestamp:
             try:
                 import datetime as _dt
+
                 if isinstance(value, (_dt.datetime, _dt.date)):
                     safe = value.isoformat(sep=" ")
                 else:
@@ -499,9 +502,7 @@ class CopyMigrationWorker(BaseMigrationWorker):
             return None
 
         with self.target_conn.cursor() as cur:
-            q = sql.SQL(
-                "SELECT {k}, {d} FROM {t} ORDER BY {k} DESC, {d} DESC LIMIT 1"
-            ).format(
+            q = sql.SQL("SELECT {k}, {d} FROM {t} ORDER BY {k} DESC, {d} DESC LIMIT 1").format(
                 k=sql.Identifier(key_column),
                 d=sql.Identifier(date_column),
                 t=sql.Identifier(partition_name),
@@ -530,9 +531,9 @@ class CopyMigrationWorker(BaseMigrationWorker):
             order = sql.SQL(", ").join(
                 sql.SQL("{} DESC").format(sql.Identifier(c)) for c in pk_columns
             )
-            q = sql.SQL(
-                "SELECT {cols} FROM {t} ORDER BY {order} LIMIT 1"
-            ).format(cols=cols, t=sql.Identifier(partition_name), order=order)
+            q = sql.SQL("SELECT {cols} FROM {t} ORDER BY {order} LIMIT 1").format(
+                cols=cols, t=sql.Identifier(partition_name), order=order
+            )
             try:
                 cur.execute(q)
                 row = cur.fetchone()
@@ -541,8 +542,8 @@ class CopyMigrationWorker(BaseMigrationWorker):
 
         if not row:
             return None
-        return dict(zip(pk_columns, row))
-
+        # row는 pk_columns로 만든 SELECT 결과라 길이가 항상 같다.
+        return dict(zip(pk_columns, row, strict=True))
 
     def _migrate_partition_with_copy(self, partition_name: str, checkpoint: Any):
         """COPY 명령을 사용한 파티션 마이그레이션 (청크 단위 처리)
@@ -557,7 +558,6 @@ class CopyMigrationWorker(BaseMigrationWorker):
         # 테이블 타입/컬럼 구성 (resume 판단에도 필요)
         table_type = self._detect_table_type(partition_name)
         table_config = TABLE_TYPE_CONFIG[table_type]
-        columns_csv = ", ".join(table_config.columns)
         key_column = table_config.columns[0]
         date_column = table_config.date_column
         is_timestamp_date = table_config.date_is_timestamp
@@ -573,9 +573,7 @@ class CopyMigrationWorker(BaseMigrationWorker):
             )
             # 테이블이 존재하지 않는 경우
             if not table_info.get("exists", True):
-                self._log(
-                    f"{partition_name} - 소스 테이블이 존재하지 않음, 건너뛰기", "WARNING"
-                )
+                self._log(f"{partition_name} - 소스 테이블이 존재하지 않음, 건너뛰기", "WARNING")
                 self.performance_metrics.completed_partitions += 1
                 self._update_checkpoint_completed(checkpoint, 0, copy_method="COPY")
                 return
@@ -595,7 +593,10 @@ class CopyMigrationWorker(BaseMigrationWorker):
                     last_path_id = checkpoint.last_path_id
                     if is_timestamp_date:
                         last_issued_date_text = getattr(checkpoint, "last_issued_date_text", None)
-                        if last_issued_date_text is None and checkpoint.last_issued_date is not None:
+                        if (
+                            last_issued_date_text is None
+                            and checkpoint.last_issued_date is not None
+                        ):
                             last_issued_date_text = str(checkpoint.last_issued_date)
                     else:
                         last_issued_date = checkpoint.last_issued_date
@@ -605,6 +606,7 @@ class CopyMigrationWorker(BaseMigrationWorker):
                     )
                 elif checkpoint.rows_processed > 0 and checkpoint.error_message:
                     import json
+
                     try:
                         data = json.loads(checkpoint.error_message)
                         last_path_id = data.get("last_path_id")
@@ -680,27 +682,33 @@ class CopyMigrationWorker(BaseMigrationWorker):
                     last_issued_date_text = None
                     self._log("재개 모드: 대상 테이블에 기존 데이터 없음 → 처음부터 진행", "INFO")
             # COPY FROM 쿼리는 루프 밖에서 한 번만 빌드 (식별자 안전 처리)
-            cols_idents = sql.SQL(", ").join(
-                sql.Identifier(c) for c in table_config.columns
-            )
+            cols_idents = sql.SQL(", ").join(sql.Identifier(c) for c in table_config.columns)
             tbl_ident = sql.Identifier(partition_name)
-            copy_from_query = sql.SQL(
-                "COPY {tbl} ({cols}) FROM STDIN WITH (FORMAT CSV, HEADER FALSE, NULL 'NULL')"
-            ).format(tbl=tbl_ident, cols=cols_idents).as_string(self.target_conn)
+            copy_from_query = (
+                sql.SQL(
+                    "COPY {tbl} ({cols}) FROM STDIN WITH (FORMAT CSV, HEADER FALSE, NULL 'NULL')"
+                )
+                .format(tbl=tbl_ident, cols=cols_idents)
+                .as_string(self.target_conn)
+            )
 
             key_ident = sql.Identifier(key_column)
             date_ident = sql.Identifier(date_column)
 
             # ORDER BY에 PK 전체 컬럼 포함 (예: RUNNING_TIME_HISTORY → path_id, issued_date, save_type)
-            order_idents = sql.SQL(", ").join(
-                sql.Identifier(c) for c in pk_columns
-            ) if pk_columns else sql.SQL("{k}, {d}").format(k=key_ident, d=date_ident)
+            order_idents = (
+                sql.SQL(", ").join(sql.Identifier(c) for c in pk_columns)
+                if pk_columns
+                else sql.SQL("{k}, {d}").format(k=key_ident, d=date_ident)
+            )
 
             # 청크 단위 처리 루프
             while self.is_running:
                 self._check_pause()
                 # COPY TO 쿼리 빌드 (식별자 안전 처리)
-                if last_path_id is not None and (last_issued_date_text is not None or last_issued_date is not None):
+                if last_path_id is not None and (
+                    last_issued_date_text is not None or last_issued_date is not None
+                ):
                     key_literal = self._format_literal(last_path_id, is_timestamp=False)
                     date_val = last_issued_date_text if is_timestamp_date else last_issued_date
                     date_literal = self._format_literal(date_val, is_timestamp_date)
@@ -708,9 +716,7 @@ class CopyMigrationWorker(BaseMigrationWorker):
                     if extra_pk_columns and last_extra_pk:
                         # 멀티 PK WHERE: (k, d, extra...) > (kv, dv, ev...)
                         # ROW 비교를 사용하여 정확한 resume 지점 결정
-                        all_pk_idents = sql.SQL(", ").join(
-                            sql.Identifier(c) for c in pk_columns
-                        )
+                        all_pk_idents = sql.SQL(", ").join(sql.Identifier(c) for c in pk_columns)
                         all_pk_vals = []
                         for c in pk_columns:
                             if c == key_column:
@@ -723,9 +729,9 @@ class CopyMigrationWorker(BaseMigrationWorker):
                                     sql.SQL(self._format_literal(val, is_timestamp=False))
                                 )
                         all_pk_val_csv = sql.SQL(", ").join(all_pk_vals)
-                        where_fragment = sql.SQL(
-                            "WHERE ({cols}) > ({vals})"
-                        ).format(cols=all_pk_idents, vals=all_pk_val_csv)
+                        where_fragment = sql.SQL("WHERE ({cols}) > ({vals})").format(
+                            cols=all_pk_idents, vals=all_pk_val_csv
+                        )
                     else:
                         where_fragment = sql.SQL(
                             "WHERE {k} > {kv} OR ({k} = {kv} AND {d} > {dv})"
@@ -738,16 +744,20 @@ class CopyMigrationWorker(BaseMigrationWorker):
                 else:
                     where_fragment = sql.SQL("")
 
-                copy_to_query = sql.SQL(
-                    "COPY (SELECT {cols} FROM {tbl} {where} ORDER BY {order} LIMIT {lim}) "
-                    "TO STDOUT WITH (FORMAT CSV, HEADER FALSE, NULL 'NULL')"
-                ).format(
-                    cols=cols_idents,
-                    tbl=tbl_ident,
-                    where=where_fragment,
-                    order=order_idents,
-                    lim=sql.SQL(str(int(self.batch_size))),
-                ).as_string(self.source_conn)
+                copy_to_query = (
+                    sql.SQL(
+                        "COPY (SELECT {cols} FROM {tbl} {where} ORDER BY {order} LIMIT {lim}) "
+                        "TO STDOUT WITH (FORMAT CSV, HEADER FALSE, NULL 'NULL')"
+                    )
+                    .format(
+                        cols=cols_idents,
+                        tbl=tbl_ident,
+                        where=where_fragment,
+                        order=order_idents,
+                        lim=sql.SQL(str(int(self.batch_size))),
+                    )
+                    .as_string(self.source_conn)
+                )
 
                 # extra PK 컬럼의 CSV 인덱스 계산
                 extra_indices = []
@@ -755,14 +765,19 @@ class CopyMigrationWorker(BaseMigrationWorker):
                     if ec in table_config.columns:
                         extra_indices.append(table_config.columns.index(ec))
                 stream_buffer = CopyStreamBuffer(extra_track_indices=extra_indices)
-                def copy_out():
+
+                # 배치마다 재생성되는 값이라 기본 인자로 묶어 이 반복의 것을 확정한다.
+                # (producer 스레드가 join 타임아웃을 넘겨 살아남으면 다음 배치의
+                #  버퍼를 건드릴 수 있다)
+                def copy_out(query=copy_to_query, buffer=stream_buffer):
                     try:
                         with self.source_conn.cursor() as source_cursor:
-                            source_cursor.copy_expert(copy_to_query, stream_buffer)
+                            source_cursor.copy_expert(query, buffer)
                     except Exception as exc:
-                        stream_buffer.set_error(exc)
+                        buffer.set_error(exc)
                     finally:
-                        stream_buffer.close()
+                        buffer.close()
+
                 producer_thread = threading.Thread(target=copy_out, daemon=True)
                 producer_thread.start()
                 with self.target_conn.cursor() as target_cursor:
@@ -775,7 +790,9 @@ class CopyMigrationWorker(BaseMigrationWorker):
                 if producer_thread.is_alive():
                     stream_buffer.cancel()
                     producer_thread.join(timeout=10)
-                    raise Exception(f"{partition_name} COPY producer 스레드가 시간 내 종료되지 않음")
+                    raise Exception(
+                        f"{partition_name} COPY producer 스레드가 시간 내 종료되지 않음"
+                    )
                 if stream_buffer.error:
                     raise stream_buffer.error
                 self.target_conn.commit()
@@ -837,7 +854,9 @@ class CopyMigrationWorker(BaseMigrationWorker):
             except Exception:
                 pass
             if checkpoint is None:
-                checkpoint = self.checkpoint_manager.create_checkpoint(self.history_id, partition_name)
+                checkpoint = self.checkpoint_manager.create_checkpoint(
+                    self.history_id, partition_name
+                )
             self.checkpoint_manager.update_checkpoint_status(
                 checkpoint.id,
                 "failed",

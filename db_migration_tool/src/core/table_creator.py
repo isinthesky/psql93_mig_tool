@@ -4,23 +4,24 @@
 파티션 테이블의 스키마를 소스에서 복제하고,
 테이블 타입에 따라 TRIGGER 또는 RULE을 생성합니다.
 """
+
 import logging
 import re
-from typing import Dict, Any, Optional, Tuple
 from datetime import datetime
-
-logger = logging.getLogger(__name__)
+from typing import Any
 
 import psycopg
 
 from .table_types import (
-    TableType,
-    get_table_type,
     TABLE_TYPE_CONFIG,
-    infer_partition_range,
+    TableType,
     get_partition_primary_key_columns,
+    get_table_type,
+    infer_partition_range,
     should_cluster_partition_by_pkey,
 )
+
+logger = logging.getLogger(__name__)
 
 # 안전한 식별자 패턴: 영문자, 숫자, 언더스코어만 허용
 _SAFE_IDENTIFIER_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
@@ -47,13 +48,13 @@ def _validate_identifier(name: str) -> str:
 
 def _validate_data_type_declaration(data_type: str) -> str:
     """information_schema 기반 타입 선언을 안전한 문자열로 검증한다."""
-    normalized = str(data_type or '').strip()
+    normalized = str(data_type or "").strip()
     if not normalized or not _SAFE_DATA_TYPE_RE.match(normalized):
         raise ValueError(f"안전하지 않은 데이터 타입: {data_type!r}")
     return normalized
 
 
-def _sanitize_column_default(default: Any) -> Optional[str]:
+def _sanitize_column_default(default: Any) -> str | None:
     """DEFAULT 표현식은 허용된 리터럴/함수만 통과시킨다."""
     if default is None:
         return None
@@ -67,13 +68,13 @@ def _sanitize_column_default(default: Any) -> Optional[str]:
     return None
 
 
-def _build_column_definition(column: Dict[str, Any]) -> str:
+def _build_column_definition(column: dict[str, Any]) -> str:
     """information_schema/manifest 공용 컬럼 정의 생성기."""
-    col_name = column['name']
-    data_type = _validate_data_type_declaration(column['data_type'])
-    max_length = column.get('character_maximum_length')
-    is_nullable = column.get('is_nullable')
-    original_default = column.get('column_default')
+    col_name = column["name"]
+    data_type = _validate_data_type_declaration(column["data_type"])
+    max_length = column.get("character_maximum_length")
+    is_nullable = column.get("is_nullable")
+    original_default = column.get("column_default")
     safe_default = _sanitize_column_default(original_default)
 
     _validate_identifier(col_name)
@@ -81,8 +82,8 @@ def _build_column_definition(column: Dict[str, Any]) -> str:
     col_def = f"    {col_name} {data_type}"
     if max_length:
         col_def += f"({int(max_length)})"
-    if is_nullable == 'NO':
-        col_def += ' NOT NULL'
+    if is_nullable == "NO":
+        col_def += " NOT NULL"
     if safe_default:
         col_def += f" DEFAULT {safe_default}"
     elif original_default:
@@ -111,7 +112,7 @@ class TableCreator:
         try:
             # 부모 테이블 이름 추출 (예: point_history_221026 -> point_history)
             _validate_identifier(partition_name)
-            parent_table = '_'.join(partition_name.split('_')[:-1])
+            parent_table = "_".join(partition_name.split("_")[:-1])
             _validate_identifier(parent_table)
 
             # 소스에서 파티션 정보 가져오기
@@ -119,7 +120,7 @@ class TableCreator:
             if not partition_info:
                 raise Exception(f"파티션 정보를 찾을 수 없습니다: {partition_name}")
 
-            table_type = partition_info['table_type']
+            table_type = partition_info["table_type"]
             table_type_name = TABLE_TYPE_CONFIG[table_type].display_name
 
             print(f"파티션 정보: {partition_name}")
@@ -144,10 +145,11 @@ class TableCreator:
 
         except Exception as e:
             import traceback
+
             traceback.print_exc()
             raise Exception(f"테이블 생성 오류: {str(e)}")
 
-    def _get_partition_info(self, partition_name: str, parent_table: str) -> Dict[str, Any]:
+    def _get_partition_info(self, partition_name: str, parent_table: str) -> dict[str, Any]:
         """
         소스에서 파티션 정보 조회
 
@@ -161,7 +163,9 @@ class TableCreator:
                 SELECT table_data, from_date, to_date
                 FROM partition_table_info
                 WHERE table_name = %s
-            """, (partition_name,))
+            """,
+                (partition_name,),
+            )
 
             row = cur.fetchone()
             if row:
@@ -175,15 +179,13 @@ class TableCreator:
                     table_type = TableType.POINT_HISTORY
 
                 return {
-                    'table_data': table_data_code,
-                    'table_type': table_type,
-                    'from_date': row[1],
-                    'to_date': row[2]
+                    "table_data": table_data_code,
+                    "table_type": table_type,
+                    "from_date": row[1],
+                    "to_date": row[2],
                 }
 
             # partition_table_info에 없으면 파티션 이름에서 추측
-            # 날짜 추출 (예: point_history_221026 -> 22, 10, 26)
-            parts = partition_name.split("_")
             table_type = None
 
             # parent_table 기반으로 테이블 타입 추론
@@ -195,18 +197,18 @@ class TableCreator:
             inferred_from, inferred_to = infer_partition_range(table_type, partition_name)
             if inferred_from is not None and inferred_to is not None:
                 return {
-                    'table_data': table_type.value,
-                    'table_type': table_type,
-                    'from_date': inferred_from,
-                    'to_date': inferred_to
+                    "table_data": table_type.value,
+                    "table_type": table_type,
+                    "from_date": inferred_from,
+                    "to_date": inferred_to,
                 }
 
             # 날짜 파싱이 안 되는 경우라도 테이블 타입만 설정해 반환
             return {
-                'table_data': table_type.value,
-                'table_type': table_type,
-                'from_date': None,
-                'to_date': None,
+                "table_data": table_type.value,
+                "table_type": table_type,
+                "from_date": None,
+                "to_date": None,
             }
 
     def _check_parent_table_exists(self, parent_table: str) -> bool:
@@ -243,7 +245,8 @@ class TableCreator:
 
         with self.source_conn.cursor() as source_cur:
             # 소스에서 테이블 구조 가져오기
-            source_cur.execute("""
+            source_cur.execute(
+                """
                 SELECT
                     column_name,
                     data_type,
@@ -253,7 +256,9 @@ class TableCreator:
                 FROM information_schema.columns
                 WHERE table_name = %s
                 ORDER BY ordinal_position
-            """, (parent_table,))
+            """,
+                (parent_table,),
+            )
 
             columns = source_cur.fetchall()
             if not columns:
@@ -267,11 +272,11 @@ class TableCreator:
             column_defs.append(
                 _build_column_definition(
                     {
-                        'name': col[0],
-                        'data_type': col[1],
-                        'character_maximum_length': col[2],
-                        'is_nullable': col[3],
-                        'column_default': col[4],
+                        "name": col[0],
+                        "data_type": col[1],
+                        "character_maximum_length": col[2],
+                        "is_nullable": col[3],
+                        "column_default": col[4],
                     }
                 )
             )
@@ -294,8 +299,9 @@ class TableCreator:
 
             self.target_conn.commit()
 
-    def _create_partition(self, partition_name: str, parent_table: str,
-                         partition_info: Dict[str, Any]):
+    def _create_partition(
+        self, partition_name: str, parent_table: str, partition_info: dict[str, Any]
+    ):
         """
         파티션 테이블 생성
 
@@ -305,7 +311,7 @@ class TableCreator:
             partition_info: 파티션 정보 (table_type, from_date, to_date 포함)
         """
         # 테이블 타입 확인
-        table_type = partition_info.get('table_type')
+        table_type = partition_info.get("table_type")
         if table_type is None:
             # partition_info에 table_type이 없으면 추론
             try:
@@ -314,8 +320,8 @@ class TableCreator:
                 raise Exception(f"알 수 없는 테이블 타입: {parent_table}")
 
         config = TABLE_TYPE_CONFIG[table_type]
-        from_date = partition_info.get('from_date')
-        to_date = partition_info.get('to_date')
+        from_date = partition_info.get("from_date")
+        to_date = partition_info.get("to_date")
 
         # 식별자 검증
         _validate_identifier(partition_name)
@@ -373,11 +379,7 @@ class TableCreator:
             # RULE 기반 파티셔닝인 경우 RULE 생성
             if config.uses_rules:
                 self._create_rule_for_partition(
-                    parent_table,
-                    partition_name,
-                    table_type,
-                    partition_info,
-                    cur
+                    parent_table, partition_name, table_type, partition_info, cur
                 )
 
             # RT는 historical DDL 관례상 partition-level 보조 인덱스를 추가로 생성
@@ -414,13 +416,16 @@ class TableCreator:
             )
             row = cur.fetchone()
         if row:
-            self._add_partition_info(partition_name, {
-                'table_data': row[0],
-                'from_date': row[1],
-                'to_date': row[2],
-            })
+            self._add_partition_info(
+                partition_name,
+                {
+                    "table_data": row[0],
+                    "from_date": row[1],
+                    "to_date": row[2],
+                },
+            )
 
-    def _add_partition_info(self, partition_name: str, partition_info: Dict[str, Any]):
+    def _add_partition_info(self, partition_name: str, partition_info: dict[str, Any]):
         """partition_table_info에 정보 추가 또는 갱신 (upsert)"""
         with self.target_conn.cursor() as cur:
             # partition_table_info 테이블 존재 확인
@@ -461,13 +466,17 @@ class TableCreator:
                     SET table_data = %s, from_date = %s, to_date = %s,
                         use_flag = %s, save_date = %s, cluster_index = %s
                     WHERE table_name = %s
-                """, (
-                    partition_info['table_data'],
-                    partition_info['from_date'],
-                    partition_info['to_date'],
-                    True, now, True,
-                    partition_name,
-                ))
+                """,
+                    (
+                        partition_info["table_data"],
+                        partition_info["from_date"],
+                        partition_info["to_date"],
+                        True,
+                        now,
+                        True,
+                        partition_name,
+                    ),
+                )
             else:
                 # 새 레코드 추가
                 cur.execute(
@@ -475,19 +484,23 @@ class TableCreator:
                     INSERT INTO partition_table_info
                     (table_name, table_data, from_date, to_date, use_flag, save_date, cluster_index)
                     VALUES (%s, %s, %s, %s, %s, %s, %s)
-                """, (
-                    partition_name,
-                    partition_info['table_data'],
-                    partition_info['from_date'],
-                    partition_info['to_date'],
-                    True, now, True,
-                ))
+                """,
+                    (
+                        partition_name,
+                        partition_info["table_data"],
+                        partition_info["from_date"],
+                        partition_info["to_date"],
+                        True,
+                        now,
+                        True,
+                    ),
+                )
 
             self.target_conn.commit()
 
     def ensure_partition_ready(
         self, partition_name: str, truncate_mode: str = "auto", confirm_callback=None
-    ) -> Tuple[bool, int]:
+    ) -> tuple[bool, int]:
         """파티션 테이블 준비 (생성 또는 TRUNCATE)
 
         Args:
@@ -629,7 +642,11 @@ class TableCreator:
         """
         _validate_identifier(parent_table)
         # 테이블 타입별 인덱스 (9.3 호환: IF NOT EXISTS 미지원 → 중복은 예외 무시)
-        if table_type in (TableType.POINT_HISTORY, TableType.POINT_SEC_HISTORY, TableType.TREND_HISTORY):
+        if table_type in (
+            TableType.POINT_HISTORY,
+            TableType.POINT_SEC_HISTORY,
+            TableType.TREND_HISTORY,
+        ):
             # PH, PS, TH: path_id + issued_date 인덱스
             self._create_indexes(
                 cursor,
@@ -664,8 +681,8 @@ class TableCreator:
         parent_table: str,
         partition_name: str,
         table_type: TableType,
-        partition_info: Dict[str, Any],
-        cursor
+        partition_info: dict[str, Any],
+        cursor,
     ):
         """
         파티션 테이블에 대한 RULE 생성
@@ -678,8 +695,8 @@ class TableCreator:
             cursor: 데이터베이스 커서
         """
         config = TABLE_TYPE_CONFIG[table_type]
-        from_date = partition_info['from_date']
-        to_date = partition_info['to_date']
+        from_date = partition_info["from_date"]
+        to_date = partition_info["to_date"]
 
         # 식별자 검증
         _validate_identifier(parent_table)
@@ -698,15 +715,15 @@ class TableCreator:
                 from_dt = datetime.fromtimestamp(from_date_val / 1000)
                 to_dt = datetime.fromtimestamp(to_date_val / 1000)
 
-                date_condition = f"""(new.{config.date_column} >= '{from_dt.strftime('%Y-%m-%d %H:%M:%S')}'::timestamp without time zone)
-                AND (new.{config.date_column} <= '{to_dt.strftime('%Y-%m-%d %H:%M:%S')}'::timestamp without time zone)"""
+                date_condition = f"""(new.{config.date_column} >= '{from_dt.strftime("%Y-%m-%d %H:%M:%S")}'::timestamp without time zone)
+                AND (new.{config.date_column} <= '{to_dt.strftime("%Y-%m-%d %H:%M:%S")}'::timestamp without time zone)"""
             else:
                 date_condition = f"""(new.{config.date_column} >= '{from_date_val}'::bigint)
                 AND (new.{config.date_column} <= '{to_date_val}'::bigint)"""
 
         # 컬럼 리스트 생성
-        columns = ', '.join(config.columns)
-        values = ', '.join([f'new.{col}' for col in config.columns])
+        columns = ", ".join(config.columns)
+        values = ", ".join([f"new.{col}" for col in config.columns])
 
         # RULE 생성 SQL (날짜 범위가 없으면 RULE 생성을 건너뜀)
         if date_condition:

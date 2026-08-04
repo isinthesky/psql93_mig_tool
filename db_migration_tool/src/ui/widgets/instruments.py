@@ -151,7 +151,7 @@ class StepRail(QWidget):
         self.set_current(0)
 
     def set_current(self, index: int) -> None:
-        for i, (chip, name) in enumerate(zip(self._chips, self._names)):
+        for i, (chip, name) in enumerate(zip(self._chips, self._names, strict=True)):
             if i < index:
                 state = "done"
             elif i == index:

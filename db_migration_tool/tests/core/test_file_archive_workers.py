@@ -8,6 +8,7 @@ from src.core.archive_manifest import ArchivePartitionEntry
 from src.core.file_archive_workers import (
     FileToPostgresArchiveWorker,
     ManifestTableCreator,
+    MigrationInterruptedError,
     PostgresToFileArchiveWorker,
 )
 from src.core.table_types import TableType
@@ -157,7 +158,9 @@ def build_manifest_with_partition(worker: FileToPostgresArchiveWorker, *, checks
 
 
 def test_export_worker_detect_table_type(tmp_path):
-    worker = PostgresToFileArchiveWorker(make_profile(tmp_path, "postgres_to_file"), [], history_id=1)
+    worker = PostgresToFileArchiveWorker(
+        make_profile(tmp_path, "postgres_to_file"), [], history_id=1
+    )
     assert worker._detect_table_type("point_history_240101") == TableType.POINT_HISTORY
 
 
@@ -170,7 +173,9 @@ def test_archive_worker_connection_defaults_missing_port(tmp_path, monkeypatch):
 
     monkeypatch.setattr("src.core.file_archive_workers.psycopg2.connect", fake_connect)
 
-    worker = PostgresToFileArchiveWorker(make_profile(tmp_path, "postgres_to_file"), [], history_id=1)
+    worker = PostgresToFileArchiveWorker(
+        make_profile(tmp_path, "postgres_to_file"), [], history_id=1
+    )
     config = {
         "kind": "postgres",
         "host": "localhost",
@@ -304,7 +309,7 @@ def test_import_partition_stop_requested_records_pending_interruption(tmp_path):
     creator = Mock()
     checkpoint = SimpleNamespace(id=1, partition_name="point_history_240101")
 
-    with pytest.raises(Exception):
+    with pytest.raises(MigrationInterruptedError, match="중단"):
         worker._import_partition("point_history_240101", checkpoint, creator, manifest)
 
     creator.ensure_partition_ready.assert_not_called()
