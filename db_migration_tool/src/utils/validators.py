@@ -130,25 +130,6 @@ class ConnectionValidator:
         return True, ""
 
 
-class DateValidator:
-    """날짜 검증"""
-
-    @staticmethod
-    def validate_date_range(start_date, end_date) -> tuple[bool, str]:
-        """날짜 범위 검증"""
-        if not start_date or not end_date:
-            return False, "시작 날짜와 종료 날짜를 선택하세요."
-
-        if start_date > end_date:
-            return False, "시작 날짜가 종료 날짜보다 늦습니다."
-
-        delta = end_date - start_date
-        if delta.days > 365:
-            return False, "날짜 범위는 최대 1년까지 선택 가능합니다."
-
-        return True, ""
-
-
 class VersionValidator:
     """PostgreSQL 버전 호환성 검증"""
 

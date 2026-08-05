@@ -236,48 +236,6 @@ class TrayIconManager(QObject):
         if self.tray_icon:
             self.tray_icon.setToolTip(tooltip)
 
-    def notify_migration_started(self, profile_name: str):
-        """마이그레이션 시작 알림
-
-        Args:
-            profile_name: 프로필 이름
-        """
-        self.set_migration_running(True)
-        self.show_message(
-            "마이그레이션 시작",
-            f"프로필: {profile_name}\n마이그레이션을 시작합니다.",
-            QSystemTrayIcon.MessageIcon.Information,
-        )
-
-    def notify_migration_completed(self, profile_name: str, rows_processed: int):
-        """마이그레이션 완료 알림
-
-        Args:
-            profile_name: 프로필 이름
-            rows_processed: 처리된 행 수
-        """
-        self.set_migration_running(False)
-        self.show_message(
-            "마이그레이션 완료",
-            f"프로필: {profile_name}\n{rows_processed:,}개 행 처리 완료",
-            QSystemTrayIcon.MessageIcon.Information,
-            5000,  # 5초간 표시
-        )
-
-    def notify_migration_error(self, error_message: str):
-        """마이그레이션 오류 알림
-
-        Args:
-            error_message: 오류 메시지
-        """
-        self.set_migration_running(False)
-        self.show_message(
-            "마이그레이션 오류",
-            f"오류가 발생했습니다:\n{error_message}",
-            QSystemTrayIcon.MessageIcon.Critical,
-            5000,
-        )
-
     def notify_first_minimize(self):
         """첫 최소화 시 안내 메시지"""
         self.show_message(

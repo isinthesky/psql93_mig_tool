@@ -56,18 +56,6 @@ class TestBaseViewModel:
         assert blocker.args == ["Test error message"]
         assert viewmodel.error_message == "Test error message"
 
-    def test_clear_error(self, viewmodel):
-        """오류 메시지 초기화 확인"""
-        # Given: 오류 메시지가 설정된 상태
-        viewmodel.handle_error(RuntimeError("Some error"))
-        assert viewmodel.error_message is not None
-
-        # When: 오류 초기화
-        viewmodel.clear_error()
-
-        # Then: 오류 메시지가 None
-        assert viewmodel.error_message is None
-
     def test_send_message_emits_signal(self, viewmodel, qtbot):
         """메시지 발송 시 시그널 발행 확인"""
         # When: 메시지 발송

@@ -396,10 +396,6 @@ class ArchiveManifestStore:
                 return ArchivePartitionEntry.from_dict(item)
         return None
 
-    def get_partition_entries(self) -> list[ArchivePartitionEntry]:
-        manifest = self.load()
-        return [ArchivePartitionEntry.from_dict(item) for item in manifest.partitions]
-
     def get_completed_status(
         self,
         partition_names: list[str],

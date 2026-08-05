@@ -30,7 +30,6 @@ class AppPaths:
     _app_data_dir: Path | None = None
     _logs_dir: Path | None = None
     _db_path: Path | None = None
-    _temp_dir: Path | None = None
 
     # 설정: 커스텀 루트 디렉토리 (테스트용)
     _custom_root: Path | None = None
@@ -61,7 +60,6 @@ class AppPaths:
         cls._app_data_dir = None
         cls._logs_dir = None
         cls._db_path = None
-        cls._temp_dir = None
 
     @classmethod
     def get_app_data_dir(cls) -> Path:
@@ -124,75 +122,6 @@ class AppPaths:
             cls._db_path = cls.get_app_data_dir() / "db_migration.db"
 
         return cls._db_path
-
-    @classmethod
-    def get_temp_dir(cls) -> Path:
-        """임시 파일 디렉토리
-
-        Returns:
-            임시 파일 디렉토리 경로
-
-        Examples:
-            - macOS: ~/Library/Application Support/DBMigrationTool/temp
-        """
-        if cls._temp_dir is None:
-            cls._temp_dir = cls.get_app_data_dir() / "temp"
-            cls._temp_dir.mkdir(parents=True, exist_ok=True)
-
-        return cls._temp_dir
-
-    @classmethod
-    def get_log_file(cls, filename: str) -> Path:
-        """로그 파일 경로
-
-        Args:
-            filename: 로그 파일 이름
-
-        Returns:
-            로그 파일 전체 경로
-
-        Examples:
-            >>> log_file = AppPaths.get_log_file("migration_20250118.log")
-        """
-        return cls.get_logs_dir() / filename
-
-    @classmethod
-    def get_config_path(cls) -> Path:
-        """설정 파일 경로
-
-        Returns:
-            설정 파일 경로 (향후 확장용)
-        """
-        return cls.get_app_data_dir() / "config.json"
-
-    @classmethod
-    def ensure_all_dirs(cls):
-        """모든 디렉토리 생성 확인
-
-        앱 초기화 시 호출하여 필요한 모든 디렉토리를 미리 생성합니다.
-        """
-        cls.get_app_data_dir()
-        cls.get_logs_dir()
-        cls.get_temp_dir()
-
-    @classmethod
-    def clean_temp_dir(cls):
-        """임시 디렉토리 정리
-
-        임시 디렉토리의 모든 파일과 하위 디렉토리를 삭제합니다.
-        실패해도 예외를 발생시키지 않습니다.
-        """
-        temp_dir = cls.get_temp_dir()
-        for item in temp_dir.iterdir():
-            try:
-                if item.is_file():
-                    item.unlink()
-                elif item.is_dir():
-                    import shutil
-
-                    shutil.rmtree(item)
-            except Exception:
-                pass  # 실패해도 무시
 
 
 # 편의 함수

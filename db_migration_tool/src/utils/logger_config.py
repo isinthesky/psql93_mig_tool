@@ -131,21 +131,3 @@ class LoggerConfig:
         logger.propagate = False
 
         return logger
-
-    @staticmethod
-    def get_default_file_handler() -> logging.FileHandler:
-        """기본 파일 핸들러 생성 (편의 메서드)
-
-        Returns:
-            기본 설정의 파일 핸들러
-        """
-        return LoggerConfig.create_file_handler()
-
-    @staticmethod
-    def get_default_console_handler() -> logging.StreamHandler:
-        """기본 콘솔 핸들러 생성 (편의 메서드)
-
-        Returns:
-            기본 설정의 콘솔 핸들러
-        """
-        return LoggerConfig.create_console_handler()

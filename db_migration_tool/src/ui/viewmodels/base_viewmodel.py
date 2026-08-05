@@ -62,7 +62,3 @@ class BaseViewModel(QObject):
             message: 메시지 내용
         """
         self.message_sent.emit(title, message)
-
-    def clear_error(self):
-        """오류 메시지 초기화"""
-        self._error_message = None

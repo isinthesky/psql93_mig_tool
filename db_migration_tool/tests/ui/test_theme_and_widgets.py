@@ -64,7 +64,7 @@ class TestInstruments:
         lamp.set_state("error")
         assert lamp.text_label.text() == "연결됨"
 
-    def test_metric_placeholder_and_reset(self):
+    def test_metric_placeholder_and_set_value(self):
         from src.ui.widgets import MetricReadout
 
         metric = MetricReadout("처리 속도")
@@ -73,7 +73,8 @@ class TestInstruments:
         metric.set_value("1.2M rows/s")
         assert metric.value_label.text() == "1.2M rows/s"
 
-        metric.reset()
+        # 빈 값은 자리표시자로 되돌린다 — 계기 자리가 비어 보이면 안 된다.
+        metric.set_value("")
         assert metric.value_label.text() == "-"
 
     def test_step_rail_marks_done_current_todo(self):

@@ -55,10 +55,6 @@ class StatusLamp(QWidget):
     def state(self) -> str:
         return self._state
 
-    def set_title(self, title: str) -> None:
-        self.title_label.setText(f"{title}:" if title else "")
-        self.title_label.setVisible(bool(title))
-
     def set_state(self, state: str, message: str = "") -> None:
         """램프 색과 문구를 함께 바꾼다.
 
@@ -101,9 +97,6 @@ class MetricReadout(QWidget):
 
     def set_value(self, value: str) -> None:
         self.value_label.setText(value or self._placeholder)
-
-    def reset(self) -> None:
-        self.value_label.setText(self._placeholder)
 
 
 class StepRail(QWidget):

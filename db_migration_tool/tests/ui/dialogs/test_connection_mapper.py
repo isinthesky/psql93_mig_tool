@@ -5,11 +5,7 @@ import sys
 import pytest
 from PySide6.QtWidgets import QApplication, QCheckBox, QComboBox, QLineEdit, QSpinBox
 
-from src.ui.dialogs.connection_mapper import (
-    ENDPOINT_KIND_LABELS,
-    ConnectionMapper,
-    ConnectionWidgetSet,
-)
+from src.ui.dialogs.connection_mapper import ENDPOINT_KIND_LABELS, ConnectionMapper
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -136,35 +132,6 @@ class TestConnectionMapper:
         assert config["username"] == "testuser"
         assert "password" not in config
 
-    def test_profile_config_to_ui(self):
-        config = {
-            "host": "192.168.1.1",
-            "port": 5433,
-            "database": "mydb",
-            "username": "admin",
-            "password": "secret",
-            "ssl": True,
-        }
-
-        host, port, db, user, pwd, ssl, compat = ConnectionMapper.profile_config_to_ui(config)
-        assert host == "192.168.1.1"
-        assert port == 5433
-        assert db == "mydb"
-        assert user == "admin"
-        assert pwd == "secret"
-        assert ssl is True
-        assert compat == "auto"
-
-    def test_profile_config_to_ui_with_defaults(self):
-        host, port, db, user, pwd, ssl, compat = ConnectionMapper.profile_config_to_ui({})
-        assert host == "localhost"
-        assert port == 5432
-        assert db == ""
-        assert user == ""
-        assert pwd == ""
-        assert ssl is False
-        assert compat == "auto"
-
     def test_set_ui_from_config(self, mock_widgets):
         config = {
             "host": "10.0.0.1",
@@ -224,69 +191,3 @@ class TestConnectionMapper:
         )
         assert endpoint_widgets["kind"].currentText() == "File Archive"
         assert endpoint_widgets["archive_path"].text() == "/tmp/archive2"
-
-
-class TestConnectionWidgetSet:
-    def test_initialization(self, mock_widgets):
-        widget_set = ConnectionWidgetSet(
-            mock_widgets["host"],
-            mock_widgets["port"],
-            mock_widgets["database"],
-            mock_widgets["username"],
-            mock_widgets["password"],
-            mock_widgets["ssl"],
-        )
-        assert widget_set.host is mock_widgets["host"]
-        assert widget_set.port is mock_widgets["port"]
-        assert widget_set.database is mock_widgets["database"]
-        assert widget_set.username is mock_widgets["username"]
-        assert widget_set.password is mock_widgets["password"]
-        assert widget_set.ssl is mock_widgets["ssl"]
-
-    def test_to_profile_config(self, mock_widgets):
-        widget_set = ConnectionWidgetSet(**mock_widgets)
-        config = widget_set.to_profile_config()
-        assert config["kind"] == "postgres"
-        assert config["host"] == "localhost"
-        assert config["port"] == 5432
-        assert config["database"] == "testdb"
-
-    def test_to_psycopg_config(self, mock_widgets):
-        widget_set = ConnectionWidgetSet(**mock_widgets)
-        config = widget_set.to_psycopg_config()
-        assert "dbname" in config
-        assert "user" in config
-        assert config["dbname"] == "testdb"
-
-    def test_to_validation_config(self, mock_widgets):
-        widget_set = ConnectionWidgetSet(**mock_widgets)
-        config = widget_set.to_validation_config()
-        assert "password" not in config
-        assert "host" in config
-        assert "database" in config
-
-    def test_load_from_config(self, mock_widgets):
-        widget_set = ConnectionWidgetSet(**mock_widgets)
-        new_config = {
-            "host": "newhost",
-            "port": 9999,
-            "database": "newdb",
-            "username": "newuser",
-            "password": "newpass",
-            "ssl": True,
-        }
-        widget_set.load_from_config(new_config)
-        assert mock_widgets["host"].text() == "newhost"
-        assert mock_widgets["port"].value() == 9999
-        assert mock_widgets["database"].text() == "newdb"
-        assert mock_widgets["username"].text() == "newuser"
-        assert mock_widgets["password"].text() == "newpass"
-        assert mock_widgets["ssl"].isChecked() is True
-
-    def test_round_trip_conversion(self, mock_widgets):
-        widget_set = ConnectionWidgetSet(**mock_widgets)
-        config1 = widget_set.to_profile_config()
-        mock_widgets["host"].setText("")
-        widget_set.load_from_config(config1)
-        config2 = widget_set.to_profile_config()
-        assert config1 == config2

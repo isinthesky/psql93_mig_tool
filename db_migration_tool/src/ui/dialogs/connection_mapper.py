@@ -95,18 +95,6 @@ class ConnectionMapper:
         }
 
     @staticmethod
-    def profile_config_to_ui(config: dict[str, Any]) -> tuple[str, int, str, str, str, bool, str]:
-        return (
-            config.get("host", "localhost"),
-            config.get("port", 5432),
-            config.get("database", ""),
-            config.get("username", ""),
-            config.get("password", ""),
-            config.get("ssl", False),
-            config.get("compat_mode", COMPAT_MODE_AUTO),
-        )
-
-    @staticmethod
     def set_ui_from_config(
         config: dict[str, Any],
         host: QLineEdit,
@@ -214,67 +202,4 @@ class ConnectionMapper:
             password,
             ssl,
             compat_mode,
-        )
-
-
-class ConnectionWidgetSet:
-    """DB 연결 UI 위젯 세트 (레거시 호환용)"""
-
-    def __init__(
-        self,
-        host: QLineEdit,
-        port: QSpinBox,
-        database: QLineEdit,
-        username: QLineEdit,
-        password: QLineEdit,
-        ssl: QCheckBox,
-        compat_mode: QComboBox | None = None,
-    ):
-        self.host = host
-        self.port = port
-        self.database = database
-        self.username = username
-        self.password = password
-        self.ssl = ssl
-        self.compat_mode = compat_mode
-
-    def to_profile_config(self) -> dict[str, Any]:
-        return ConnectionMapper.ui_to_profile_config(
-            self.host,
-            self.port,
-            self.database,
-            self.username,
-            self.password,
-            self.ssl,
-            self.compat_mode,
-        )
-
-    def to_psycopg_config(self) -> dict[str, Any]:
-        return ConnectionMapper.ui_to_psycopg_config(
-            self.host,
-            self.port,
-            self.database,
-            self.username,
-            self.password,
-            self.ssl,
-        )
-
-    def to_validation_config(self) -> dict[str, Any]:
-        return ConnectionMapper.ui_to_validation_config(
-            self.host,
-            self.port,
-            self.database,
-            self.username,
-        )
-
-    def load_from_config(self, config: dict[str, Any]):
-        ConnectionMapper.set_ui_from_config(
-            config,
-            self.host,
-            self.port,
-            self.database,
-            self.username,
-            self.password,
-            self.ssl,
-            self.compat_mode,
         )

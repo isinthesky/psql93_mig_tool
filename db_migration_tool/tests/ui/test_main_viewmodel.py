@@ -173,19 +173,6 @@ class TestMainViewModel:
         assert blocker.args[0] == mock_histories
         assert viewmodel.histories == mock_histories
 
-    def test_refresh_histories_alias(self, viewmodel, mock_history_manager, qtbot):
-        """refresh_histories가 load_histories의 별칭인지 확인"""
-        # Given: 목 이력 데이터
-        mock_histories = [Mock(id=1)]
-        mock_history_manager.get_all_history.return_value = mock_histories
-
-        # When: refresh_histories 호출
-        with qtbot.waitSignal(viewmodel.histories_changed, timeout=1000):
-            viewmodel.refresh_histories()
-
-        # Then: 이력이 로드됨
-        assert viewmodel.histories == mock_histories
-
     def test_initialize_loads_both(
         self, viewmodel, mock_profile_manager, mock_history_manager, qtbot
     ):

@@ -147,24 +147,6 @@ class TestLoggerConfig:
                 h.close()
                 logger.removeHandler(h)
 
-    def test_get_default_file_handler(self):
-        """기본 파일 핸들러 생성 편의 메서드 테스트"""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            AppPaths.set_custom_root(Path(tmpdir))
-            handler = LoggerConfig.get_default_file_handler()
-            try:
-                assert isinstance(handler, logging.FileHandler)
-                assert handler.level == logging.DEBUG
-            finally:
-                handler.close()
-
-    def test_get_default_console_handler(self):
-        """기본 콘솔 핸들러 생성 편의 메서드 테스트"""
-        handler = LoggerConfig.get_default_console_handler()
-
-        assert isinstance(handler, logging.StreamHandler)
-        assert handler.level == logging.INFO
-
     def test_logger_writes_to_file(self):
         """로거가 실제로 파일에 쓰는지 테스트"""
         with tempfile.TemporaryDirectory() as tmpdir:

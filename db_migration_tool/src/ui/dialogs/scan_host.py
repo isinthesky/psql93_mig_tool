@@ -147,14 +147,6 @@ class ScanHostMixin:
         worker = self._scan_workers.get(kind)
         return bool(worker is not None and worker.isRunning())
 
-    def _has_active_scan(self) -> bool:
-        """조회 작업이 돌고 있는가.
-
-        마이그레이션 실행과 구분한다. 실행은 닫기를 막지만, 조회는
-        파괴적이지 않으므로 닫기를 허용하고 대신 정리한다.
-        """
-        return any(w is not None and w.isRunning() for w in self._scan_workers.values())
-
     def _sync_scan_buttons(self) -> None:
         """조회 버튼 활성화를 한 곳에서 정한다. 쓰는 쪽에서 재정의한다."""
 

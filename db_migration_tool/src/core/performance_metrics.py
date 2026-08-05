@@ -153,16 +153,3 @@ class PerformanceMetrics:
         )
 
         return estimated_remaining_rows / current_rate
-
-    def format_speed(self, rows_per_sec: float, mb_per_sec: float) -> str:
-        """속도를 보기 좋은 형식으로 포맷"""
-        if rows_per_sec >= 1000000:
-            rows_str = f"{rows_per_sec / 1000000:.1f}M rows/sec"
-        elif rows_per_sec >= 1000:
-            rows_str = f"{rows_per_sec / 1000:.1f}K rows/sec"
-        else:
-            rows_str = f"{rows_per_sec:.0f} rows/sec"
-
-        mb_str = f"{mb_per_sec:.1f} MB/sec"
-
-        return f"{rows_str}, {mb_str}"

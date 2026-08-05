@@ -28,23 +28,8 @@ class PgVersionInfo:
     family: PgVersionFamily
 
     @property
-    def is_legacy(self) -> bool:
-        """레거시(9.3) 버전 여부"""
-        return self.family == PgVersionFamily.PG_9_3
-
-    @property
     def supports_jsonb(self) -> bool:
         """JSONB 타입 지원 여부 (16만 지원)"""
-        return self.family == PgVersionFamily.PG_16
-
-    @property
-    def supports_parallel_query(self) -> bool:
-        """병렬 쿼리 지원 여부 (16만 지원)"""
-        return self.family == PgVersionFamily.PG_16
-
-    @property
-    def supports_pg_server_files_role(self) -> bool:
-        """pg_read_server_files/pg_write_server_files 역할 지원 (16만 지원)"""
         return self.family == PgVersionFamily.PG_16
 
     def __str__(self) -> str:

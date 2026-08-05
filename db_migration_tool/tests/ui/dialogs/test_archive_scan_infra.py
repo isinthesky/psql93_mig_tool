@@ -247,16 +247,6 @@ class TestGenerationInvalidation:
 
 
 class TestScanLifecycle:
-    def test_no_active_scan_initially(self, dialog):
-        assert not dialog._has_active_scan()
-
-    def test_active_scan_is_detected(self, dialog):
-        worker = MagicMock()
-        worker.isRunning.return_value = True
-        dialog._scan_workers["discover"] = worker
-
-        assert dialog._has_active_scan()
-
     def test_scan_does_not_count_as_migration_running(self, dialog):
         """조회는 닫기를 막지 않는다. 막으면 수 분간 닫을 수 없는 창이 된다."""
         worker = MagicMock()

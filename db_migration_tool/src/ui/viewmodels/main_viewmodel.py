@@ -158,10 +158,6 @@ class MainViewModel(BaseViewModel):
         finally:
             self.is_loading = False
 
-    def refresh_histories(self):
-        """이력 새로고침 (load_histories의 별칭)"""
-        self.load_histories()
-
     @property
     def histories(self) -> list[MigrationHistoryItem]:
         """이력 목록"""

@@ -83,29 +83,6 @@ class TestHistoryRepository:
         success = history_repo.update_by_id(99999, status="completed")
         assert success is False
 
-    def test_delete_by_id(self, history_repo):
-        """이력 삭제 테스트"""
-        # Given: 이력 생성
-        history = history_repo.create(
-            profile_id=1,
-            start_date="2025-01-01",
-            end_date="2025-01-31",
-            started_at=datetime.now(),
-            status="running",
-        )
-
-        # When: 삭제
-        success = history_repo.delete_by_id(history.id)
-
-        # Then: 삭제 성공 및 조회 실패
-        assert success is True
-        assert history_repo.get_by_id(history.id) is None
-
-    def test_delete_nonexistent(self, history_repo):
-        """존재하지 않는 이력 삭제 시도"""
-        success = history_repo.delete_by_id(99999)
-        assert success is False
-
     def test_get_all(self, history_repo):
         """전체 이력 조회 테스트"""
         # Given: 여러 이력 생성

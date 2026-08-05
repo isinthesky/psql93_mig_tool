@@ -23,7 +23,6 @@ class TestVersionParsing:
         assert info.major == 9
         assert info.minor == 3
         assert info.family == PgVersionFamily.PG_9_3
-        assert info.is_legacy is True
         assert info.supports_jsonb is False
 
     def test_parse_version_16(self):
@@ -34,7 +33,6 @@ class TestVersionParsing:
         assert info.major == 16
         assert info.minor == 1
         assert info.family == PgVersionFamily.PG_16
-        assert info.is_legacy is False
         assert info.supports_jsonb is True
 
     def test_parse_version_unknown_14(self):
@@ -172,18 +170,10 @@ class TestPgVersionInfo:
         info = PgVersionInfo(9, 3, "test", PgVersionFamily.PG_9_3)
         assert str(info) == "PostgreSQL 9.3 (9.3)"
 
-    def test_is_legacy_property(self):
-        """레거시 버전 속성"""
+    def test_supports_jsonb_property(self):
+        """JSONB 지원 속성"""
         info_9_3 = PgVersionInfo(9, 3, "test", PgVersionFamily.PG_9_3)
         info_16 = PgVersionInfo(16, 0, "test", PgVersionFamily.PG_16)
 
-        assert info_9_3.is_legacy is True
-        assert info_16.is_legacy is False
-
-    def test_supports_parallel_query(self):
-        """병렬 쿼리 지원 속성"""
-        info_9_3 = PgVersionInfo(9, 3, "test", PgVersionFamily.PG_9_3)
-        info_16 = PgVersionInfo(16, 0, "test", PgVersionFamily.PG_16)
-
-        assert info_9_3.supports_parallel_query is False
-        assert info_16.supports_parallel_query is True
+        assert info_9_3.supports_jsonb is False
+        assert info_16.supports_jsonb is True

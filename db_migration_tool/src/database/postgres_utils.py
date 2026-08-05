@@ -22,39 +22,6 @@ logger = logging.getLogger(__name__)
 class PostgresOptimizer:
     """PostgreSQL 성능 최적화 유틸리티"""
 
-    # 대량 작업을 위한 최적화 파라미터 (세션 레벨에서 변경 가능한 것만)
-    BULK_OPERATION_PARAMS = {
-        "work_mem": "256MB",
-        "maintenance_work_mem": "1GB",
-        "synchronous_commit": "off",
-        # 'wal_buffers': '16MB',  # 서버 재시작 필요
-        # 'checkpoint_segments': '32',  # PostgreSQL 9.5부터 제거됨
-        # 'checkpoint_completion_target': '0.9'  # 서버 재시작 필요
-    }
-
-    @staticmethod
-    def apply_bulk_operation_optimizations(connection) -> None:
-        """대량 작업을 위한 세션 레벨 최적화 적용"""
-        try:
-            with connection.cursor() as cursor:
-                for param, value in PostgresOptimizer.BULK_OPERATION_PARAMS.items():
-                    try:
-                        cursor.execute(f"SET {param} = %s", (value,))
-                        logger.info(f"PostgreSQL 파라미터 설정: {param} = {value}")
-                    except psycopg2.Error as e:
-                        # 오류 발생 시 트랜잭션 롤백
-                        connection.rollback()
-                        logger.warning(f"파라미터 설정 실패 (무시됨): {param} = {value}, 오류: {e}")
-                        continue
-
-                connection.commit()
-                logger.info("PostgreSQL 대량 작업 최적화 완료")
-
-        except Exception as e:
-            connection.rollback()
-            logger.error(f"PostgreSQL 최적화 실패: {e}")
-            # 최적화 실패는 치명적이지 않으므로 예외를 발생시키지 않음
-
     @staticmethod
     def check_copy_permissions(
         connection,
@@ -205,33 +172,6 @@ class PostgresOptimizer:
                     conn.close()
                 except Exception:
                     pass
-
-    @staticmethod
-    def create_optimized_connection(config: dict[str, Any]) -> psycopg2.extensions.connection:
-        """최적화된 연결 생성"""
-        # 연결 파라미터 준비
-        conn_params = {
-            "host": config.get("host", "localhost"),
-            "port": config.get("port", 5432),
-            "database": config.get("database", ""),
-            "user": config.get("username", ""),
-            "password": config.get("password", ""),
-        }
-
-        # SSL 설정
-        if config.get("ssl"):
-            conn_params["sslmode"] = "require"
-
-        # 연결 생성
-        connection = psycopg2.connect(**conn_params)
-
-        # 자동 커밋 비활성화 (대량 작업 최적화)
-        connection.autocommit = False
-
-        # 세션 최적화 적용
-        PostgresOptimizer.apply_bulk_operation_optimizations(connection)
-
-        return connection
 
     @staticmethod
     def estimate_table_size(

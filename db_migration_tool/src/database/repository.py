@@ -89,25 +89,6 @@ class BaseRepository(Generic[T]):
                 session.expunge(obj)
             return obj
 
-    def get_one_by(self, **filters) -> T | None:
-        """조건으로 단건 조회
-
-        Args:
-            **filters: 필터 조건
-
-        Returns:
-            엔티티 또는 None
-
-        Examples:
-            >>> repo = HistoryRepository()
-            >>> history = repo.get_one_by(profile_id=1, status='running')
-        """
-        with self._session_scope() as session:
-            obj = session.query(self.model_class).filter_by(**filters).first()
-            if obj:
-                session.expunge(obj)
-            return obj
-
     def get_all(self, order_by=None) -> list[T]:
         """전체 조회
 
@@ -179,23 +160,6 @@ class BaseRepository(Generic[T]):
                     setattr(obj, key, value)
 
             return True
-
-    # DELETE
-    def delete_by_id(self, id: int) -> bool:
-        """ID로 삭제
-
-        Args:
-            id: 엔티티 ID
-
-        Returns:
-            성공 여부
-        """
-        with self._session_scope() as session:
-            obj = session.query(self.model_class).filter_by(id=id).first()
-            if obj:
-                session.delete(obj)
-                return True
-            return False
 
     # 고급 쿼리
     def exists(self, **filters) -> bool:
