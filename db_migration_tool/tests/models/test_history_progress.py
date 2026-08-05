@@ -12,6 +12,7 @@
 """
 
 import os
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -134,6 +135,55 @@ class TestProcessedRowsAccumulateAcrossRuns:
 
         assert total == 0
         assert isinstance(total, int)
+
+
+class TestFinalTotalCorrection:
+    """완료 시점에 분모를 실측값으로 정정한다.
+
+    시작 때 기록한 분모는 추정치(reltuples)다. 실측 오차가 0.02% 수준이어도
+    분모가 분자보다 크면 다 옮기고도 99%로 남는다.
+    """
+
+    def test_a_fully_successful_run_is_corrected(self, managers):
+        history_manager, checkpoint_manager = managers
+        created = history_manager.create_history(1, "2026-01-01", "2026-01-31", total_rows=1_005)
+        checkpoint = checkpoint_manager.create_checkpoint(created.id, "p1")
+        checkpoint_manager.update_checkpoint_status(checkpoint.id, "completed", rows_processed=1000)
+
+        assert checkpoint_manager.final_total_rows(created.id, 1000) == 1000
+
+    def test_a_partial_run_keeps_the_estimate(self, managers):
+        """'건너뛰기' 모드에서 100%가 실패를 덮으면 안 된다."""
+        history_manager, checkpoint_manager = managers
+        created = history_manager.create_history(1, "2026-01-01", "2026-01-31", total_rows=1_005)
+        done = checkpoint_manager.create_checkpoint(created.id, "p1")
+        checkpoint_manager.update_checkpoint_status(done.id, "completed", rows_processed=600)
+        failed = checkpoint_manager.create_checkpoint(created.id, "p2")
+        checkpoint_manager.update_checkpoint_status(failed.id, "failed", rows_processed=0)
+
+        assert checkpoint_manager.final_total_rows(created.id, 600) is None
+
+    def test_the_banner_reaches_100_after_correction(self, managers):
+        from src.ui.dialogs.migration_wizard_dialog import MigrationWizardDialog
+
+        history_manager, checkpoint_manager = managers
+        created = history_manager.create_history(1, "2026-01-01", "2026-01-31", total_rows=1_005)
+        checkpoint = checkpoint_manager.create_checkpoint(created.id, "p1")
+        checkpoint_manager.update_checkpoint_status(checkpoint.id, "completed", rows_processed=1000)
+        history_manager.update_history_status(
+            created.id,
+            "completed",
+            processed_rows=1000,
+            total_rows=checkpoint_manager.final_total_rows(created.id, 1000),
+        )
+
+        dialog = MagicMock()
+        dialog.checkpoint_manager = checkpoint_manager
+        text = MigrationWizardDialog._describe_progress(
+            dialog, history_manager.get_history(created.id)
+        )
+
+        assert text == "1,000 / 약 1,000 rows (100%)"
 
 
 class TestResumeBannerReadsRight:

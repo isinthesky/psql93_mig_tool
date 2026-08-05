@@ -340,6 +340,21 @@ class CheckpointRepository(BaseRepository[Checkpoint]):
             )
             return int(total or 0)
 
+    def count_pending(self, history_id: int) -> int:
+        """완료되지 않은 체크포인트 수.
+
+        엔티티를 만들지 않고 센다. "전부 끝났는가"만 알면 되는 곳에서
+        목록을 통째로 불러올 이유가 없다.
+        """
+        with self._session_scope() as session:
+            return (
+                session.query(func.count(Checkpoint.id))
+                .filter(Checkpoint.history_id == history_id)
+                .filter(Checkpoint.status != "completed")
+                .scalar()
+                or 0
+            )
+
     def get_pending_by_history(self, history_id: int) -> list[Checkpoint]:
         """미완료 체크포인트 조회
 

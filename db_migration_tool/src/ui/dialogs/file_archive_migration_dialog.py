@@ -1439,6 +1439,10 @@ class FileArchiveMigrationDialog(ScanHostMixin, QDialog):
                     self.history_id,
                     "completed",
                     processed_rows=rows_processed,
+                    # 분모가 추정치라 다 옮기고도 99%로 남는다. 전부 성공했을 때만 정정한다.
+                    total_rows=self.checkpoint_manager.final_total_rows(
+                        self.history_id, rows_processed
+                    ),
                 )
             self.add_log("마이그레이션이 완료되었습니다", "SUCCESS")
             self.current_label.setText("완료")

@@ -239,6 +239,31 @@ class CheckpointManager:
         """
         return self.repo.sum_rows_processed(history_id)
 
+    def has_pending_checkpoints(self, history_id: int) -> bool:
+        """아직 끝나지 않은 파티션이 남아 있는가."""
+        return self.repo.count_pending(history_id) > 0
+
+    def final_total_rows(self, history_id: int, processed_rows: int) -> int | None:
+        """완료 시점에 이력의 전체 행 수를 정정할 값.
+
+        실행 시작 때 기록한 분모는 플래너 통계 기반 추정치다. 오차가 0.02%
+        수준이어도 분모가 분자보다 크면 다 옮기고도 99%로 남는다.
+
+        단 **전부 성공했을 때만** 정정한다. '건너뛰기' 모드로 일부 파티션이
+        실패하면, 옮긴 양을 전체로 간주하는 순간 100%가 그 실패를 덮는다.
+
+        Returns:
+            정정할 값, 또는 그대로 두라는 뜻의 None.
+        """
+        try:
+            if self.has_pending_checkpoints(history_id):
+                return None
+        except Exception:
+            # 집계에 실패하면 건드리지 않는다. 추정치가 남는 편이
+            # 틀린 100%보다 낫다.
+            return None
+        return processed_rows
+
     def get_pending_checkpoints(self, history_id: int) -> list[CheckpointItem]:
         """미완료 체크포인트 조회"""
         db_checkpoints = self.repo.get_pending_by_history(history_id)
