@@ -17,7 +17,29 @@
 - `dialogs/file_archive_migration_dialog.py`: PostgreSQL ↔ File Archive 마이그레이션 3단계 마법사입니다.
 - `dialogs/history_dialog.py`: 작업 이력을 조회합니다(modeless 싱글톤).
 - `dialogs/log_viewer_dialog.py`: 실시간 로그와 이력을 확인하는 창을 제공합니다.
+- `dialogs/scan_host.py`: 두 마법사가 공유하는 조회(scan) 골격 — `ScanHostMixin`(세대·수명·재진입),
+  `format_row_count()`(추정치 표기), `PARTITION_DISPLAY_LIMIT`, `build_log_retention_hint()`.
 - `widgets/instruments.py`: 두 마법사가 공유하는 계기 위젯 — `StatusLamp`(상태 램프), `StepRail`(단계 표시), `MetricReadout`(속도/ETA 등 수치).
+
+## 조회(scan) 규칙
+탐색·대상 확인·검증은 DB를 오래 붙잡으므로 반드시 `src/core/scan_workers.py`의 워커로 돌리고,
+`ScanHostMixin`을 통해 관리합니다. 직접 동기 호출하거나 `QApplication.processEvents()`를 쓰지 않습니다.
+
+- **세대**: 조회 조건(날짜·항목)이 바뀌면 `_bump_generation()`을 부릅니다. 결과 시그널의 첫 인자가
+  세대이므로 늦게 도착한 결과는 `_is_current_generation(gen)`으로 걸러 버립니다.
+  늦은 결과를 버리는 것만으로는 부족합니다 — `_on_scan_generation_changed()`에서 **이미 그려진
+  목록도 비웁니다.** 남아 있으면 사용자가 새 조건의 결과로 믿습니다.
+- **수명**: 실행 중인 `QThread`의 마지막 파이썬 참조가 사라지면 **프로세스가 죽습니다.** 워커를
+  `_scan_workers[kind]`에 넣고, 닫기 경로에서 `_prepare_close()`를 부릅니다. `terminate()`는
+  쓰지 않습니다(psycopg 커넥션과 파일 락이 남습니다).
+- **재진입**: 시작 전 `_is_scan_inflight(kind)`로 막습니다. `isRunning()`만으로는 `run()`이 끝나고
+  결과 슬롯이 아직 안 돈 구간을 놓칩니다.
+- 워커 시그널은 **람다로 연결하지 않습니다**. 수신자 QObject가 없어 다이얼로그 파괴 시 자동 해제되지 않습니다.
+
+## 숫자 표기 규칙
+PostgreSQL 소스의 행 수는 플래너 통계 기반 **추정치**입니다. `format_row_count(count, estimated)`로
+표기해 `약 N rows` / `행 수 미상`(통계 없음)을 구분합니다. 0을 `0 rows`로 쓰면 사용자가 빈 파티션으로
+읽고 체크를 풉니다. 아카이브 매니페스트의 행 수는 내보낼 때 실측한 값이라 그대로 씁니다.
 
 ## 스타일 규칙
 - 위젯에서 `setStyleSheet`으로 색을 직접 지정하지 않습니다. `theme.py`의 토큰을 objectName 또는

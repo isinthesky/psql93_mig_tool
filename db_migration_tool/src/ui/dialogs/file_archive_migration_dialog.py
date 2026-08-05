@@ -1134,8 +1134,22 @@ class FileArchiveMigrationDialog(ScanHostMixin, QDialog):
     # ============================
 
     def _on_scan_generation_changed(self) -> None:
-        """조건이 바뀌면 지금 목록은 더 이상 '확인된' 목록이 아니다."""
+        """조건이 바뀌면 지금 목록은 더 이상 그 조건의 결과가 아니다.
+
+        '다음'을 잠그는 것만으로는 부족하다. 화면에 남은 목록을 사용자는
+        새 조건의 결과로 읽는다. 늦게 도착할 결과를 버리는 것과, 이미
+        그려진 것을 지우는 것은 별개다.
+        """
         self._selection_verified = False
+
+        if self.discovered_partitions:
+            self.discovered_partitions = []
+            self._target_has_data = {}
+            self._render_partition_list()
+            self._update_counts()
+            self.discover_status.setText("조건이 바뀌었습니다. 파티션을 다시 찾으세요.")
+            self._sync_scan_buttons()
+
         self._update_nav_state()
 
     def _set_scan_status(self, text: str) -> None:

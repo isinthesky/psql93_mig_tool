@@ -368,28 +368,37 @@ UI 테스트 12개가 `check_connections`를 `lambda self: None`으로 패치해
 
 ---
 
-## 8. 실 DB 수동 체크리스트 (전환 후 1회)
+## 8. 실 DB 수동 체크리스트
 
-- [ ] 파티션 수천 개 범위로 "파티션 찾기" — 탐색 중 창 이동/리사이즈가 되는가
-- [ ] 탐색 중 필터 입력창 타이핑이 즉시 반응하는가
-- [ ] 탐색 중 "닫기" → 앱이 죽지 않는가, 로그에 `QThread: Destroyed while thread is still running`이 없는가
-- [ ] 탐색 중 날짜를 바꾸고 다시 찾기 → 목록이 **새 날짜** 결과인가
-- [ ] 대상 확인 실패 시 '다음'이 잠기는가 (§2.1 방어 확인)
-- [ ] 연결 안 되는 프로필로 열기 → 램프가 `busy`에서 멈추지 않고 `error`로 가는가
-- [ ] `file→postgres`, `postgres→file` **양방향** 확인 (분기가 다름)
-- [ ] 취소 후 `pg_stat_activity`에 세션이 남지 않는가
+**→ `docs/plans/real-db-verification.md`로 분리했다.**
+
+이관 이후 작업(마법사 이관, 추정치 표기, 진행량 기록)까지 확인 대상이 늘어나
+이 문서의 한 절로는 담기지 않는다.
 
 ---
 
-## 9. 범위 밖 / 후속 과제
+## 9. 범위 밖 / 후속 과제 — **전부 처리됨**
 
-| 항목 | 비고 |
+| 항목 | 처리 |
 |---|---|
-| `PartitionDiscovery._get_row_count`의 `COUNT(*)` 전수 스캔 | 탐색 지연의 지배적 원인. 별도 이슈로 분리 |
-| 마법사(`migration_wizard_dialog.py`)의 동일 결함 수정 | `scan_workers.py` 공유 후 마법사도 이관하면 자연히 해결 |
-| 아카이브 워커의 `pause()` 무효 | `_check_pause()` 호출이 없는데 일시정지 버튼이 존재. 별도 수정 |
-| 아카이브 다이얼로그의 파티션 표시 상한 부재 | 마법사는 5,000. 수만 개 렌더 시 별도 문제 |
-| 로그 보존/정리 정책 부재 | 무관하지만 미해결 |
+| `PartitionDiscovery._get_row_count`의 `COUNT(*)` 전수 스캔 | `dd23b50` — `_estimate_row_count`(reltuples)로 교체. 소비처가 표시 전용임을 전수 확인 |
+| 마법사(`migration_wizard_dialog.py`)의 동일 결함 수정 | `dd23b50` — `ScanHostMixin` 추출 후 이관. 세대 무효화 누락도 함께 수정 |
+| 아카이브 워커의 `pause()` 무효 | `dd23b50` — 죽은 배선 제거. 마법사도 server/auto 모드에서 무효였던 것을 함께 수정 |
+| 아카이브 다이얼로그의 파티션 표시 상한 부재 | `dd23b50` — 5,000개 상한 + 초과분 경고 |
+| 로그 보존/정리 정책 부재 | `dd23b50` — 화면 상한은 유지하고(전체는 파일에 남는다) 그 사실과 경로를 표시 |
+
+### 이 과정에서 새로 발견해 고친 것
+
+| 항목 | 처리 |
+|---|---|
+| 통계 미갱신 파티션이 조용히 누락 | `39e0f48` — 데이터 손실. 추정 0이면 실제 `COUNT(*)`로 재확인 |
+| `estimate_table_size()` 예외를 "테이블 없음"으로 삼킴 | `39e0f48` — 건너뛰기 + completed 체크포인트로 이어졌다 |
+| 연결 확인 워커가 닫기 정리 대상 밖 | `dd23b50` — 창 열자마자 Esc 시 프로세스 사망 경로 |
+| `RowCountVerifyWorker`가 대상 커넥션 미추적 | `dd23b50` — 검증 시간의 절반이 취소 불가 |
+| `total_rows`에 쓰는 코드 없음 | `98a8e0b` — 재개 안내가 늘 `/ 0` |
+| `processed_rows`가 재개 시 역행 | `98a8e0b` — 체크포인트 합계로 전환 |
+| `get_partition_info`/`verify_partition_structure` 사문화 | 정리 커밋 — 호출부 0건 확인 후 제거(연쇄로 `_create_connection(is_target=)`, `PartitionDiscovery(target_config=)`도) |
+| 아카이브의 세대 변경이 그려진 목록을 안 비움 | 정리 커밋 — 마법사와 동일하게 맞춤.`_selection_verified` 잠금만으로는 화면의 낡은 목록이 남는다 |
 
 ---
 

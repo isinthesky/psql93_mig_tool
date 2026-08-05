@@ -215,6 +215,36 @@ class TestGenerationInvalidation:
         assert not dialog._is_current_generation(stale)
         assert dialog._is_current_generation(dialog._scan_gen)
 
+    def test_the_drawn_list_is_cleared_too(self, dialog):
+        """'다음'을 잠그는 것만으로는 부족하다.
+
+        화면에 남은 목록을 사용자는 새 조건의 결과로 읽는다. 늦게 도착할
+        결과를 버리는 것과, 이미 그려진 것을 지우는 것은 별개다.
+        """
+        _fill_partitions(dialog)
+        assert dialog.partition_list.count() > 0
+
+        dialog.start_date_edit.setDate(dialog.start_date_edit.date().addDays(-3))
+
+        assert dialog.discovered_partitions == []
+        assert dialog.partition_list.count() == 0
+        assert dialog._target_has_data == {}
+
+    def test_clearing_says_why(self, dialog):
+        _fill_partitions(dialog)
+
+        dialog._bump_generation()
+
+        assert "다시 찾" in dialog.discover_status.text()
+
+    def test_an_empty_list_does_not_stomp_the_status_text(self, dialog):
+        """찾은 게 없을 때까지 안내를 덮어쓰면 직전 메시지를 잃는다."""
+        dialog.discover_status.setText("탐색 실패: boom")
+
+        dialog._bump_generation()
+
+        assert dialog.discover_status.text() == "탐색 실패: boom"
+
 
 class TestScanLifecycle:
     def test_no_active_scan_initially(self, dialog):

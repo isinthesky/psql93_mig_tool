@@ -178,7 +178,7 @@ class TestDiscoveryMarksItsCounts:
         cursor = MagicMock()
         cursor.fetchone.return_value = (-1,)
 
-        assert PartitionDiscovery({}, None)._estimate_row_count(cursor, "t0") == 0
+        assert PartitionDiscovery({})._estimate_row_count(cursor, "t0") == 0
 
     def test_a_missing_table_reads_as_zero(self):
         from src.core.partition_discovery import PartitionDiscovery
@@ -186,4 +186,4 @@ class TestDiscoveryMarksItsCounts:
         cursor = MagicMock()
         cursor.fetchone.return_value = None
 
-        assert PartitionDiscovery({}, None)._estimate_row_count(cursor, "t0") == 0
+        assert PartitionDiscovery({})._estimate_row_count(cursor, "t0") == 0

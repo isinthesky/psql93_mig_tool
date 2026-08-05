@@ -16,13 +16,14 @@ CONNECT_TIMEOUT_SECONDS = 10
 
 
 class PartitionDiscovery:
-    """파티션 테이블 탐색 클래스"""
+    """소스 DB에서 날짜 범위에 해당하는 파티션을 찾는다.
 
-    def __init__(
-        self, connection_config: dict[str, Any], target_config: dict[str, Any] | None = None
-    ):
+    소스 전용이다. 대상 쪽 조회는 `scan_workers.TargetCompletedScanWorker`가
+    맡는다(취소·세대 관리가 붙어 있어야 하기 때문).
+    """
+
+    def __init__(self, connection_config: dict[str, Any]):
         self.source_config = connection_config
-        self.target_config = target_config
         self.connection_config = connection_config  # 하위 호환성을 위해 유지
 
     def discover_partitions(
@@ -218,94 +219,9 @@ class PartitionDiscovery:
         partitions.sort(key=lambda p: (p["table_type_code"], p["from_timestamp"] or 0))
         return partitions
 
-    def get_partition_info(
-        self, partition_name: str, is_target: bool = False
-    ) -> dict[str, Any] | None:
-        """특정 파티션 정보 조회
-
-        Args:
-            partition_name: 조회할 파티션 이름
-            is_target: True이면 대상 DB 구성으로 연결
-        """
-        conn = None
-        try:
-            conn = self._create_connection(is_target=is_target)
-
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    SELECT
-                        table_name,
-                        from_date,
-                        to_date,
-                        use_flag
-                    FROM partition_table_info
-                    WHERE table_name = %s
-                """,
-                    (partition_name,),
-                )
-
-                row = cur.fetchone()
-                if not row:
-                    return None
-
-                table_name, from_date, to_date, use_flag = row
-                info = {
-                    "table_name": table_name,
-                    "from_date": self._timestamp_to_date(from_date),
-                    "to_date": self._timestamp_to_date(to_date),
-                    "active": use_flag,
-                    "exists": self._check_table_exists(cur, table_name),
-                }
-
-                if info["exists"]:
-                    info["row_count"] = self._estimate_row_count(cur, table_name)
-                    cur.execute(
-                        """
-                        SELECT column_name, data_type
-                        FROM information_schema.columns
-                        WHERE table_name = %s
-                        ORDER BY ordinal_position
-                    """,
-                        (table_name,),
-                    )
-                    info["columns"] = [{"name": col[0], "type": col[1]} for col in cur.fetchall()]
-
-            return info
-
-        except Exception as e:
-            raise Exception(f"파티션 정보 조회 오류: {str(e)}")
-        finally:
-            if conn is not None:
-                try:
-                    conn.close()
-                except Exception:
-                    pass
-
-    def verify_partition_structure(self, source_partition: str, target_partition: str) -> bool:
-        """소스와 대상 파티션 구조 비교"""
-        try:
-            source_info = self.get_partition_info(source_partition)
-            if not self.target_config:
-                return False
-
-            target_info = self.get_partition_info(target_partition, is_target=True)
-            if not source_info or not target_info:
-                return False
-
-            source_cols = {(c["name"], c["type"]) for c in source_info.get("columns", [])}
-            target_cols = {(c["name"], c["type"]) for c in target_info.get("columns", [])}
-            return source_cols == target_cols
-
-        except Exception:
-            return False
-
-    def _create_connection(self, is_target: bool = False) -> psycopg.Connection:
-        """데이터베이스 연결 생성"""
-        if is_target and self.target_config:
-            config = self.target_config
-        else:
-            config = self.connection_config
+    def _create_connection(self) -> psycopg.Connection:
+        """소스 데이터베이스 연결 생성"""
+        config = self.connection_config
 
         conn_params = {
             "host": config.get("host", "localhost"),
