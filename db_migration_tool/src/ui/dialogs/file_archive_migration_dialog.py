@@ -602,9 +602,26 @@ class FileArchiveMigrationDialog(ScanHostMixin, QDialog):
         self.incomplete_label.setText(
             "이전에 중단된 작업이 있습니다.\n"
             f"날짜: {incomplete.start_date} ~ {incomplete.end_date}\n"
-            f"진행: {incomplete.processed_rows:,} rows\n\n"
+            f"진행: {self._describe_progress(incomplete)}\n\n"
             "이어서 진행하면 미완료 파티션만 다시 실행합니다."
         )
+
+    def _describe_progress(self, history: MigrationHistoryItem) -> str:
+        """중단된 작업이 어디까지 갔는지 한 줄로 말한다.
+
+        이력에 저장된 `processed_rows`가 아니라 체크포인트 합계를 쓴다.
+        워커의 카운터는 실행 1회분만 세므로, 한 번 재개한 뒤에는 이력의
+        값이 실제보다 작다.
+        """
+        done = max(
+            self.checkpoint_manager.get_processed_rows(history.id or 0),
+            int(history.processed_rows or 0),
+        )
+        planned = int(history.total_rows or 0)
+        if planned <= 0:
+            return f"{done:,} rows 처리됨"
+        percent = min(100, int(done / planned * 100))
+        return f"{done:,} / 약 {planned:,} rows ({percent}%)"
 
     def _on_resume_clicked(self):
         if not self._incomplete_history or self._incomplete_history.id is None:
@@ -1237,12 +1254,14 @@ class FileArchiveMigrationDialog(ScanHostMixin, QDialog):
                 return
             start_date = cast(date, self.start_date_edit.date().toPython())
             end_date = cast(date, self.end_date_edit.date().toPython())
+            planned_rows, _ = self._row_total(partitions)
             history = self.history_manager.create_history(
                 self.profile.id,
                 start_date.strftime("%Y-%m-%d"),
                 end_date.strftime("%Y-%m-%d"),
                 source_status=self.source_status_message,
                 target_status=self.target_status_message,
+                total_rows=planned_rows,
             )
             if history.id is None:
                 QMessageBox.critical(self, "이력 생성 실패", "작업 이력을 만들지 못했습니다.")
@@ -1324,17 +1343,38 @@ class FileArchiveMigrationDialog(ScanHostMixin, QDialog):
         self.eta_metric.set_value(str(stats.get("eta_time", "계산 중")))
         self.elapsed_metric.set_value(str(stats.get("elapsed_time", "00:00:00")))
 
+    def _get_processed_rows(self) -> int:
+        """이 이력에서 지금까지 옮긴 누적 행 수.
+
+        체크포인트 합계를 쓴다. 워커의 카운터는 실행 1회분만 세므로,
+        재개한 뒤 그 값을 이력에 쓰면 진행량이 뒤로 간다.
+
+        둘 중 큰 값을 취한다. 어느 쪽도 실제보다 클 수 없는 하한이다 —
+        체크포인트 기록이 조용히 실패하면 합계가 작고, 재개 실행이라면
+        워커 카운터가 작다. 진행량을 잃는 쪽으로 틀리지 않게 한다.
+        """
+        counts = []
+
+        if self.history_id:
+            try:
+                counts.append(self.checkpoint_manager.get_processed_rows(self.history_id))
+            except Exception as e:
+                self.add_log(f"진행량 집계 실패, 이번 실행분만 기록합니다: {e}", "WARNING")
+
+        if self.worker and hasattr(self.worker, "get_stats"):
+            try:
+                counts.append(int(self.worker.get_stats().get("total_rows") or 0))
+            except Exception:
+                pass
+
+        return max(counts, default=0)
+
     def on_worker_finished(self):
         was_normal_completion = bool(self.worker and getattr(self.worker, "is_running", False))
         if self.worker:
             self.worker.is_running = False
 
-        rows_processed = 0
-        if self.worker and hasattr(self.worker, "get_stats"):
-            try:
-                rows_processed = int(self.worker.get_stats().get("total_rows") or 0)
-            except Exception:
-                rows_processed = 0
+        rows_processed = self._get_processed_rows()
 
         if self._worker_had_error:
             self._set_run_state("failed", "실행 로그에서 원인을 확인하세요")

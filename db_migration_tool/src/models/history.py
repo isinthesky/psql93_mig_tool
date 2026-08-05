@@ -110,14 +110,22 @@ class HistoryManager:
         end_date: str,
         source_status: str | None = None,
         target_status: str | None = None,
+        total_rows: int = 0,
     ) -> MigrationHistoryItem:
-        """새 이력 생성"""
+        """새 이력 생성
+
+        Args:
+            total_rows: 이 작업이 옮기기로 한 전체 행 수. 실행 시작 시점의
+                범위를 기록해 둬야 나중에 "어디까지 갔나"를 답할 수 있다.
+                PostgreSQL 소스라면 플래너 통계 기반 추정치다.
+        """
         db_history = self.repo.create(
             profile_id=profile_id,
             start_date=start_date,
             end_date=end_date,
             started_at=datetime.now(),
             status="running",
+            total_rows=total_rows,
             source_connection_status=source_status,
             target_connection_status=target_status,
             connection_check_time=datetime.now() if source_status or target_status else None,
@@ -137,12 +145,23 @@ class HistoryManager:
         return [MigrationHistoryItem.from_db_model(h) for h in db_histories]
 
     def update_history_status(
-        self, history_id: int, status: str, processed_rows: int | None = None
+        self,
+        history_id: int,
+        status: str,
+        processed_rows: int | None = None,
+        total_rows: int | None = None,
     ) -> bool:
-        """이력 상태 업데이트"""
+        """이력 상태 업데이트
+
+        Args:
+            total_rows: 전체 행 수를 나중에 바로잡을 때만 넘긴다. 실행 시점의
+                값은 추정치이므로, 실제로 다 옮기고 나면 정정할 수 있다.
+        """
         updates: dict[str, Any] = {"status": status}
         if processed_rows is not None:
             updates["processed_rows"] = processed_rows
+        if total_rows is not None:
+            updates["total_rows"] = total_rows
 
         if status in ["completed", "failed", "cancelled"]:
             updates["completed_at"] = datetime.now()
@@ -210,6 +229,15 @@ class CheckpointManager:
             updates["bytes_transferred"] = bytes_transferred
 
         return self.repo.update_by_id(checkpoint_id, **updates)
+
+    def get_processed_rows(self, history_id: int) -> int:
+        """이력의 누적 처리 행 수(실행 횟수와 무관).
+
+        워커의 성능 카운터는 실행 1회분만 센다. 재개 후 그 값을 이력에
+        쓰면 진행량이 뒤로 간다(70만 처리 후 중단 → 30만 더 처리하고 완료 →
+        이력에는 30만). 체크포인트는 실행을 넘어 남으므로 여기서 합산한다.
+        """
+        return self.repo.sum_rows_processed(history_id)
 
     def get_pending_checkpoints(self, history_id: int) -> list[CheckpointItem]:
         """미완료 체크포인트 조회"""

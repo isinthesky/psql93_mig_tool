@@ -8,6 +8,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from typing import Generic, TypeVar
 
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from .local_db import Checkpoint, MigrationHistory, get_db
@@ -320,6 +321,24 @@ class CheckpointRepository(BaseRepository[Checkpoint]):
             for obj in results:
                 session.expunge(obj)
             return results
+
+    def sum_rows_processed(self, history_id: int) -> int:
+        """이력의 누적 처리 행 수.
+
+        워커의 성능 카운터는 실행 1회분만 센다. 재개하면 새 워커가 0부터
+        다시 세므로 그 값을 이력에 쓰면 진행량이 뒤로 간다. 체크포인트는
+        실행을 넘어 남으므로 여기서 합산한다.
+
+        엔티티를 만들지 않고 SQL에서 더한다 — 체크포인트가 수만 개인
+        이력에서 전부 hydrate하면 UI 스레드가 멈춘다.
+        """
+        with self._session_scope() as session:
+            total = (
+                session.query(func.coalesce(func.sum(Checkpoint.rows_processed), 0))
+                .filter(Checkpoint.history_id == history_id)
+                .scalar()
+            )
+            return int(total or 0)
 
     def get_pending_by_history(self, history_id: int) -> list[Checkpoint]:
         """미완료 체크포인트 조회
