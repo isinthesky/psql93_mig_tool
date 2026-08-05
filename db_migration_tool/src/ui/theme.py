@@ -229,6 +229,11 @@ QPushButton {
     border-radius: 5px;
     padding: 7px 12px;
     font-weight: 600;
+    /* 다이얼로그 안에서는 padding이 버튼의 sizeHint에 반영되지 않아
+       '이전'·'검증 실행' 같은 문구가 잘려 보였다(단독 위젯일 때는 정상).
+       min-width만은 확실히 반영되므로 여기서 바닥을 깔아 준다.
+       텍스트가 더 길면 sizeHint가 그만큼 커지므로 넓은 버튼은 그대로 넓어진다. */
+    min-width: 96px;
 }
 QPushButton:hover {
     background-color: $border;
@@ -257,6 +262,9 @@ QPushButton[variant="chip"] {
     border-radius: 4px;
     padding: 4px 10px;
     font-weight: 500;
+    /* 보조 액션은 좁아야 한다. 기본 버튼의 min-width를 물려받으면
+       날짜 프리셋 같은 짧은 칩이 본 액션만큼 커진다. */
+    min-width: 0;
 }
 QPushButton[variant="chip"]:hover {
     color: $text_strong;
