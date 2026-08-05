@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from typing import cast
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QTextCursor
 from PySide6.QtWidgets import (
     QButtonGroup,
@@ -73,6 +73,11 @@ def to_qdate(py_date):
 
 
 class FileArchiveMigrationDialog(ScanHostMixin, QDialog):
+    # 실행 중인지 여부가 바뀔 때마다 발행한다. 메인 창이 트레이에 전달해
+    # 실행 중 아이콘과 종료 확인이 실제로 동작하게 한다. 다이얼로그가
+    # 트레이를 직접 알면 창을 띄우는 쪽마다 배선을 다시 해야 한다.
+    migration_running_changed = Signal(bool)
+
     # 실행 상태 → (램프, 표시 문구). 마이그레이션 마법사와 같은 언어를 쓴다.
     # 'paused'는 없다 — 아카이브 워커가 일시정지를 지원하지 않는다.
     RUN_STATES = {
@@ -347,6 +352,10 @@ class FileArchiveMigrationDialog(ScanHostMixin, QDialog):
         self.run_detail_label.setText(detail)
 
         running = state == "running"
+        # 실행 상태가 갈리는 유일한 지점이므로 트레이 통지도 여기서 낸다.
+        # 각 핸들러에서 따로 알리면 한 경로만 빠져도 트레이가 계속 '실행 중'으로 남는다.
+        self.migration_running_changed.emit(running)
+
         start_labels = {
             "stopped": "이어서 시작",
             "partial": "실패분 다시 실행",

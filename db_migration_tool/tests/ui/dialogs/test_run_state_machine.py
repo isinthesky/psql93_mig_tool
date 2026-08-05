@@ -222,6 +222,63 @@ class TestArchiveRunState:
         assert archive_dialog.cancel_btn.isEnabled()
 
 
+class TestTrayRunNotification:
+    """실행 상태가 트레이까지 전달되는지 확인한다.
+
+    과거에 `set_migration_running`을 아무도 부르지 않아 플래그가 늘 False였다.
+    그 결과 마이그레이션 중에도 트레이 '종료'가 되묻지 않고 앱을 껐다.
+    """
+
+    @staticmethod
+    def _capture(dialog):
+        seen: list[bool] = []
+        dialog.migration_running_changed.connect(seen.append)
+        return seen
+
+    def test_wizard_reports_running(self, wizard):
+        seen = self._capture(wizard)
+        wizard._set_run_state("running")
+        assert seen == [True]
+
+    def test_wizard_reports_paused_as_still_running(self, wizard):
+        """일시정지는 아직 끝난 게 아니다. 여기서 False를 보내면 종료 확인이 사라진다."""
+        seen = self._capture(wizard)
+        wizard._set_run_state("paused")
+        assert seen == [True]
+
+    @pytest.mark.parametrize("state", ["idle", "done", "stopped", "failed"])
+    def test_wizard_reports_not_running_on_terminal_states(self, wizard, state):
+        seen = self._capture(wizard)
+        wizard._set_run_state(state)
+        assert seen == [False]
+
+    def test_archive_reports_running(self, archive_dialog):
+        seen = self._capture(archive_dialog)
+        archive_dialog._set_run_state("running")
+        assert seen == [True]
+
+    @pytest.mark.parametrize("state", ["idle", "done", "partial", "stopped", "failed"])
+    def test_archive_reports_not_running_on_terminal_states(self, archive_dialog, state):
+        seen = self._capture(archive_dialog)
+        archive_dialog._set_run_state(state)
+        assert seen == [False]
+
+    def test_main_window_forwards_to_tray(self):
+        from src.ui.main_window import MainWindow
+
+        window = MagicMock()
+        MainWindow.set_migration_running(window, True)
+        window.tray_icon.set_migration_running.assert_called_once_with(True)
+
+    def test_main_window_without_tray_is_harmless(self):
+        """트레이 설정에 실패한 환경에서도 실행 자체는 막히면 안 된다."""
+        from src.ui.main_window import MainWindow
+
+        window = MagicMock()
+        window.tray_icon = None
+        MainWindow.set_migration_running(window, True)
+
+
 class TestTableTypeGuard:
     def test_last_checked_type_cannot_be_unchecked(self, wizard):
         checked = [cb for cb in wizard.table_type_checkboxes.values() if cb.isChecked()]

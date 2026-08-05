@@ -5,7 +5,6 @@
 from PySide6.QtCore import QEvent, Qt, QTimer, Signal
 from PySide6.QtGui import QAction, QCloseEvent
 from PySide6.QtWidgets import (
-    QDialog,
     QGroupBox,
     QHBoxLayout,
     QListWidget,
@@ -363,12 +362,20 @@ class MainWindow(QMainWindow):
         self.status_bar.showMessage(
             f"{self._migration_mode_text(profile)} 실행 준비 · {self._endpoint_summary(profile)}"
         )
-        dialog: QDialog
+        dialog: MigrationWizardDialog | FileArchiveMigrationDialog
         if profile.source_kind == "postgres" and profile.target_kind == "postgres":
             dialog = MigrationWizardDialog(self, profile)
         else:
             dialog = FileArchiveMigrationDialog(self, profile)
-        dialog.exec()
+
+        dialog.migration_running_changed.connect(self.set_migration_running)
+        try:
+            dialog.exec()
+        finally:
+            # 다이얼로그가 어떻게 끝나든 실행 표시는 내린다. 마지막 상태 변화를
+            # 놓치면 트레이가 영원히 '실행 중'으로 남아 종료를 계속 되묻는다.
+            self.set_migration_running(False)
+
         # 다이얼로그는 이 창의 자식이라 exec()가 끝나도 살아 있다.
         # 정리하지 않으면 마이그레이션을 열 때마다 쌓이고, 워커 결과가
         # 숨겨진 창으로 계속 배달된다.
@@ -401,6 +408,15 @@ class MainWindow(QMainWindow):
             self.log_viewer_dialog.activateWindow()
 
     # === 트레이 아이콘 관련 메서드 ===
+
+    def set_migration_running(self, is_running: bool):
+        """마이그레이션 실행 여부를 트레이에 전달한다.
+
+        트레이는 이 값으로 실행 중 아이콘을 바꾸고, 종료를 누를 때 되묻는다.
+        트레이 설정에 실패한 환경에서는 `tray_icon`이 없으므로 조용히 넘어간다.
+        """
+        if self.tray_icon:
+            self.tray_icon.set_migration_running(is_running)
 
     def closeEvent(self, event: QCloseEvent):
         """윈도우 닫기 이벤트 처리
