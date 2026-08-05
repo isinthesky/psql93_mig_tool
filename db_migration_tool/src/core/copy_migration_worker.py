@@ -586,9 +586,9 @@ class CopyMigrationWorker(BaseMigrationWorker):
                 self.performance_metrics.completed_partitions += 1
                 self._update_checkpoint_completed(checkpoint, 0, copy_method="COPY")
                 return
-            total_rows = table_info["row_count"]
+            total_rows, is_empty = self._resolve_total_rows(partition_name, table_info)
             total_mb = table_info["total_size_mb"]
-            if total_rows == 0:
+            if is_empty:
                 self._log(f"{partition_name} - 데이터 없음", "WARNING")
                 self._update_checkpoint_completed(checkpoint, 0, copy_method="COPY")
                 self.performance_metrics.completed_partitions += 1
@@ -905,10 +905,10 @@ class CopyMigrationWorker(BaseMigrationWorker):
                 self._update_checkpoint_completed(checkpoint, 0)
                 return
 
-            total_rows = table_info["row_count"]
+            total_rows, is_empty = self._resolve_total_rows(partition_name, table_info)
             total_mb = table_info["total_size_mb"]
 
-            if total_rows == 0:
+            if is_empty:
                 self.log.emit(f"{partition_name} - 데이터 없음", "WARNING")
                 self._update_checkpoint_completed(checkpoint, 0)
                 self.performance_metrics.completed_partitions += 1
@@ -1112,6 +1112,55 @@ class CopyMigrationWorker(BaseMigrationWorker):
                 log_emitter.emit_log("INFO", f"{partition_name} 기존 데이터 삭제 완료")
 
         return created, row_count
+
+    def _resolve_total_rows(self, partition_name: str, table_info: dict) -> tuple[int, bool]:
+        """(행 수, 비어 있는가)를 돌려준다.
+
+        두 값을 나누는 이유: 행 수를 못 세는 경우에도 '비었다'고 단정하면 안 되는데,
+        그렇다고 진행률 계산에 음수를 넘길 수도 없다.
+
+        `estimate_table_size`의 row_count는 `pg_class.reltuples`, 즉 **추정치**다.
+        이 값은 VACUUM/ANALYZE 전에는 0(PG14+는 -1)이라, 방금 만들어져 아직
+        분석되지 않은 파티션은 **데이터가 있어도 0으로 보고된다.**
+
+        그대로 믿고 건너뛰면 체크포인트가 완료로 마킹되어 재개해도 다시
+        시도하지 않는다 — 조용한 데이터 누락이다. 이 도구는 최근 날짜
+        파티션을 옮기므로 갓 생성된 파티션이 정확히 이 조건에 해당한다.
+
+        추정이 0/음수일 때만 실제로 세어 확인한다(진짜 빈 테이블이면 COUNT도 싸다).
+        """
+        estimated = int(table_info.get("row_count") or 0)
+        if estimated > 0:
+            return estimated, False
+
+        try:
+            with self.source_conn.cursor() as cur:
+                cur.execute(
+                    sql.SQL("SELECT COUNT(*) FROM {}").format(sql.Identifier(partition_name))
+                )
+                row = cur.fetchone()
+                actual = int(row[0]) if row else 0
+        except Exception as e:
+            # 실패한 문장이 트랜잭션을 abort 상태로 남긴다. 되돌리지 않으면
+            # 이어지는 COPY가 전부 실패한다("current transaction is aborted").
+            try:
+                self.source_conn.rollback()
+            except Exception:
+                pass
+            # 셀 수 없으면 '비었다'고 단정하지 않는다. 건너뛰지 말고 진행시킨다.
+            self._log(
+                f"{partition_name} - 행 수 확인 실패({e}). 비어 있지 않다고 보고 진행합니다.",
+                "WARNING",
+            )
+            return 0, False
+
+        if actual > 0:
+            self._log(
+                f"{partition_name} - 통계상 0행이지만 실제 {actual:,}행입니다"
+                " (ANALYZE 전 파티션). 건너뛰지 않습니다.",
+                "WARNING",
+            )
+        return actual, actual == 0
 
     def _update_checkpoint_completed(
         self,

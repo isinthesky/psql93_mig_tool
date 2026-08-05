@@ -24,7 +24,12 @@ SQL_TEMPLATES: dict[str, dict[str, str]] = {
         # 테이블 크기 추정 (pg_table_size 사용)
         "estimate_size": """
             SELECT
-                (SELECT reltuples::bigint FROM pg_class WHERE relname = %s) as row_count,
+                (SELECT c.reltuples::bigint
+                   FROM pg_class c
+                   JOIN pg_namespace n ON n.oid = c.relnamespace
+                  WHERE c.relname = %s
+                    AND n.nspname = 'public'
+                    AND c.relkind IN ('r', 'p')) as row_count,
                 pg_table_size(%s) as total_size
         """,
         # 권한 확인 (pg_read_server_files 역할 없음 - 슈퍼유저만 확인)
@@ -48,7 +53,12 @@ SQL_TEMPLATES: dict[str, dict[str, str]] = {
         # 테이블 크기 추정 (pg_total_relation_size 사용 - 인덱스 포함)
         "estimate_size": """
             SELECT
-                (SELECT reltuples::bigint FROM pg_class WHERE relname = %s) as row_count,
+                (SELECT c.reltuples::bigint
+                   FROM pg_class c
+                   JOIN pg_namespace n ON n.oid = c.relnamespace
+                  WHERE c.relname = %s
+                    AND n.nspname = 'public'
+                    AND c.relkind IN ('r', 'p')) as row_count,
                 pg_total_relation_size(%s) as total_size
         """,
         # 권한 확인 (pg_read_server_files 역할 지원)

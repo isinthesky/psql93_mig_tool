@@ -288,12 +288,20 @@ class PostgresOptimizer:
             except psycopg2.Error:
                 pass
             logger.error(f"테이블 크기 추정 실패: {e}")
+            # 여기서 exists=False를 돌려주면 안 된다.
+            # 호출부(COPY 워커)는 그것을 '소스 테이블이 없다'로 읽고 체크포인트를
+            # 완료로 마킹한 뒤 건너뛴다. 실제로는 '확인하지 못했다'일 뿐이라,
+            # 멀쩡한 파티션이 조용히 누락된다.
+            # 확인 불가는 존재한다고 보고 진행시킨다. 정말 없으면 이어지는
+            # COPY가 크게 실패하므로 사용자가 알 수 있다.
             return {
                 "row_count": 0,
                 "total_size_bytes": 0,
                 "total_size_mb": 0,
                 "avg_row_size_bytes": 0,
-                "exists": False,
+                "exists": True,
+                "lookup_failed": True,
+                "error": str(e),
             }
 
     @staticmethod
