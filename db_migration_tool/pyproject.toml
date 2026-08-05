@@ -4,34 +4,34 @@ version = "1.0.0"
 description = "PostgreSQL 파티션 테이블 마이그레이션 도구"
 authors = [{name = "DB Migration Team"}]
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.13"
 license = {text = "Proprietary"}
 
 # Core dependencies
 dependencies = [
-    "PySide6>=6.5.0",
-    "psycopg[binary]>=3.1.18",
-    "psycopg-pool>=3.2.0",
-    "psycopg2-binary>=2.9.9",
+    "PySide6>=6.11.1",
+    "psycopg[binary]>=3.3.4",
+    "psycopg-pool>=3.3.1",
+    "psycopg2-binary>=2.9.12",
     "qdarkstyle>=3.2.3",
-    "SQLAlchemy>=2.0.23",
-    "cryptography>=41.0.7",
+    "SQLAlchemy>=2.0.51",
+    "cryptography>=50.0.0",
 ]
 
 [project.optional-dependencies]
 # Development dependencies (build, package, lint, type check)
 dev = [
-    "PyInstaller>=6.3.0",
-    "ruff>=0.8.0",
-    "mypy>=1.13.0",
+    "PyInstaller>=6.21.0",
+    "ruff>=0.16.1",
+    "mypy>=2.3.0",
 ]
 
 # Test dependencies
 test = [
-    "pytest>=7.4.3",
-    "pytest-qt>=4.2.0",
-    "pytest-cov>=4.1.0",
-    "pytest-mock>=3.11.1",
+    "pytest>=9.1.1",
+    "pytest-qt>=4.5.0",
+    "pytest-cov>=7.1.0",
+    "pytest-mock>=3.15.1",
 ]
 
 # All optional dependencies
@@ -51,7 +51,7 @@ db-migration-tool = "src.main:main"
 
 # Ruff 설정
 [tool.ruff]
-target-version = "py311"
+target-version = "py313"
 line-length = 100
 indent-width = 4
 
@@ -83,7 +83,7 @@ line-ending = "auto"
 
 # MyPy 설정
 [tool.mypy]
-python_version = "3.11"
+python_version = "3.13"
 warn_return_any = true
 warn_unused_configs = true
 disallow_untyped_defs = false
@@ -96,10 +96,6 @@ warn_unused_ignores = true
 warn_no_return = true
 strict_optional = true
 ignore_missing_imports = true
-
-[[tool.mypy.overrides]]
-module = "tests.*"
-ignore_errors = true
 
 # Pytest 설정
 [tool.pytest.ini_options]
@@ -135,6 +131,6 @@ skip_covered = false
 
 [dependency-groups]
 dev = [
-    "pyinstaller>=6.16.0",
-    "pytest>=8.4.2",
+    "pyinstaller>=6.21.0",
+    "pytest>=9.1.1",
 ]

@@ -6,17 +6,14 @@ CRUD 공통 로직을 제공하는 베이스 리포지토리와
 
 from collections.abc import Iterator
 from contextlib import contextmanager
-from typing import Generic, TypeVar
 
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from .local_db import Checkpoint, MigrationHistory, get_db
 
-T = TypeVar("T")
 
-
-class BaseRepository(Generic[T]):
+class BaseRepository[T]:
     """CRUD 공통 로직을 제공하는 베이스 리포지토리
 
     Args:

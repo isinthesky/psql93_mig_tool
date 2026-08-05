@@ -2,23 +2,21 @@
 echo DB Migration Tool - Development Mode
 echo.
 
-REM ê°€ìƒí™˜ê²½ í™œì„±í™”
-if exist venv\Scripts\activate.bat (
-    call venv\Scripts\activate
-) else (
-    echo ê°€ìƒí™˜ê²½ì„ ì°¾ì„ ìˆ˜ ì—†ìŠµë‹ˆë‹¤.
-    echo python -m venv venv ëª…ë ¹ìœ¼ë¡œ ìƒì„±í•˜ì„¸ìš”.
+REM °¡»óÈ¯°æ È®ÀÎ (uv°¡ .venv¿¡ ¸¸µç´Ù)
+if not exist ".venv\Scripts\python.exe" (
+    echo °¡»óÈ¯°æÀ» Ã£À» ¼ö ¾ø½À´Ï´Ù.
+    echo uv sync --all-extras --dev ¸í·ÉÀ¸·Î »ı¼ºÇÏ¼¼¿ä.
     pause
     exit /b 1
 )
 
-REM ì• í”Œë¦¬ì¼€ì´ì…˜ ì‹¤í–‰
-echo ì• í”Œë¦¬ì¼€ì´ì…˜ì„ ì‹œì‘í•©ë‹ˆë‹¤...
-python src/main.py
+REM ¾ÖÇÃ¸®ÄÉÀÌ¼Ç ½ÇÇà
+echo ¾ÖÇÃ¸®ÄÉÀÌ¼ÇÀ» ½ÃÀÛÇÕ´Ï´Ù...
+".venv\Scripts\python.exe" src\main.py
 
-REM ì˜¤ë¥˜ ë°œìƒ ì‹œ ëŒ€ê¸°
+REM ¿À·ù ¹ß»ı ½Ã ´ë±â
 if errorlevel 1 (
     echo.
-    echo ì˜¤ë¥˜ê°€ ë°œìƒí–ˆìŠµë‹ˆë‹¤.
+    echo ¿À·ù°¡ ¹ß»ıÇß½À´Ï´Ù.
     pause
 )
