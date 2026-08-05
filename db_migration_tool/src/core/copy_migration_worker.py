@@ -281,6 +281,13 @@ class CopyMigrationWorker(BaseMigrationWorker):
 
             # 각 파티션 처리
             for i, partition in enumerate(self.partitions):
+                # 일시정지는 파티션 경계에서도 확인한다.
+                #
+                # Python COPY는 배치 루프 안에서 스스로 확인하지만, server-side
+                # COPY는 파티션 하나가 단일 명령이라 중간에 끼어들 수 없다.
+                # 이 확인이 없으면 server/auto 모드에서 '일시정지'를 눌러도
+                # 작업이 끝까지 그냥 돈다 — 화면만 '일시정지'라고 말한다.
+                self._check_pause()
                 if not self.is_running:
                     break
 

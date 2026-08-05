@@ -17,6 +17,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 import src.ui.dialogs.file_archive_migration_dialog as archive_mod
+import src.ui.dialogs.scan_host as scan_host
 from src.core.table_types import TableType
 
 
@@ -346,10 +347,10 @@ class TestScanLifecycle:
             dialog._abandon_scans()
 
             assert worker.disconnect.called, "사라질 위젯을 건드리지 못하게 끊어야 합니다"
-            assert worker in archive_mod._ORPHANED_SCAN_WORKERS, "참조가 유지돼야 합니다"
+            assert worker in scan_host._ORPHANED_SCAN_WORKERS, "참조가 유지돼야 합니다"
             assert dialog._scan_workers == {}
         finally:
-            archive_mod._ORPHANED_SCAN_WORKERS.discard(worker)
+            scan_host._ORPHANED_SCAN_WORKERS.discard(worker)
 
     def test_stopped_worker_is_not_parked(self, dialog):
         worker = MagicMock()
@@ -358,7 +359,7 @@ class TestScanLifecycle:
 
         dialog._abandon_scans()
 
-        assert worker not in archive_mod._ORPHANED_SCAN_WORKERS
+        assert worker not in scan_host._ORPHANED_SCAN_WORKERS
 
     def test_reject_also_stops_scans(self, dialog):
         """Esc는 closeEvent를 거치지 않을 수 있다."""

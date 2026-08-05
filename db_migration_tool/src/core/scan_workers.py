@@ -58,7 +58,10 @@ class ScanWorker(QThread):
     def __init__(self, generation: int):
         super().__init__()
         self.generation = generation
-        self._conn: Any = None
+        # 취소를 걸 커넥션들. 대부분의 워커는 1개지만 소스·대상을 함께
+        # 쓰는 워커도 있다. 하나만 추적하면 나머지 쪽 쿼리가 도는 동안
+        # 취소가 조용히 무시된다.
+        self._conns: list[Any] = []
         self._conn_lock = threading.Lock()
 
     # ── 취소 ────────────────────────────────────────────────
@@ -68,22 +71,22 @@ class ScanWorker(QThread):
     def cancel_query(self) -> None:
         """진행 중인 쿼리를 서버 쪽에서 끊는다(다른 스레드에서 호출 가능)."""
         with self._conn_lock:
-            conn = self._conn
-        if conn is None:
-            return
-        try:
-            conn.cancel()
-        except Exception:
-            # 이미 닫혔거나 취소를 지원하지 않는다. 무시해도 안전하다.
-            pass
+            conns = list(self._conns)
+        for conn in conns:
+            try:
+                conn.cancel()
+            except Exception:
+                # 이미 닫혔거나 취소를 지원하지 않는다. 무시해도 안전하다.
+                pass
 
     def _track_connection(self, conn: Any) -> None:
         with self._conn_lock:
-            self._conn = conn
+            if not any(tracked is conn for tracked in self._conns):
+                self._conns.append(conn)
 
     def _release_connection(self) -> None:
         with self._conn_lock:
-            self._conn = None
+            self._conns.clear()
 
     # ── 실행 ────────────────────────────────────────────────
     def execute(self) -> Any:
@@ -272,14 +275,100 @@ class TargetCompletedScanWorker(ScanWorker):
         self.progress.emit(self.generation, done, total)
 
 
+class RowCountVerifyWorker(ScanWorker):
+    """소스/대상의 행 수를 COUNT(*)로 비교한다.
+
+    사용자가 명시적으로 요청하는 검증 단계다. 여기서는 추정치를 쓰면 안 된다 —
+    '옮긴 게 맞는가'를 답하는 것이 목적이므로 정확한 값이어야 한다.
+
+    payload는 `list[dict]`: {table, source_count, target_count, ok}
+    """
+
+    def __init__(
+        self,
+        generation: int,
+        source_config: dict,
+        target_config: dict,
+        table_names: list[str],
+    ):
+        super().__init__(generation)
+        self._source_config = dict(source_config)
+        self._target_config = dict(target_config)
+        self._names = list(table_names)
+
+    @staticmethod
+    def _conn_params(config: dict) -> dict[str, Any]:
+        params: dict[str, Any] = {
+            "host": config.get("host", "localhost"),
+            "port": config.get("port", 5432),
+            "dbname": config.get("database", ""),
+            "user": config.get("username", ""),
+            "password": config.get("password", ""),
+            "connect_timeout": CONNECT_TIMEOUT_SECONDS,
+        }
+        if config.get("ssl"):
+            params["sslmode"] = "require"
+        return params
+
+    def execute(self) -> list[dict[str, Any]]:
+        results: list[dict[str, Any]] = []
+        total = len(self._names)
+
+        source = psycopg.connect(**self._conn_params(self._source_config))
+        try:
+            target = psycopg.connect(**self._conn_params(self._target_config))
+        except Exception:
+            source.close()
+            raise
+
+        # 양쪽 다 추적한다. 소스와 대상의 COUNT(*)를 번갈아 돌리므로,
+        # 소스만 걸어 두면 검증 시간의 절반이 취소 불가 구간이 된다.
+        self._track_connection(source)
+        self._track_connection(target)
+        try:
+            source.autocommit = True
+            target.autocommit = True
+            with source.cursor() as s_cur, target.cursor() as t_cur:
+                for index, name in enumerate(self._names, start=1):
+                    if self.should_stop():
+                        raise ScanCancelled("검증이 취소되었습니다")
+
+                    query = sql.SQL("SELECT COUNT(*) FROM {}").format(sql.Identifier(name))
+                    s_cur.execute(query)
+                    s_row = s_cur.fetchone()
+                    t_cur.execute(query)
+                    t_row = t_cur.fetchone()
+
+                    source_count = int(s_row[0]) if s_row else 0
+                    target_count = int(t_row[0]) if t_row else 0
+                    results.append(
+                        {
+                            "table": name,
+                            "source_count": source_count,
+                            "target_count": target_count,
+                            "ok": source_count == target_count,
+                        }
+                    )
+                    self.progress.emit(self.generation, index, total)
+        finally:
+            self._release_connection()
+            for conn in (source, target):
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+        return results
+
+
 class PartitionScanWorker(ScanWorker):
     """소스에서 날짜 범위에 해당하는 파티션을 찾는다.
 
     payload는 `list[dict]` — `PartitionDiscovery`/`ArchiveManifestStore`가 주는
     원본 항목 그대로다. UI 표현으로 바꾸는 일은 다이얼로그가 한다.
 
-    PostgreSQL 소스는 파티션마다 `COUNT(*)` 전수 스캔이 돌기 때문에 상한이 없다.
-    취소 훅이 이 워커에서 가장 중요한 이유다.
+    행 수의 성격이 소스마다 다르다. PostgreSQL 쪽은 플래너 통계 기반 **추정치**라
+    항목에 `row_count_estimated: True`가 붙는다. 아카이브 쪽은 내보낼 때 실제로
+    센 값이라 붙지 않는다. 다이얼로그는 이 플래그를 보고 표기를 정한다.
     """
 
     def __init__(
@@ -311,8 +400,8 @@ class PartitionScanWorker(ScanWorker):
             self._table_types,
             should_stop=self.should_stop,
             on_progress=self._emit_progress,
-            # COUNT(*) 전수 스캔은 플래그로 못 멈춘다. 커넥션을 받아 둬야
-            # cancel_query()가 실제로 쿼리를 끊을 수 있다.
+            # 플래그는 쿼리 사이에서만 읽힌다. 커넥션을 받아 둬야
+            # cancel_query()가 진행 중인 쿼리를 실제로 끊을 수 있다.
             on_connection=self._track_connection,
         )
 

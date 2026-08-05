@@ -7,7 +7,6 @@ from datetime import date, datetime
 from typing import Any
 
 import psycopg
-from psycopg import sql
 
 from .archive_manifest import ScanCancelled
 from .table_types import DEFAULT_TABLE_TYPE, TableType, infer_partition_range
@@ -43,13 +42,13 @@ class PartitionDiscovery:
             start_date: 시작 날짜
             end_date: 종료 날짜
             table_types: 탐색할 테이블 타입 리스트 (기본값: [DEFAULT_TABLE_TYPE])
-            should_stop: 중간에 멈춰야 하는지 묻는 콜백. 파티션마다 COUNT(*)를
-                돌기 때문에 이 훅이 없으면 창을 닫아도 워커가 안 멈춘다.
+            should_stop: 중간에 멈춰야 하는지 묻는 콜백. 파티션이 수백 개면
+                루프가 길어지므로 이 훅이 없으면 창을 닫아도 워커가 안 멈춘다.
             on_progress: (done, total) 진행 상황 콜백. total은 아직 모르는
                 시점이 있어 0으로 올 수 있다.
-            on_connection: 커넥션이 열리면 넘겨준다. 파티션마다 도는
-                `COUNT(*)` 전수 스캔은 플래그로 못 멈추므로, 호출자가 이
-                커넥션에 `cancel()`을 걸 수 있어야 실제로 중단된다.
+            on_connection: 커넥션이 열리면 넘겨준다. 플래그는 쿼리 사이에서만
+                읽히므로, 첫 조회가 오래 걸리면 호출자가 이 커넥션에
+                `cancel()`을 걸 수 있어야 실제로 중단된다.
 
         Returns:
             파티션 정보 리스트
@@ -137,7 +136,7 @@ class PartitionDiscovery:
                             if not table_type:
                                 continue
 
-                            row_count = self._get_row_count(cur, table_name)
+                            row_count = self._estimate_row_count(cur, table_name)
                             partitions.append(
                                 {
                                     "table_name": table_name,
@@ -146,6 +145,8 @@ class PartitionDiscovery:
                                     "start_date": partition_start,
                                     "end_date": partition_end,
                                     "row_count": row_count,
+                                    # 추정치임을 UI가 정직하게 표기하도록 알린다.
+                                    "row_count_estimated": True,
                                     "from_timestamp": from_date,
                                     "to_timestamp": to_date,
                                 }
@@ -185,7 +186,7 @@ class PartitionDiscovery:
                         if partition_start > end_date or partition_end < start_date:
                             continue
 
-                        row_count = self._get_row_count(cur, table_name)
+                        row_count = self._estimate_row_count(cur, table_name)
                         partitions.append(
                             {
                                 "table_name": table_name,
@@ -194,6 +195,8 @@ class PartitionDiscovery:
                                 "start_date": partition_start,
                                 "end_date": partition_end,
                                 "row_count": row_count,
+                                # 추정치임을 UI가 정직하게 표기하도록 알린다.
+                                "row_count_estimated": True,
                                 "from_timestamp": from_ts,
                                 "to_timestamp": to_ts,
                             }
@@ -256,7 +259,7 @@ class PartitionDiscovery:
                 }
 
                 if info["exists"]:
-                    info["row_count"] = self._get_row_count(cur, table_name)
+                    info["row_count"] = self._estimate_row_count(cur, table_name)
                     cur.execute(
                         """
                         SELECT column_name, data_type
@@ -335,12 +338,39 @@ class PartitionDiscovery:
         row = cursor.fetchone()
         return bool(row and row[0])
 
-    def _get_row_count(self, cursor, table_name: str) -> int:
-        """테이블 행 수 조회"""
+    def _estimate_row_count(self, cursor, table_name: str) -> int:
+        """테이블 행 수 **추정치**를 얻는다.
+
+        예전에는 파티션마다 `SELECT COUNT(*)`를 돌렸다. 이 도구가 다루는
+        파티션은 수백만 행이고 한 번에 수십~수백 개를 훑으므로, 전수 스캔이
+        탐색 시간을 지배했다(파티션당 수 초 × 개수). 그 숫자는 목록·툴팁·
+        합계 라벨에만 쓰이고 건너뛰기나 완료 판정에는 쓰이지 않으므로,
+        플래너 통계(`pg_class.reltuples`)로 충분하다.
+
+        정확한 값이 필요한 곳은 각자 따로 센다:
+        - 실행 전 빈 파티션 판정: `CopyMigrationWorker._resolve_total_rows()`
+        - 사후 검증: `RowCountVerifyWorker` (`COUNT(*)` 유지)
+
+        ANALYZE 전이면 통계가 없다. PG14+는 `-1`, 그 이전은 `0`을 준다.
+        둘 다 '모른다'는 뜻이므로 0으로 눕힌다 — 음수가 합계를 깎으면
+        화면의 총합이 실제보다 작아진다.
+        """
         try:
-            cursor.execute(sql.SQL("SELECT COUNT(*) FROM {}").format(sql.Identifier(table_name)))
+            cursor.execute(
+                """
+                SELECT c.reltuples::bigint
+                FROM pg_class c
+                JOIN pg_namespace n ON n.oid = c.relnamespace
+                WHERE c.relname = %s
+                  AND n.nspname = 'public'
+                  AND c.relkind IN ('r', 'p')
+                """,
+                (table_name,),
+            )
             row = cursor.fetchone()
-            return int(row[0]) if row else 0
+            if not row or row[0] is None:
+                return 0
+            return max(0, int(row[0]))
         except (psycopg.DatabaseError, psycopg.OperationalError):
             return 0
 

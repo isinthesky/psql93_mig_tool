@@ -19,9 +19,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from typing import cast
 
-import psycopg2
-from psycopg2 import sql
-from PySide6.QtCore import QDate, Qt, QThread, QTimer, Signal
+from PySide6.QtCore import QDate, Qt, QTimer
 from PySide6.QtGui import QColor, QTextCursor
 from PySide6.QtWidgets import (
     QButtonGroup,
@@ -48,17 +46,23 @@ from PySide6.QtWidgets import (
 )
 
 from src.core.copy_migration_worker import CopyMigrationWorker
-from src.core.partition_discovery import PartitionDiscovery
+from src.core.scan_workers import (
+    PartitionScanWorker,
+    RowCountVerifyWorker,
+    TargetCompletedScanWorker,
+)
 from src.core.table_types import TABLE_TYPE_CONFIG, TableType, get_all_table_types
 from src.models.history import CheckpointManager, HistoryManager, MigrationHistoryItem
 from src.models.profile import ConnectionProfile
+from src.ui.dialogs.scan_host import (
+    PARTITION_DISPLAY_LIMIT,
+    ScanHostMixin,
+    build_log_retention_hint,
+    format_row_count,
+)
 from src.ui.theme import LOG_MAX_BLOCKS, TEXT_DANGER, TEXT_MUTED, log_color
 from src.ui.widgets import MetricReadout, StatusLamp, StepRail
 from src.utils.enhanced_logger import log_emitter
-
-# 화면에 그릴 파티션 최대 개수. 이보다 많으면 목록에 담기지 않고,
-# 담기지 않은 파티션은 실행 대상에서도 빠지므로 반드시 사용자에게 알린다.
-PARTITION_DISPLAY_LIMIT = 5000
 
 
 def to_qdate(d: date) -> QDate:
@@ -70,177 +74,12 @@ class PartitionSummary:
     table_name: str
     row_count: int
     table_type: TableType
+    # PostgreSQL 소스의 행 수는 플래너 통계에서 온 추정치다.
+    # 아카이브 소스는 내보낼 때 실제로 센 값이라 정확하다.
+    row_count_estimated: bool = False
 
 
-class PartitionDiscoveryWorker(QThread):
-    """파티션 탐색을 백그라운드에서 수행"""
-
-    result = Signal(list)  # list[dict]
-    error = Signal(str)
-
-    def __init__(
-        self, source_config: dict, start_date: date, end_date: date, table_types: list[TableType]
-    ):
-        super().__init__()
-        self.source_config = source_config
-        self.start_date = start_date
-        self.end_date = end_date
-        self.table_types = table_types
-
-    def run(self):
-        try:
-            discovery = PartitionDiscovery(self.source_config)
-            partitions = discovery.discover_partitions(
-                self.start_date,
-                self.end_date,
-                table_types=self.table_types,
-            )
-            self.result.emit(partitions or [])
-        except Exception as e:
-            self.error.emit(str(e))
-
-
-class TargetCompletedCheckWorker(QThread):
-    """대상 DB에 테이블/데이터가 이미 존재하는지(완료 후보) 확인"""
-
-    progress = Signal(int, int)  # done, total
-    result = Signal(dict)  # {table_name: bool}
-    error = Signal(str)
-
-    def __init__(self, target_config: dict, table_names: list[str]):
-        super().__init__()
-        self.target_config = target_config
-        self.table_names = table_names
-
-    def run(self):
-        try:
-            conn_params = {
-                "host": self.target_config.get("host"),
-                "port": self.target_config.get("port"),
-                "database": self.target_config.get("database"),
-                "user": self.target_config.get("username"),
-                "password": self.target_config.get("password"),
-            }
-            if self.target_config.get("ssl"):
-                conn_params["sslmode"] = "require"
-
-            conn = psycopg2.connect(**conn_params)
-            conn.autocommit = True
-
-            results: dict[str, bool] = {}
-            total = len(self.table_names)
-
-            with conn.cursor() as cur:
-                for i, table_name in enumerate(self.table_names, start=1):
-                    # table exists?
-                    cur.execute(
-                        """
-                        SELECT EXISTS (
-                            SELECT 1 FROM information_schema.tables
-                            WHERE table_schema = 'public'
-                            AND table_name = %s
-                        )
-                        """,
-                        (table_name,),
-                    )
-                    exists = bool(cur.fetchone()[0])
-                    has_data = False
-
-                    if exists:
-                        # cheap-ish check: any row?
-                        q = sql.SQL("SELECT 1 FROM {} LIMIT 1").format(sql.Identifier(table_name))
-                        try:
-                            cur.execute(q)
-                            has_data = cur.fetchone() is not None
-                        except Exception:
-                            # 권한/테이블 타입 이슈 등은 "있음"으로 보지 않고 False
-                            has_data = False
-
-                    results[table_name] = has_data
-                    self.progress.emit(i, total)
-
-            conn.close()
-            self.result.emit(results)
-        except Exception as e:
-            self.error.emit(str(e))
-
-
-class RowCountVerificationWorker(QThread):
-    """소스/대상 row_count(COUNT(*)) 검증 워커
-
-    - 기본 마이그레이션은 빠르게 끝내고,
-      필요할 때만 사용자가 버튼으로 실행하는 검증 단계.
-    """
-
-    progress = Signal(int, int, str)  # done, total, table
-    result = Signal(list)  # list[dict]
-    error = Signal(str)
-
-    def __init__(self, source_config: dict, target_config: dict, table_names: list[str]):
-        super().__init__()
-        self.source_config = source_config
-        self.target_config = target_config
-        self.table_names = table_names
-
-    def _connect(self, cfg: dict):
-        conn_params = {
-            "host": cfg.get("host"),
-            "port": cfg.get("port"),
-            "database": cfg.get("database"),
-            "user": cfg.get("username"),
-            "password": cfg.get("password"),
-        }
-        if cfg.get("ssl"):
-            conn_params["sslmode"] = "require"
-        conn = psycopg2.connect(**conn_params)
-        conn.autocommit = True
-        return conn
-
-    def run(self):
-        try:
-            src = self._connect(self.source_config)
-            dst = self._connect(self.target_config)
-
-            results = []
-            total = len(self.table_names)
-
-            with src.cursor() as s_cur, dst.cursor() as t_cur:
-                for i, name in enumerate(self.table_names, start=1):
-                    self.progress.emit(i, total, name)
-
-                    q = sql.SQL("SELECT COUNT(*) FROM {t}").format(t=sql.Identifier(name))
-
-                    s_cur.execute(q)
-                    s_count = int(s_cur.fetchone()[0])
-
-                    t_cur.execute(q)
-                    t_count = int(t_cur.fetchone()[0])
-
-                    results.append(
-                        {
-                            "table": name,
-                            "source_count": s_count,
-                            "target_count": t_count,
-                            "ok": s_count == t_count,
-                        }
-                    )
-
-            try:
-                src.close()
-            except Exception:
-                pass
-            try:
-                dst.close()
-            except Exception:
-                pass
-
-            self.result.emit(results)
-
-        except Exception as e:
-            self.error.emit(str(e))
-
-
-class MigrationWizardDialog(QDialog):
+class MigrationWizardDialog(ScanHostMixin, QDialog):
     """COPY 중심 단계형 마이그레이션 마법사"""
 
     # 실행 상태 → (램프, 표시 문구). 실행 페이지의 모든 버튼이 여기서 갈린다.
@@ -265,8 +104,7 @@ class MigrationWizardDialog(QDialog):
         # 실행 상태
         self.worker: CopyMigrationWorker | None = None
         self.connection_checker: CopyMigrationWorker | None = None
-        self.discovery_worker: PartitionDiscoveryWorker | None = None
-        self.completed_check_worker: TargetCompletedCheckWorker | None = None
+        self._init_scan_host()
 
         self.history_id: int | None = None
         self.resume_mode: bool = False
@@ -564,10 +402,14 @@ class MigrationWizardDialog(QDialog):
         row_dates.addWidget(QLabel("시작"))
         self.start_date_edit = QDateEdit()
         self.start_date_edit.setCalendarPopup(True)
+        # 날짜가 바뀌면 지금 목록은 무효다. 프리셋 버튼과 재개 모드의
+        # setDate()도 이 시그널을 타므로 한 곳만 걸면 전부 덮인다.
+        self.start_date_edit.dateChanged.connect(self._on_scan_condition_changed)
         row_dates.addWidget(self.start_date_edit)
         row_dates.addWidget(QLabel("종료"))
         self.end_date_edit = QDateEdit()
         self.end_date_edit.setCalendarPopup(True)
+        self.end_date_edit.dateChanged.connect(self._on_scan_condition_changed)
         row_dates.addWidget(self.end_date_edit)
         row_dates.addStretch(1)
         date_layout.addLayout(row_dates)
@@ -747,6 +589,7 @@ class MigrationWizardDialog(QDialog):
         # 장시간 실행에서 로그가 메모리를 계속 먹지 않도록 상한을 둔다.
         self.log_text.document().setMaximumBlockCount(LOG_MAX_BLOCKS)
         layout.addWidget(self.log_text)
+        layout.addWidget(build_log_retention_hint(LOG_MAX_BLOCKS))
         return group
 
     def _create_run_controls(self) -> QWidget:
@@ -842,6 +685,50 @@ class MigrationWizardDialog(QDialog):
         if idx == 2:
             self._refresh_summary()
 
+    def _on_scan_condition_changed(self, *_args) -> None:
+        """탐색 조건(날짜·항목)이 바뀌었다.
+
+        여기서 세대를 올리지 않으면, 옛 조건으로 시작한 탐색 결과가 현재
+        세대로 통과해 화면을 채운다. 그 목록을 그대로 실행하면 이력에는
+        위젯의 **새** 날짜가, 실제로는 **옛** 범위의 파티션이 기록된다.
+        """
+        self._bump_generation()
+
+    def _on_scan_generation_changed(self) -> None:
+        """조건이 바뀌면 지금 목록은 더 이상 그 조건의 결과가 아니다.
+
+        늦은 결과를 버리는 것만으로는 부족하다. 이미 그려진 목록이 남아
+        있으면 사용자는 그게 새 조건의 결과라고 믿고 실행한다.
+        """
+        if not self.discovered_partitions:
+            return
+        self.discovered_partitions = []
+        self._target_has_data = {}
+        self._render_partition_list()
+        self._update_counts()
+        self.discover_status.setText("조건이 바뀌었습니다. 파티션을 다시 찾으세요.")
+        self._sync_scan_buttons()
+        self._update_nav_state()
+
+    def _sync_scan_buttons(self) -> None:
+        """조회 버튼 활성화를 한 곳에서 정한다.
+
+        각 핸들러가 따로 켜고 끄면 순서에 따라 어긋난다. 예전에는 탐색이
+        한 번 실패하면 '완료여부 확인'이 영구 비활성으로 남았다.
+        """
+        if self.resume_mode:
+            # 재개 모드는 옵션이 잠겨 있다.
+            return
+        busy = self._is_scan_inflight("discover") or self._is_scan_inflight("target")
+        self.discover_btn.setEnabled(not busy)
+        self.check_completed_btn.setEnabled(not busy and bool(self.discovered_partitions))
+
+    def _set_scan_status(self, text: str) -> None:
+        self.discover_status.setText(text)
+
+    def _on_scans_abandoned(self) -> None:
+        self.add_log("조회 작업이 멈추지 않아 분리하고 창을 닫습니다", "WARNING")
+
     def _is_running(self) -> bool:
         if self.run_state in ("running", "paused"):
             return True
@@ -919,22 +806,33 @@ class MigrationWizardDialog(QDialog):
     # ============================
 
     def check_connections(self):
-        if self.connection_checker and self.connection_checker.isRunning():
+        # 생성자에서 QTimer로 예약되므로, 창이 뜨자마자 Esc를 누르면
+        # 닫힌 뒤에 이 호출이 도착할 수 있다.
+        if self._closing or self._is_scan_inflight("conn"):
             return
 
-        self.connection_checker = CopyMigrationWorker(
+        checker = CopyMigrationWorker(
             profile=self.profile,
             partitions=[],
             history_id=0,
             resume=False,
         )
-        self.connection_checker.connection_checking.connect(self._on_connection_checking)
-        self.connection_checker.source_connection_status.connect(self._on_source_connection_status)
-        self.connection_checker.target_connection_status.connect(self._on_target_connection_status)
-        self.connection_checker.finished.connect(lambda: self._update_nav_state())
+        checker.connection_checking.connect(self._on_connection_checking)
+        checker.source_connection_status.connect(self._on_source_connection_status)
+        checker.target_connection_status.connect(self._on_target_connection_status)
+        checker.finished.connect(self._on_connection_check_finished)
 
-        self.connection_checker.check_connections_only = True
-        self.connection_checker.start()
+        checker.check_connections_only = True
+        self.connection_checker = checker
+        # 조회 워커로 등록해야 창을 닫을 때 함께 정리된다. 등록하지 않으면
+        # 실행 중인 QThread의 참조가 다이얼로그와 함께 사라져 프로세스가 죽는다.
+        self._scan_workers["conn"] = checker
+        self._mark_scan_started("conn")
+        checker.start()
+
+    def _on_connection_check_finished(self):
+        self._mark_scan_finished("conn")
+        self._update_nav_state()
 
     def _on_connection_checking(self):
         self.source_lamp.set_state("busy", "확인 중...")
@@ -1030,8 +928,9 @@ class MigrationWizardDialog(QDialog):
         self.copy_mode_combo.setEnabled(True)
         self.start_date_edit.setEnabled(True)
         self.end_date_edit.setEnabled(True)
-        self.discover_btn.setEnabled(True)
-        self.check_completed_btn.setEnabled(bool(self.discovered_partitions))
+        # 조회 버튼은 직접 켜지 않는다. 탐색이 아직 도는 중일 수 있고,
+        # 그러면 눌러도 반응 없는 죽은 버튼이 된다.
+        self._sync_scan_buttons()
         self.select_all_btn.setEnabled(True)
         self.select_none_btn.setEnabled(True)
         self.select_pending_btn.setEnabled(True)
@@ -1120,6 +1019,8 @@ class MigrationWizardDialog(QDialog):
             tt for tt, cb in self.table_type_checkboxes.items() if cb.isChecked()
         ]
         self._guard_last_table_type()
+        # 항목도 탐색 조건이다. 날짜와 같이 취급한다.
+        self._on_scan_condition_changed()
 
     def _guard_last_table_type(self):
         """마지막 하나 남은 항목은 아예 끌 수 없게 한다.
@@ -1182,35 +1083,73 @@ class MigrationWizardDialog(QDialog):
             QMessageBox.warning(self, "날짜 오류", "시작 날짜가 종료 날짜보다 늦습니다.")
             return
 
-        if self.discovery_worker and self.discovery_worker.isRunning():
+        if self._closing or self._is_scan_inflight("discover"):
             return
 
+        gen = self._bump_generation()
+
         self.discover_status.setText("파티션 탐색 중...")
-        self.discover_btn.setEnabled(False)
-        self.check_completed_btn.setEnabled(False)
         self.partition_list.clear()
         self.discovered_partitions = []
         self._target_has_data = {}
         self._load_last_completed_partitions_cache()
 
-        self.discovery_worker = PartitionDiscoveryWorker(
-            self.profile.source_config,
+        worker = PartitionScanWorker(
+            gen,
+            self.profile.source_kind,
+            dict(self.profile.source_config or {}),
             start_date,
             end_date,
-            self.selected_table_types,
+            list(self.selected_table_types),
         )
-        self.discovery_worker.result.connect(self._on_discovery_result)
-        self.discovery_worker.error.connect(self._on_discovery_error)
-        self.discovery_worker.finished.connect(lambda: self.discover_btn.setEnabled(True))
-        self.discovery_worker.start()
+        # 람다로 연결하지 않는다. 수신자 QObject가 없어 자동 해제되지 않는다.
+        worker.result.connect(self._on_discovery_result)
+        worker.failed.connect(self._on_discovery_error)
+        worker.progress.connect(self._on_discovery_progress)
+        worker.finished.connect(self._on_discovery_finished)
 
-    def _on_discovery_error(self, msg: str):
-        self.discover_status.setText("파티션 탐색 오류")
+        self._scan_workers["discover"] = worker
+        self._mark_scan_started("discover")
+        self._sync_scan_buttons()
+        worker.start()
+
+    def _on_discovery_progress(self, gen: int, done: int, total: int):
+        if not self._is_current_generation(gen):
+            return
+        self.discover_status.setText(f"파티션 탐색 중... ({done}/{total})")
+
+    def _on_discovery_error(self, gen: int, msg: str):
+        if not self._is_current_generation(gen):
+            return
+        # 실패했는데 이전 목록이 남아 있으면 그걸 실행 대상으로 착각한다.
+        self.discovered_partitions = []
+        self._target_has_data = {}
+        self._render_partition_list()
+        self.discover_status.setText("파티션 탐색 실패 — 다시 시도하세요")
         self.add_log(f"파티션 탐색 오류: {msg}", "ERROR")
         self._update_counts()
         self._update_nav_state()
 
-    def _on_discovery_result(self, partitions: list):
+    def _on_discovery_finished(self):
+        """성공·실패·취소 공통 정리.
+
+        결과 슬롯이 아니라 여기서 버튼을 되돌린다. 예전에는 실패 시
+        '완료여부 확인'이 영구 비활성으로 남았다.
+        """
+        self._mark_scan_finished("discover")
+        self._sync_scan_buttons()
+
+        worker = self.sender()
+        gen = getattr(worker, "generation", self._scan_gen)
+        if self._is_current_generation(gen) and "탐색 중" in self.discover_status.text():
+            self.discover_status.setText("파티션 탐색이 중단되었습니다")
+
+        self._update_nav_state()
+
+    def _on_discovery_result(self, gen: int, payload: object):
+        if not self._is_current_generation(gen):
+            return
+        partitions = cast(list, payload)
         summaries: list[PartitionSummary] = []
         for p in partitions or []:
             if not isinstance(p, dict):
@@ -1225,6 +1164,7 @@ class MigrationWizardDialog(QDialog):
                         table_name=name,
                         row_count=int(p.get("row_count") or 0),
                         table_type=tt,
+                        row_count_estimated=bool(p.get("row_count_estimated")),
                     )
                 )
             except Exception:
@@ -1236,13 +1176,13 @@ class MigrationWizardDialog(QDialog):
         if summaries:
             self.discover_status.setText(f"완료: {len(summaries)}개 파티션")
             self.add_log(f"파티션 {len(summaries)}개 발견", "INFO")
-            self.check_completed_btn.setEnabled(True)
         else:
             self.discover_status.setText("조건에 해당하는 파티션이 없습니다")
             self.add_log("선택한 조건에 해당하는 파티션이 없습니다", "WARNING")
-            self.check_completed_btn.setEnabled(False)
 
         self._update_counts()
+        # 버튼은 _sync_scan_buttons가 정한다(직접 켜면 순서에 따라 어긋난다).
+        self._sync_scan_buttons()
         self._update_nav_state()
 
     def _is_completed_like(self, table_name: str) -> bool:
@@ -1272,7 +1212,8 @@ class MigrationWizardDialog(QDialog):
             completed_like = self._is_completed_like(s.table_name)
             # 상태는 색이 아니라 맨 앞의 모양으로 먼저 읽힌다.
             marker = "✓" if completed_like else "●"
-            text = f"{marker}  {s.table_name}  ·  {s.row_count:,} rows  ·  {type_name}"
+            rows_text = format_row_count(s.row_count, s.row_count_estimated)
+            text = f"{marker}  {s.table_name}  ·  {rows_text}  ·  {type_name}"
 
             item = QListWidgetItem(text)
             item.setData(Qt.ItemDataRole.UserRole, s.table_name)
@@ -1290,7 +1231,7 @@ class MigrationWizardDialog(QDialog):
                 item.setForeground(muted)
                 item.setToolTip(f"{' · '.join(reasons)}\n다시 실행하려면 체크하세요.")
             else:
-                item.setToolTip(f"{s.table_name} · {s.row_count:,} rows")
+                item.setToolTip(f"{s.table_name} · {rows_text}")
 
             self.partition_list.addItem(item)
 
@@ -1368,9 +1309,7 @@ class MigrationWizardDialog(QDialog):
                 if hidden:
                     hidden_selected += 1
 
-        selected_rows = sum(
-            s.row_count for s in self.discovered_partitions if s.table_name in selected_names
-        )
+        selected_rows, rows_estimated = self._row_total(selected_names)
 
         if visible != min(total, PARTITION_DISPLAY_LIMIT):
             self.partition_count_label.setText(f"표시 {visible}개 / 총 {total}개")
@@ -1388,37 +1327,55 @@ class MigrationWizardDialog(QDialog):
             else ""
         )
         # 총합보다 '지금 실행하면 옮겨질 양'이 결정에 필요한 숫자다.
-        self.partition_rows_label.setText(f"선택 {selected_rows:,} rows")
+        self.partition_rows_label.setText(f"선택 {format_row_count(selected_rows, rows_estimated)}")
 
     def check_target_completed(self):
         if not self.discovered_partitions:
             return
 
-        if self.completed_check_worker and self.completed_check_worker.isRunning():
+        if self._closing or self._is_scan_inflight("target"):
             return
 
         names = [s.table_name for s in self.discovered_partitions]
-        self.check_completed_btn.setEnabled(False)
+        gen = self._scan_gen
         self.discover_status.setText("대상 DB 확인 중...")
 
-        self.completed_check_worker = TargetCompletedCheckWorker(self.profile.target_config, names)
-        self.completed_check_worker.progress.connect(self._on_target_check_progress)
-        self.completed_check_worker.result.connect(self._on_target_check_result)
-        self.completed_check_worker.error.connect(self._on_target_check_error)
-        self.completed_check_worker.finished.connect(
-            lambda: self.check_completed_btn.setEnabled(True)
+        worker = TargetCompletedScanWorker(
+            gen,
+            self.profile.target_kind,
+            dict(self.profile.target_config or {}),
+            names,
         )
-        self.completed_check_worker.start()
+        worker.progress.connect(self._on_target_check_progress)
+        worker.result.connect(self._on_target_check_result)
+        worker.failed.connect(self._on_target_check_error)
+        worker.finished.connect(self._on_target_check_finished)
 
-    def _on_target_check_progress(self, done: int, total: int):
+        self._scan_workers["target"] = worker
+        self._mark_scan_started("target")
+        self._sync_scan_buttons()
+        worker.start()
+
+    def _on_target_check_progress(self, gen: int, done: int, total: int):
+        if not self._is_current_generation(gen):
+            return
         self.discover_status.setText(f"대상 DB 확인 중... ({done}/{total})")
 
-    def _on_target_check_error(self, msg: str):
+    def _on_target_check_error(self, gen: int, msg: str):
+        if not self._is_current_generation(gen):
+            return
+        # 확인에 실패하면 완료 표시를 믿을 수 없다. 비워서 '전부 미확인'으로 둔다.
+        self._target_has_data = {}
+        self._render_partition_list()
+        self._update_counts()
         self.add_log(f"대상 DB 완료여부 확인 오류: {msg}", "ERROR")
-        self.discover_status.setText("대상 DB 확인 오류")
+        self.discover_status.setText("대상 DB 확인 실패 — 다시 시도하세요")
         self._update_nav_state()
 
-    def _on_target_check_result(self, result: dict):
+    def _on_target_check_result(self, gen: int, payload: object):
+        if not self._is_current_generation(gen):
+            return
+        result = cast(dict, payload)
         self._target_has_data = {str(k): bool(v) for k, v in (result or {}).items()}
         self.add_log("대상 DB 완료여부 확인 완료", "INFO")
         self.discover_status.setText("대상 DB 확인 완료")
@@ -1426,13 +1383,32 @@ class MigrationWizardDialog(QDialog):
         self._update_counts()
         self._update_nav_state()
 
+    def _on_target_check_finished(self):
+        """성공·실패·취소 공통 정리."""
+        self._mark_scan_finished("target")
+        self._sync_scan_buttons()
+
+        worker = self.sender()
+        gen = getattr(worker, "generation", self._scan_gen)
+        if self._is_current_generation(gen) and "확인 중" in self.discover_status.text():
+            self.discover_status.setText("대상 DB 확인이 중단되었습니다")
+
+        self._update_nav_state()
+
     # ============================
     # Step 3: run
     # ============================
 
-    def _selected_row_total(self, names) -> int:
+    def _row_total(self, names) -> tuple[int, bool]:
+        """선택분의 행 수 합계와, 그 합계가 추정치를 포함하는지 돌려준다.
+
+        하나라도 추정치가 섞이면 합계도 추정치다. 정확한 값처럼 보이면
+        사용자가 그 숫자로 용량이나 시간을 계산한다.
+        """
         wanted = set(names)
-        return sum(s.row_count for s in self.discovered_partitions if s.table_name in wanted)
+        picked = [s for s in self.discovered_partitions if s.table_name in wanted]
+        total = sum(s.row_count for s in picked)
+        return total, any(s.row_count_estimated for s in picked)
 
     def _refresh_summary(self):
         error_text = "중단" if self.error_strategy == "stop" else "건너뛰기"
@@ -1458,7 +1434,7 @@ class MigrationWizardDialog(QDialog):
             "방식        COPY (고성능)",
             f"날짜        {start_date} ~ {end_date}",
             f"항목        {types_text}",
-            f"파티션      {len(parts):,}개 · {self._selected_row_total(parts):,} rows",
+            f"파티션      {len(parts):,}개 · {format_row_count(*self._row_total(parts))}",
             f"에러 처리   {error_text} · 배치 {int(self.batch_size_spin.value()):,} rows",
         ]
         self.summary_label.setText("\n".join(lines))
@@ -1586,12 +1562,24 @@ class MigrationWizardDialog(QDialog):
 
         if self.run_state == "running":
             self.worker.pause()
-            self._set_run_state("paused", self.run_detail_label.text())
+            self._set_run_state("paused", self._pause_detail())
             self.add_log("일시정지 요청", "INFO")
         else:
             self.worker.resume()
             self._set_run_state("running", self.run_detail_label.text())
             self.add_log("재개 요청", "INFO")
+
+    def _pause_detail(self) -> str:
+        """일시정지가 언제 실제로 걸리는지 말한다.
+
+        Python COPY는 배치 사이에서 바로 멈춘다. server-side COPY는 파티션
+        하나가 단일 명령이라 그 파티션이 끝나야 멈춘다. 그냥 '일시정지'라고만
+        쓰면 사용자는 이미 멈춘 줄 알고 창을 닫거나 DB를 만진다.
+        """
+        mode = getattr(self.worker, "copy_mode", self.copy_mode)
+        if mode == "python":
+            return "일시정지"
+        return "일시정지 요청됨 · 진행 중인 파티션이 끝나면 멈춥니다"
 
     def cancel_migration(self):
         """진행 중인 작업만 멈춘다. 창을 닫는 일은 '닫기'가 한다."""
@@ -1642,28 +1630,44 @@ class MigrationWizardDialog(QDialog):
 
         self.verify_btn.setEnabled(False)
 
-        self._verify_worker = RowCountVerificationWorker(
-            self.profile.source_config,
-            self.profile.target_config,
+        if self._is_scan_inflight("verify"):
+            return
+
+        worker = RowCountVerifyWorker(
+            self._scan_gen,
+            dict(self.profile.source_config or {}),
+            dict(self.profile.target_config or {}),
             list(table_names),
         )
-        self._verify_worker.progress.connect(self._on_verify_progress)
-        self._verify_worker.result.connect(self._on_verify_result)
-        self._verify_worker.error.connect(self._on_verify_error)
-        # 버튼 활성화는 상태 머신이 정한다(실행 중에 검증 버튼이 살아나지 않도록).
-        self._verify_worker.finished.connect(
-            lambda: self._set_run_state(self.run_state, self.run_detail_label.text())
-        )
-        self._verify_worker.start()
+        worker.progress.connect(self._on_verify_progress)
+        worker.result.connect(self._on_verify_result)
+        worker.failed.connect(self._on_verify_error)
+        worker.finished.connect(self._on_verify_finished)
 
-    def _on_verify_progress(self, done: int, total: int, table: str):
-        self.add_log(f"검증 진행: {done}/{total} - {table}", "INFO")
+        self._scan_workers["verify"] = worker
+        self._mark_scan_started("verify")
+        worker.start()
 
-    def _on_verify_error(self, msg: str):
+    def _on_verify_progress(self, gen: int, done: int, total: int):
+        if not self._is_current_generation(gen):
+            return
+        self.add_log(f"검증 진행: {done}/{total}", "INFO")
+
+    def _on_verify_error(self, gen: int, msg: str):
+        if not self._is_current_generation(gen):
+            return
         self.add_log(f"검증 오류: {msg}", "ERROR")
         QMessageBox.critical(self, "검증 오류", msg)
 
-    def _on_verify_result(self, results: list):
+    def _on_verify_finished(self):
+        """성공·실패·취소 공통 정리. 버튼 활성화는 상태 머신이 정한다."""
+        self._mark_scan_finished("verify")
+        self._set_run_state(self.run_state, self.run_detail_label.text())
+
+    def _on_verify_result(self, gen: int, payload: object):
+        if not self._is_current_generation(gen):
+            return
+        results = cast(list, payload)
         mismatches = [r for r in (results or []) if not r.get("ok")]
 
         # mismatch는 해당 파티션만 failed로 마킹하고 history는 completed 유지
@@ -1888,10 +1892,19 @@ class MigrationWizardDialog(QDialog):
         # Esc 키는 closeEvent를 거치지 않을 수 있으므로 여기서도 막는다.
         if self._block_close_while_running():
             return
+        if not self._prepare_close():
+            QTimer.singleShot(self.SCAN_SHUTDOWN_STEP_MS, self.reject)
+            return
         super().reject()
 
     def closeEvent(self, event):
         if self._block_close_while_running():
             event.ignore()
+            return
+        # 조회 워커는 닫기를 막지 않지만, 정리하지 않고 닫으면 실행 중인
+        # QThread가 파괴돼 프로세스가 죽는다(main_window가 deleteLater를 건다).
+        if not self._prepare_close():
+            event.ignore()
+            QTimer.singleShot(self.SCAN_SHUTDOWN_STEP_MS, self.close)
             return
         event.accept()

@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from typing import cast
 
-from PySide6.QtCore import Qt, QThread, QTimer
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QColor, QTextCursor
 from PySide6.QtWidgets import (
     QButtonGroup,
@@ -45,7 +45,13 @@ from src.core.scan_workers import (
 from src.core.table_types import TABLE_TYPE_CONFIG, TableType, get_all_table_types
 from src.models.history import CheckpointManager, HistoryManager, MigrationHistoryItem
 from src.models.profile import ENDPOINT_KIND_POSTGRES, ConnectionProfile
-from src.ui.theme import LOG_MAX_BLOCKS, TEXT_MUTED, log_color
+from src.ui.dialogs.scan_host import (
+    PARTITION_DISPLAY_LIMIT,
+    ScanHostMixin,
+    build_log_retention_hint,
+    format_row_count,
+)
+from src.ui.theme import LOG_MAX_BLOCKS, TEXT_DANGER, TEXT_MUTED, log_color
 from src.ui.widgets import MetricReadout, StatusLamp, StepRail
 from src.utils.enhanced_logger import log_emitter
 
@@ -55,6 +61,9 @@ class PartitionSummary:
     table_name: str
     row_count: int
     table_type: TableType
+    # 내보내기(DB→파일)의 소스는 PostgreSQL이라 행 수가 추정치다.
+    # 가져오기(파일→DB)의 소스는 매니페스트라 내보낼 때 실제로 센 값이다.
+    row_count_estimated: bool = False
 
 
 def to_qdate(py_date):
@@ -63,37 +72,17 @@ def to_qdate(py_date):
     return QDate(py_date.year, py_date.month, py_date.day)
 
 
-# 끝내 멈추지 않은 조회 워커를 붙들어 두는 곳.
-#
-# 실행 중인 QThread의 마지막 파이썬 참조가 사라지면 프로세스가 즉사한다.
-# 창을 닫을 때 워커가 아직 살아 있으면 여기로 옮겨서, 창이 사라져도
-# 스레드가 제 발로 끝날 때까지 참조를 유지한다.
-_ORPHANED_SCAN_WORKERS: set[QThread] = set()
-
-
-def _park_orphan_worker(worker: QThread) -> None:
-    """멈추지 않는 워커를 전역에 맡기고 스스로 정리되게 한다."""
-    _ORPHANED_SCAN_WORKERS.add(worker)
-    worker.finished.connect(lambda: _ORPHANED_SCAN_WORKERS.discard(worker))
-
-
-class FileArchiveMigrationDialog(QDialog):
+class FileArchiveMigrationDialog(ScanHostMixin, QDialog):
     # 실행 상태 → (램프, 표시 문구). 마이그레이션 마법사와 같은 언어를 쓴다.
+    # 'paused'는 없다 — 아카이브 워커가 일시정지를 지원하지 않는다.
     RUN_STATES = {
         "idle": ("idle", "대기 중"),
         "running": ("ok", "실행 중"),
-        "paused": ("busy", "일시정지"),
         "done": ("ok", "완료"),
         "partial": ("busy", "일부 실패"),
         "stopped": ("busy", "중단됨"),
         "failed": ("error", "오류"),
     }
-
-    # 창을 닫을 때 조회 워커를 기다리는 방식.
-    # 한 번에 오래 붙잡으면 창이 굳어 보이므로 짧게 여러 번 시도하고,
-    # 총 대기(약 2초)를 넘기면 워커를 떼어내고 창을 닫는다.
-    SCAN_SHUTDOWN_STEP_MS = 200
-    SCAN_SHUTDOWN_MAX_ATTEMPTS = 10
 
     def __init__(self, parent, profile: ConnectionProfile):
         super().__init__(parent)
@@ -127,14 +116,8 @@ class FileArchiveMigrationDialog(QDialog):
         # _selection_verified: 지금 목록에 대해 '대상 완료 여부 확인'이 끝났는가.
         #   이게 False면 '다음'을 막는다. 확인 전에는 모든 파티션이 체크된 상태로
         #   보이는데, 그대로 실행하면 이미 완료된 파티션까지 TRUNCATE 후 재적재된다.
-        self._scan_gen: int = 0
-        self._scan_workers: dict[str, QThread] = {}
-        self._inflight: set[str] = set()
+        self._init_scan_host()
         self._selection_verified: bool = False
-        self._close_attempts: int = 0
-        # 창이 닫히는 중인가. 예약된 작업(QTimer.singleShot)이 닫힌 뒤에
-        # 뒤늦게 발화해 워커를 띄우는 것을 막는다.
-        self._closing: bool = False
 
         self.setWindowTitle(self._build_title())
         self.resize(980, 760)
@@ -332,6 +315,7 @@ class FileArchiveMigrationDialog(QDialog):
         self.log_text.setPlaceholderText("작업을 시작하면 실행 로그가 여기에 표시됩니다.")
         self.log_text.document().setMaximumBlockCount(LOG_MAX_BLOCKS)
         lg.addWidget(self.log_text)
+        lg.addWidget(build_log_retention_hint(LOG_MAX_BLOCKS))
         layout.addWidget(log_group, 1)
 
         controls = QHBoxLayout()
@@ -339,20 +323,17 @@ class FileArchiveMigrationDialog(QDialog):
         self.start_btn.setObjectName("startButton")
         self.start_btn.setToolTip("선택한 범위와 파티션으로 마이그레이션을 시작합니다.")
         self.start_btn.clicked.connect(self.start_migration)
-        # 파일 아카이브 워커는 일시정지를 지원하지 않는다.
-        self.pause_btn = QPushButton("일시정지")
-        self.pause_btn.clicked.connect(self.pause_migration)
-        self.pause_btn.setEnabled(False)
-        self.pause_btn.setVisible(False)
+        # 일시정지 버튼은 없다. 아카이브 워커는 `_check_pause()`를 부르지 않아
+        # `pause()`를 호출해도 계속 돈다. 눌러도 안 멈추는 버튼을 두느니
+        # 없는 게 낫다 — 취소는 실제로 동작한다.
         self.cancel_btn = QPushButton("작업 취소")
         self.cancel_btn.setObjectName("dangerAction")
         self.cancel_btn.setToolTip("진행 중인 작업을 멈춥니다. 완료된 파티션은 그대로 남습니다.")
         self.cancel_btn.setEnabled(False)
         self.cancel_btn.clicked.connect(self.cancel_migration)
-        for btn in (self.start_btn, self.pause_btn, self.cancel_btn):
+        for btn in (self.start_btn, self.cancel_btn):
             btn.setAutoDefault(False)
         controls.addWidget(self.start_btn)
-        controls.addWidget(self.pause_btn)
         controls.addStretch(1)
         controls.addWidget(self.cancel_btn)
         layout.addLayout(controls)
@@ -365,7 +346,7 @@ class FileArchiveMigrationDialog(QDialog):
         self.run_lamp.set_state(lamp, text)
         self.run_detail_label.setText(detail)
 
-        running = state in ("running", "paused")
+        running = state == "running"
         start_labels = {
             "stopped": "이어서 시작",
             "partial": "실패분 다시 실행",
@@ -827,6 +808,7 @@ class FileArchiveMigrationDialog(QDialog):
                 table_name=item["table_name"],
                 row_count=int(item.get("row_count") or 0),
                 table_type=item["table_type"],
+                row_count_estimated=bool(item.get("row_count_estimated")),
             )
             for item in cast(list, payload)
         ]
@@ -882,14 +864,14 @@ class FileArchiveMigrationDialog(QDialog):
         self._apply_partition_filter(self.partition_filter.text())
 
     def _fill_partition_items(self, muted: QColor):
-        for summary in self.discovered_partitions:
+        for summary in self.discovered_partitions[:PARTITION_DISPLAY_LIMIT]:
             cfg = TABLE_TYPE_CONFIG[summary.table_type]
             completed_like = bool(self._target_has_data.get(summary.table_name))
             # 상태는 색이 아니라 맨 앞의 모양으로 먼저 읽힌다.
             marker = "✓" if completed_like else "●"
+            rows_text = format_row_count(summary.row_count, summary.row_count_estimated)
             item = QListWidgetItem(
-                f"{marker}  {summary.table_name}  ·  {summary.row_count:,} rows  ·  "
-                f"{cfg.display_name}"
+                f"{marker}  {summary.table_name}  ·  {rows_text}  ·  {cfg.display_name}"
             )
             item.setData(Qt.ItemDataRole.UserRole, summary.table_name)
             item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
@@ -898,8 +880,19 @@ class FileArchiveMigrationDialog(QDialog):
                 item.setForeground(muted)
                 item.setToolTip("대상에 이미 데이터가 있습니다. 다시 실행하려면 체크하세요.")
             else:
-                item.setToolTip(f"{summary.table_name} · {summary.row_count:,} rows")
+                item.setToolTip(f"{summary.table_name} · {rows_text}")
             self.partition_list.addItem(item)
+
+        # 잘린 파티션은 체크할 수 없어 실행 대상에서도 빠진다. 조용히 넘어가지 않는다.
+        hidden = len(self.discovered_partitions) - PARTITION_DISPLAY_LIMIT
+        if hidden > 0:
+            overflow = QListWidgetItem(
+                f"⚠ {hidden:,}개는 목록에 표시되지 않아 이번 실행에서 제외됩니다. "
+                "날짜 범위를 좁혀서 나눠 실행하세요."
+            )
+            overflow.setForeground(QColor(TEXT_DANGER))
+            overflow.setFlags(Qt.ItemFlag.NoItemFlags)
+            self.partition_list.addItem(overflow)
 
     def _apply_partition_filter(self, text: str):
         """이름으로 목록을 거른다. 선택 상태는 건드리지 않는다."""
@@ -964,13 +957,9 @@ class FileArchiveMigrationDialog(QDialog):
                 if hidden:
                     hidden_selected += 1
 
-        selected_rows = sum(
-            part.row_count
-            for part in self.discovered_partitions
-            if part.table_name in selected_names
-        )
+        selected_rows, rows_estimated = self._row_total(selected_names)
 
-        if visible != total:
+        if visible != min(total, PARTITION_DISPLAY_LIMIT):
             self.partition_count_label.setText(f"표시 {visible}개 / 총 {total}개")
         else:
             self.partition_count_label.setText(f"총 {total}개")
@@ -986,7 +975,7 @@ class FileArchiveMigrationDialog(QDialog):
             else ""
         )
         # 총합보다 '지금 실행하면 옮겨질 양'이 결정에 필요한 숫자다.
-        self.partition_rows_label.setText(f"선택 {selected_rows:,} rows")
+        self.partition_rows_label.setText(f"선택 {format_row_count(selected_rows, rows_estimated)}")
 
     def check_target_completed(self):
         names = [part.table_name for part in self.discovered_partitions]
@@ -1127,21 +1116,16 @@ class FileArchiveMigrationDialog(QDialog):
     # 조회(scan) 작업 골격
     # ============================
 
-    def _bump_generation(self) -> int:
-        """조회 조건이 바뀌었음을 알린다.
-
-        늦게 도착하는 이전 세대의 결과는 버려지고, 지금 목록은 더 이상
-        '확인된' 목록이 아니게 된다.
-
-        돌고 있는 조회는 결과가 어차피 버려지므로 멈추라고 알린다.
-        (아카이브 체크섬 확인은 수 분씩 걸린다 — 날짜만 바꿔도 쓸모없어진
-         작업이 계속 도는 것을 막는다)
-        """
-        self._scan_gen += 1
+    def _on_scan_generation_changed(self) -> None:
+        """조건이 바뀌면 지금 목록은 더 이상 '확인된' 목록이 아니다."""
         self._selection_verified = False
-        self._interrupt_active_scans()
         self._update_nav_state()
-        return self._scan_gen
+
+    def _set_scan_status(self, text: str) -> None:
+        self.discover_status.setText(text)
+
+    def _on_scans_abandoned(self) -> None:
+        self.add_log("조회 작업이 멈추지 않아 분리하고 창을 닫습니다", "WARNING")
 
     def _sync_scan_buttons(self) -> None:
         """조회 버튼 활성화를 한 곳에서 정한다.
@@ -1155,97 +1139,8 @@ class FileArchiveMigrationDialog(QDialog):
         # '완료여부 확인'은 찾은 파티션이 있을 때만 의미가 있다.
         self.check_completed_btn.setEnabled(not busy and bool(self.discovered_partitions))
 
-    def _interrupt_active_scans(self) -> None:
-        """돌고 있는 조회에 중단을 요청한다(기다리지는 않는다)."""
-        for worker in self._scan_workers.values():
-            if worker is None or not worker.isRunning():
-                continue
-            worker.requestInterruption()
-            cancel = getattr(worker, "cancel_query", None)
-            if callable(cancel):
-                try:
-                    cancel()
-                except Exception:
-                    pass
-
-    def _is_current_generation(self, gen: int) -> bool:
-        return gen == self._scan_gen
-
-    def _has_active_scan(self) -> bool:
-        """탐색/확인 작업이 돌고 있는가.
-
-        마이그레이션 실행(`_is_running`)과 구분한다. 실행은 닫기를 막지만,
-        조회는 파괴적이지 않으므로 닫기를 허용하고 대신 정리한다.
-        """
-        return any(w is not None and w.isRunning() for w in self._scan_workers.values())
-
-    def _mark_scan_started(self, kind: str) -> None:
-        self._inflight.add(kind)
-
-    def _mark_scan_finished(self, kind: str) -> None:
-        self._inflight.discard(kind)
-
-    def _is_scan_inflight(self, kind: str) -> bool:
-        """해당 종류의 조회가 진행 중인가.
-
-        `isRunning()`만으로는 run()이 끝나고 결과 슬롯이 아직 안 돈 구간을
-        놓친다. 그 틈에 두 번째 요청이 들어가면 워커가 둘이 된다.
-        """
-        if kind in self._inflight:
-            return True
-        worker = self._scan_workers.get(kind)
-        return bool(worker is not None and worker.isRunning())
-
-    def _shutdown_scans(self, timeout_ms: int = 3000) -> bool:
-        """진행 중인 조회 워커를 정리한다.
-
-        `terminate()`는 쓰지 않는다. psycopg 커넥션과 아카이브 파일 락이
-        정리되지 않은 채 남아 이후 저장이 실패한다.
-
-        Returns:
-            제한 시간 안에 전부 멈췄으면 True.
-        """
-        workers = [w for w in self._scan_workers.values() if w is not None and w.isRunning()]
-        for worker in workers:
-            worker.requestInterruption()
-            cancel = getattr(worker, "cancel_query", None)
-            if callable(cancel):
-                try:
-                    cancel()
-                except Exception:
-                    pass
-
-        all_stopped = True
-        for worker in workers:
-            if not worker.wait(timeout_ms):
-                all_stopped = False
-
-        if all_stopped:
-            self._inflight.clear()
-        return all_stopped
-
-    def _abandon_scans(self) -> None:
-        """멈추지 않는 워커를 떼어내고 창을 놓아준다.
-
-        마지막 수단이다. 워커 시그널을 끊어 사라질 위젯을 건드리지 못하게 하고,
-        스레드 객체는 전역에 맡겨 참조가 살아 있게 한다(참조가 끊기면 프로세스가 죽는다).
-        """
-        for worker in self._scan_workers.values():
-            if worker is None:
-                continue
-            try:
-                # 인자 없는 disconnect()는 이 객체의 모든 연결을 끊는 Qt의 유효한
-                # 사용법이지만 PySide6 스텁에 해당 오버로드가 없다.
-                worker.disconnect()  # type: ignore[call-overload]
-            except (RuntimeError, TypeError):
-                pass
-            if worker.isRunning():
-                _park_orphan_worker(worker)
-        self._scan_workers.clear()
-        self._inflight.clear()
-
     def _is_running(self) -> bool:
-        if self.run_state in ("running", "paused"):
+        if self.run_state == "running":
             return True
         return bool(self.worker and getattr(self.worker, "is_running", False))
 
@@ -1290,11 +1185,16 @@ class FileArchiveMigrationDialog(QDialog):
         """
         return self.resume_mode or self._selection_verified
 
-    def _selected_row_total(self, names) -> int:
+    def _row_total(self, names) -> tuple[int, bool]:
+        """선택분의 행 수 합계와, 그 합계가 추정치를 포함하는지 돌려준다.
+
+        하나라도 추정치가 섞이면 합계도 추정치다. 정확한 값처럼 보이면
+        사용자가 그 숫자로 용량이나 시간을 계산한다.
+        """
         wanted = set(names)
-        return sum(
-            part.row_count for part in self.discovered_partitions if part.table_name in wanted
-        )
+        picked = [part for part in self.discovered_partitions if part.table_name in wanted]
+        total = sum(part.row_count for part in picked)
+        return total, any(part.row_count_estimated for part in picked)
 
     def _refresh_summary(self):
         parts = self._frozen_selection or self.get_selected_partition_names()
@@ -1305,7 +1205,7 @@ class FileArchiveMigrationDialog(QDialog):
         lines = [
             f"프로필      {self.profile.name}",
             f"방향        {mode_text}",
-            f"파티션      {len(parts):,}개 · {self._selected_row_total(parts):,} rows",
+            f"파티션      {len(parts):,}개 · {format_row_count(*self._row_total(parts))}",
             f"에러 처리   {'중단' if self.error_strategy == 'stop' else '건너뛰기'}",
         ]
         if self.resume_mode:
@@ -1382,18 +1282,6 @@ class FileArchiveMigrationDialog(QDialog):
         self.add_log(f"마이그레이션 시작 - 파티션 {len(partitions)}개", "INFO")
         self.worker.start()
 
-    def pause_migration(self):
-        if not self.worker:
-            return
-        if self.run_state == "running":
-            self.worker.pause()
-            self._set_run_state("paused", self.run_detail_label.text())
-            self.add_log("일시정지 요청", "INFO")
-        else:
-            self.worker.resume()
-            self._set_run_state("running", self.run_detail_label.text())
-            self.add_log("재개 요청", "INFO")
-
     def cancel_migration(self):
         """진행 중인 작업만 멈춘다. 창을 닫는 일은 '닫기'가 한다."""
         if not self.worker or not self._is_running():
@@ -1416,7 +1304,7 @@ class FileArchiveMigrationDialog(QDialog):
             done = data.get("completed_partitions", 0)
             total = data.get("total_partitions", 0)
             self.total_label.setText(f"{done} / {total}")
-            if self.run_state in ("running", "paused"):
+            if self.run_state == "running":
                 self.run_detail_label.setText(f"파티션 {done} / {total} 완료")
         if "current_progress" in data:
             self.current_progress.setValue(int(data["current_progress"]))
@@ -1537,33 +1425,6 @@ class FileArchiveMigrationDialog(QDialog):
             "작업 진행 중에는 닫을 수 없습니다.\n먼저 '작업 취소'로 작업을 멈추세요.",
         )
         return True
-
-    def _prepare_close(self) -> bool:
-        """닫기 전에 조회 워커를 정리한다.
-
-        조회는 파괴적이지 않으므로 닫기를 막지 않는다. 다만 정리하지 않고 닫으면
-        워커가 사라진 위젯을 갱신하거나, 실행 중인 QThread가 파괴돼 프로세스가 죽는다.
-
-        Returns:
-            닫아도 되면 True. 잠시 더 기다려야 하면 False.
-        """
-        # 예약된 작업이 닫힌 뒤에 워커를 띄우지 못하게 먼저 표시한다.
-        self._closing = True
-
-        if self._shutdown_scans(self.SCAN_SHUTDOWN_STEP_MS):
-            self._close_attempts = 0
-            return True
-
-        self._close_attempts += 1
-        if self._close_attempts >= self.SCAN_SHUTDOWN_MAX_ATTEMPTS:
-            # 끝내 안 멈춘다. 창을 인질로 잡지 않는다 — 떼어내고 닫는다.
-            self.add_log("조회 작업이 멈추지 않아 분리하고 창을 닫습니다", "WARNING")
-            self._abandon_scans()
-            self._close_attempts = 0
-            return True
-
-        self.discover_status.setText("조회 작업 정리 중...")
-        return False
 
     def reject(self):
         # Esc 키는 closeEvent를 거치지 않을 수 있으므로 여기서도 막는다.
