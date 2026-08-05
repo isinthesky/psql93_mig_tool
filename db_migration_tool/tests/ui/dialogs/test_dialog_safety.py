@@ -15,6 +15,10 @@ import src.ui.dialogs.file_archive_migration_dialog as archive_mod
 from src.ui.theme import LOG_VIEWER_MAX_BLOCKS
 
 
+def mod_partition_summary(name, table_type):
+    return archive_mod.PartitionSummary(table_name=name, row_count=100, table_type=table_type)
+
+
 @pytest.fixture
 def log_viewer(qapp, tmp_path):
     from src.ui.dialogs.log_viewer_dialog import LogViewerDialog
@@ -349,29 +353,63 @@ def archive_dialog(qapp):
 
 
 class TestArchiveBusyGuard:
-    def test_navigation_is_locked_while_busy(self, archive_dialog):
-        """_busy는 이벤트 큐를 비운다. 그때 '다음'이 배달되면
-        대상 확인 전 상태로 실행 대상이 굳어 완료 파티션까지 다시 적재된다."""
+    """`_busy` 컨텍스트매니저가 지키던 불변식을 비동기 경로로 이관한 것.
+
+    옛 구현은 `processEvents()`로 큐를 비우면서 '다음'이 뒤늦게 배달돼
+    대상 확인 전 상태(전 파티션 체크)로 실행 대상이 굳는 문제를 막으려고
+    네비게이션을 잠갔다. 워커로 바뀐 뒤에는 `_selection_verified` 게이트가
+    같은 역할을 하고, 이벤트 루프를 막지 않으므로 닫기는 오히려 허용된다.
+    """
+
+    def test_next_is_locked_until_the_target_check_completes(self, archive_dialog):
+        from src.core.table_types import TableType
+
         archive_dialog.source_connected = True
         archive_dialog.target_connected = True
+        archive_dialog.pages.setCurrentIndex(1)
+        archive_dialog.discovered_partitions = [
+            mod_partition_summary("tbl_0", TableType.POINT_HISTORY)
+        ]
+        archive_dialog._render_partition_list()
+        archive_dialog._update_counts()
         archive_dialog._update_nav_state()
 
-        with archive_dialog._busy("확인 중", archive_dialog.discover_btn):
-            assert not archive_dialog.next_btn.isEnabled()
-            assert not archive_dialog.back_btn.isEnabled()
-            assert not archive_dialog.close_btn.isEnabled()
+        assert archive_dialog.get_selected_partition_names()
+        assert not archive_dialog.next_btn.isEnabled(), (
+            "확인 전 상태로 넘어가면 완료 파티션까지 다시 적재됩니다"
+        )
 
-    def test_navigation_returns_to_rule_after_busy(self, archive_dialog):
+    def test_scan_does_not_lock_the_close_button(self, archive_dialog):
+        """옛 구현은 이벤트 루프를 막아 닫기까지 잠갔다.
+
+        워커로 옮긴 뒤에는 조회 중에도 창을 닫을 수 있어야 한다.
+        """
+        worker = MagicMock()
+        worker.isRunning.return_value = True
+        archive_dialog._scan_workers["discover"] = worker
+        archive_dialog._update_nav_state()
+
+        assert archive_dialog.close_btn.isEnabled()
+        assert not archive_dialog._block_close_while_running()
+
+    def test_navigation_returns_to_rule_after_a_scan(self, archive_dialog):
         """작업이 끝나면 무조건 켜는 게 아니라 규칙대로 되돌아와야 한다."""
         archive_dialog.source_connected = False
         archive_dialog.target_connected = False
+        archive_dialog._mark_scan_started("discover")
 
-        with archive_dialog._busy("확인 중", archive_dialog.discover_btn):
-            pass
+        archive_dialog._on_discovery_finished()
 
         assert archive_dialog.close_btn.isEnabled()
         # 연결이 안 됐으므로 '다음'은 여전히 잠겨 있어야 한다
         assert not archive_dialog.next_btn.isEnabled()
+
+    def test_dialog_no_longer_pumps_the_event_loop(self):
+        """`processEvents()`가 큐에 밀린 클릭을 뒤늦게 배달하던 원인이었다."""
+        import src.ui.dialogs.file_archive_migration_dialog as mod
+
+        source = inspect.getsource(mod)
+        assert "processEvents" not in source
 
     def test_connection_check_failure_does_not_lock_the_dialog(self, archive_dialog):
         """연결 확인 실패가 창을 잠그면 안 된다.

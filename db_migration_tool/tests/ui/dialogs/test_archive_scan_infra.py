@@ -132,47 +132,40 @@ class TestVerificationSurvivesFailure:
 
     def test_failure_after_success_closes_the_gate(self, dialog):
         self._prepare(dialog)
+        gen = dialog._scan_gen
 
-        with patch.object(
-            archive_mod.FileArchiveMigrationDialog,
-            "_check_target_postgres_partitions",
-            return_value={"tbl_0": True, "tbl_1": False, "tbl_2": False},
-        ):
-            dialog.check_target_completed()
+        dialog._on_target_check_result(gen, {"tbl_0": True, "tbl_1": False, "tbl_2": False})
         assert dialog._selection_verified
 
-        with patch.object(
-            archive_mod.FileArchiveMigrationDialog,
-            "_check_target_postgres_partitions",
-            side_effect=RuntimeError("boom"),
-        ):
-            dialog.check_target_completed()
+        # 수동 재확인이 시작되면 게이트가 내려가고, 실패하면 그대로 닫혀 있어야 한다.
+        dialog.check_target_completed()
+        dialog._on_target_check_failed(dialog._scan_gen, "boom")
 
         assert not dialog._selection_verified, "재확인이 실패하면 게이트가 닫혀야 합니다"
         assert not dialog.next_btn.isEnabled()
+
+    def test_starting_a_check_immediately_closes_the_gate(self, dialog):
+        """확인이 끝나기 전에는 이전 결과를 믿으면 안 된다."""
+        self._prepare(dialog)
+        dialog._on_target_check_result(dialog._scan_gen, {"tbl_0": True})
+        assert dialog._selection_verified
+
+        dialog.check_target_completed()
+
+        assert not dialog._selection_verified
 
     def test_failure_does_not_keep_stale_completion_flags(self, dialog):
         """실패 후 남은 완료 플래그를 믿으면 안 된다."""
         self._prepare(dialog)
 
-        with patch.object(
-            archive_mod.FileArchiveMigrationDialog,
-            "_check_target_postgres_partitions",
-            side_effect=RuntimeError("boom"),
-        ):
-            dialog.check_target_completed()
+        dialog._on_target_check_failed(dialog._scan_gen, "boom")
 
         assert dialog._target_has_data == {}
 
     def test_failure_is_visible_to_the_user(self, dialog):
         self._prepare(dialog)
 
-        with patch.object(
-            archive_mod.FileArchiveMigrationDialog,
-            "_check_target_postgres_partitions",
-            side_effect=RuntimeError("boom"),
-        ):
-            dialog.check_target_completed()
+        dialog._on_target_check_failed(dialog._scan_gen, "boom")
 
         assert "실패" in dialog.discover_status.text(), "실패가 화면에 드러나야 합니다"
 

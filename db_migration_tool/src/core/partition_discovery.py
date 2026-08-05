@@ -2,13 +2,18 @@
 파티션 테이블 탐색 및 분석
 """
 
+from collections.abc import Callable
 from datetime import date, datetime
 from typing import Any
 
 import psycopg
 from psycopg import sql
 
+from .archive_manifest import ScanCancelled
 from .table_types import DEFAULT_TABLE_TYPE, TableType, infer_partition_range
+
+# 커넥션 수립 대기 상한(초).
+CONNECT_TIMEOUT_SECONDS = 10
 
 
 class PartitionDiscovery:
@@ -22,7 +27,14 @@ class PartitionDiscovery:
         self.connection_config = connection_config  # 하위 호환성을 위해 유지
 
     def discover_partitions(
-        self, start_date: date, end_date: date, table_types: list[TableType] | None = None
+        self,
+        start_date: date,
+        end_date: date,
+        table_types: list[TableType] | None = None,
+        *,
+        should_stop: Callable[[], bool] | None = None,
+        on_progress: Callable[[int, int], None] | None = None,
+        on_connection: Callable[[Any], None] | None = None,
     ) -> list[dict[str, Any]]:
         """
         날짜 범위에 해당하는 파티션 탐색
@@ -31,10 +43,25 @@ class PartitionDiscovery:
             start_date: 시작 날짜
             end_date: 종료 날짜
             table_types: 탐색할 테이블 타입 리스트 (기본값: [DEFAULT_TABLE_TYPE])
+            should_stop: 중간에 멈춰야 하는지 묻는 콜백. 파티션마다 COUNT(*)를
+                돌기 때문에 이 훅이 없으면 창을 닫아도 워커가 안 멈춘다.
+            on_progress: (done, total) 진행 상황 콜백. total은 아직 모르는
+                시점이 있어 0으로 올 수 있다.
+            on_connection: 커넥션이 열리면 넘겨준다. 파티션마다 도는
+                `COUNT(*)` 전수 스캔은 플래그로 못 멈추므로, 호출자가 이
+                커넥션에 `cancel()`을 걸 수 있어야 실제로 중단된다.
 
         Returns:
             파티션 정보 리스트
+
+        Raises:
+            ScanCancelled: should_stop이 True를 돌려준 경우
         """
+
+        def _check_cancelled() -> None:
+            if should_stop is not None and should_stop():
+                raise ScanCancelled("파티션 탐색이 취소되었습니다")
+
         partitions = []
 
         if table_types is None:
@@ -51,6 +78,8 @@ class PartitionDiscovery:
         conn = None
         try:
             conn = self._create_connection()
+            if on_connection is not None:
+                on_connection(conn)
 
             with conn.cursor() as cur:
                 # 1) partition_table_info 기반 조회 (기본)
@@ -77,7 +106,23 @@ class PartitionDiscovery:
 
                 cur.execute(query, params)
 
-                for row in cur.fetchall():
+                # 진행률은 두 루프에 걸쳐 한 번만 센다. 루프마다 1부터 다시 세면
+                # 화면의 숫자가 되돌아가 사용자가 멈춘 줄 안다.
+                scanned = 0
+                total_estimate = 0
+
+                def _report(step: int = 1) -> None:
+                    nonlocal scanned
+                    scanned += step
+                    if on_progress is not None:
+                        on_progress(scanned, total_estimate)
+
+                primary_rows = cur.fetchall()
+                total_estimate = len(primary_rows)
+                for row in primary_rows:
+                    _check_cancelled()
+                    _report()
+
                     table_name, table_data, from_date, to_date, use_flag = row
 
                     partition_start = self._timestamp_to_date(from_date)
@@ -122,7 +167,12 @@ class PartitionDiscovery:
                         (prefix,),
                     )
                     physical_names = [row[0] for row in cur.fetchall()]
+                    # 총계는 여기서 늘어난다(미리 알 수 없다). 진행 수치는 줄지 않는다.
+                    total_estimate += len(physical_names)
                     for table_name in physical_names:
+                        _check_cancelled()
+                        _report()
+
                         if table_name in seen_names:
                             continue
 
@@ -150,6 +200,9 @@ class PartitionDiscovery:
                         )
                         seen_names.add(table_name)
 
+        except ScanCancelled:
+            # 취소는 오류가 아니다. 여기서 재포장하면 UI가 '탐색 실패'로 알린다.
+            raise
         except Exception as e:
             raise Exception(f"파티션 탐색 오류: {str(e)}")
         finally:
@@ -257,6 +310,9 @@ class PartitionDiscovery:
             "dbname": config.get("database", ""),
             "user": config.get("username", ""),
             "password": config.get("password", ""),
+            # 상한이 없으면 방화벽이 패킷을 버릴 때 OS 타임아웃(수십 초)까지
+            # 붙잡혀 있고, 그동안 취소 요청조차 읽지 못한다.
+            "connect_timeout": CONNECT_TIMEOUT_SECONDS,
         }
 
         if config.get("ssl"):

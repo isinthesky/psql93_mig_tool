@@ -26,13 +26,22 @@ from __future__ import annotations
 
 import threading
 from dataclasses import dataclass
+from datetime import date
 from typing import Any
 
+import psycopg
+from psycopg import sql
 from PySide6.QtCore import QThread, Signal
 
+from src.core.archive_manifest import ArchiveManifestStore, ScanCancelled
+from src.core.partition_discovery import PartitionDiscovery
 from src.database.postgres_utils import PostgresOptimizer
 from src.models.profile import ENDPOINT_KIND_POSTGRES
 from src.utils.validators import ConnectionValidator
+
+# 커넥션 수립 대기 상한. 이게 없으면 방화벽이 패킷을 버릴 때
+# OS 타임아웃(수십 초)까지 취소 플래그조차 읽지 못한다.
+CONNECT_TIMEOUT_SECONDS = 10
 
 
 class ScanWorker(QThread):
@@ -83,6 +92,10 @@ class ScanWorker(QThread):
     def run(self) -> None:
         try:
             payload = self.execute()
+        except ScanCancelled:
+            # 취소는 실패가 아니다. 아무 신호도 보내지 않는다.
+            # (정리는 QThread.finished가 맡는다)
+            return
         except Exception as e:  # noqa: BLE001 - 어떤 예외든 UI로 전달해야 한다
             if not self.should_stop():
                 self.failed.emit(self.generation, str(e))
@@ -148,3 +161,171 @@ class ConnectionCheckWorker(ScanWorker):
         if ok:
             msg = "경로 확인 완료" if spec.must_exist else "출력 경로 사용 가능"
         return EndpointCheckResult(bool(ok), str(msg))
+
+
+class TargetCompletedScanWorker(ScanWorker):
+    """대상에 이미 들어 있는 파티션을 찾는다.
+
+    payload는 `{파티션명: 이미_있음}`.
+
+    이 결과가 틀리면 데이터가 상한다. 값을 못 믿을 상황에서는 결과를 내지 말고
+    실패로 알려야 한다 — 호출부가 '전부 미완료'로 읽으면 이미 옮긴 파티션까지
+    TRUNCATE 후 다시 적재한다.
+    """
+
+    def __init__(
+        self,
+        generation: int,
+        target_kind: str,
+        target_config: dict,
+        partition_names: list[str],
+    ):
+        super().__init__(generation)
+        self._target_kind = target_kind
+        self._target_config = dict(target_config)
+        self._names = list(partition_names)
+
+    def execute(self) -> dict[str, bool]:
+        if self._target_kind == ENDPOINT_KIND_POSTGRES:
+            return self._check_postgres()
+        return self._check_archive()
+
+    # ── File Archive ────────────────────────────────────────
+    def _check_archive(self) -> dict[str, bool]:
+        store = ArchiveManifestStore(self._target_config["archive_path"])
+        try:
+            return store.get_completed_status(
+                self._names,
+                should_stop=self.should_stop,
+                on_progress=self._emit_progress,
+            )
+        except FileNotFoundError:
+            # manifest가 아직 없다 = 아무것도 완료되지 않았다. 정상 상태다.
+            return dict.fromkeys(self._names, False)
+
+    # ── PostgreSQL ──────────────────────────────────────────
+    def _check_postgres(self) -> dict[str, bool]:
+        # 기본값은 ConnectionProfile이 정규화로 넣어 주지만, 워커는 임의의 dict를
+        # 받을 수 있으므로 여기서도 한 겹 더 둔다(키 누락 시 None이 넘어가면
+        # libpq 기본값으로 엉뚱한 DB에 붙을 수 있다).
+        conn_params: dict[str, Any] = {
+            "host": self._target_config.get("host", "localhost"),
+            "port": self._target_config.get("port", 5432),
+            "dbname": self._target_config.get("database", ""),
+            "user": self._target_config.get("username", ""),
+            "password": self._target_config.get("password", ""),
+            # 없으면 방화벽이 패킷을 버릴 때 OS 타임아웃까지 취소도 안 먹는다.
+            "connect_timeout": CONNECT_TIMEOUT_SECONDS,
+        }
+        if self._target_config.get("ssl"):
+            conn_params["sslmode"] = "require"
+
+        results = dict.fromkeys(self._names, False)
+        conn = psycopg.connect(**conn_params)
+        # 취소는 다른 스레드에서 conn.cancel()로 들어온다.
+        self._track_connection(conn)
+        try:
+            # 루프 전체가 한 트랜잭션으로 묶이면 대상 DB에 idle-in-transaction이
+            # 남는다. 읽기만 하므로 자동 커밋으로 둔다.
+            conn.autocommit = True
+            total = len(self._names)
+            with conn.cursor() as cur:
+                for index, name in enumerate(self._names, start=1):
+                    if self.should_stop():
+                        raise ScanCancelled("대상 확인이 취소되었습니다")
+
+                    cur.execute(
+                        """
+                        SELECT EXISTS (
+                            SELECT 1 FROM information_schema.tables
+                            WHERE table_schema = 'public' AND table_name = %s
+                        )
+                        """,
+                        (name,),
+                    )
+                    row = cur.fetchone()
+                    if not row or not row[0]:
+                        self._emit_progress(index, total)
+                        continue
+
+                    try:
+                        # '데이터가 있는가'만 알면 되므로 COUNT(*)로 전수를 세지 않는다.
+                        # 대용량 파티션에서 확인이 수 분씩 걸리던 원인.
+                        cur.execute(
+                            sql.SQL("SELECT 1 FROM {} LIMIT 1").format(sql.Identifier(name))
+                        )
+                        results[name] = cur.fetchone() is not None
+                    except Exception:
+                        # 권한 부족 등은 '없음'으로 본다(다시 적재하는 쪽이 안전).
+                        results[name] = False
+
+                    self._emit_progress(index, total)
+        finally:
+            self._release_connection()
+            try:
+                conn.close()
+            except Exception:
+                pass
+        return results
+
+    def _emit_progress(self, done: int, total: int) -> None:
+        self.progress.emit(self.generation, done, total)
+
+
+class PartitionScanWorker(ScanWorker):
+    """소스에서 날짜 범위에 해당하는 파티션을 찾는다.
+
+    payload는 `list[dict]` — `PartitionDiscovery`/`ArchiveManifestStore`가 주는
+    원본 항목 그대로다. UI 표현으로 바꾸는 일은 다이얼로그가 한다.
+
+    PostgreSQL 소스는 파티션마다 `COUNT(*)` 전수 스캔이 돌기 때문에 상한이 없다.
+    취소 훅이 이 워커에서 가장 중요한 이유다.
+    """
+
+    def __init__(
+        self,
+        generation: int,
+        source_kind: str,
+        source_config: dict,
+        start_date: date,
+        end_date: date,
+        table_types: list,
+    ):
+        super().__init__(generation)
+        self._source_kind = source_kind
+        self._source_config = dict(source_config)
+        self._start_date = start_date
+        self._end_date = end_date
+        self._table_types = list(table_types)
+
+    def execute(self) -> list:
+        if self._source_kind == ENDPOINT_KIND_POSTGRES:
+            return self._discover_postgres()
+        return self._discover_archive()
+
+    def _discover_postgres(self) -> list:
+        discovery = PartitionDiscovery(self._source_config)
+        return discovery.discover_partitions(
+            self._start_date,
+            self._end_date,
+            self._table_types,
+            should_stop=self.should_stop,
+            on_progress=self._emit_progress,
+            # COUNT(*) 전수 스캔은 플래그로 못 멈춘다. 커넥션을 받아 둬야
+            # cancel_query()가 실제로 쿼리를 끊을 수 있다.
+            on_connection=self._track_connection,
+        )
+
+    def _discover_archive(self) -> list:
+        store = ArchiveManifestStore(self._source_config["archive_path"])
+        partitions = store.filter_partitions(
+            start_date=self._start_date,
+            end_date=self._end_date,
+            table_types=self._table_types,
+        )
+        if self.should_stop():
+            raise ScanCancelled("파티션 탐색이 취소되었습니다")
+        return list(partitions)
+
+    def _emit_progress(self, done: int, total: int) -> None:
+        self.progress.emit(self.generation, done, total)

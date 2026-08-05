@@ -8,12 +8,21 @@ import os
 import re
 import sys
 import uuid
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, field, fields
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
 from src.core.table_types import TableType, infer_partition_range
+
+
+class ScanCancelled(Exception):
+    """조회가 사용자 요청으로 중단됐다.
+
+    실패가 아니라 취소다. UI가 이 둘을 구분해야 '오류'로 잘못 알리지 않는다.
+    """
+
 
 ARCHIVE_FORMAT_NAME = "psql93-migration-archive"
 ARCHIVE_FORMAT_VERSION = 2
@@ -299,7 +308,18 @@ class ArchiveManifestStore:
         self._validate_partition_name(partition_name)
         return self.partitions_dir / f".{partition_name}.csv.tmp"
 
-    def compute_file_metadata(self, file_path: str | Path) -> dict[str, Any]:
+    def compute_file_metadata(
+        self,
+        file_path: str | Path,
+        *,
+        should_stop: Callable[[], bool] | None = None,
+    ) -> dict[str, Any]:
+        """파일의 크기와 SHA-256을 구한다.
+
+        Args:
+            should_stop: 중간에 멈춰야 하는지 묻는 콜백. 수 GB 파일이면 이 루프가
+                수 분씩 돌기 때문에, 취소 훅이 없으면 창을 닫아도 워커가 안 멈춘다.
+        """
         path = Path(file_path)
         if not path.exists():
             raise FileNotFoundError(f"아카이브 데이터 파일이 없습니다: {path}")
@@ -308,6 +328,8 @@ class ArchiveManifestStore:
         size = 0
         with path.open("rb") as fp:
             while True:
+                if should_stop is not None and should_stop():
+                    raise ScanCancelled(f"체크섬 계산이 취소되었습니다: {path.name}")
                 chunk = fp.read(1024 * 1024)
                 if not chunk:
                     break
@@ -336,9 +358,14 @@ class ArchiveManifestStore:
                 f"expected={expected_checksum}, actual={metadata['checksum_sha256']}"
             )
 
-    def verify_partition_file(self, entry: ArchivePartitionEntry) -> dict[str, Any]:
+    def verify_partition_file(
+        self,
+        entry: ArchivePartitionEntry,
+        *,
+        should_stop: Callable[[], bool] | None = None,
+    ) -> dict[str, Any]:
         file_path = self.resolve_safe_path(entry.file_path)
-        metadata = self.compute_file_metadata(file_path)
+        metadata = self.compute_file_metadata(file_path, should_stop=should_stop)
         self._verify_entry_against_metadata(entry, metadata)
         return metadata
 
@@ -373,20 +400,48 @@ class ArchiveManifestStore:
         manifest = self.load()
         return [ArchivePartitionEntry.from_dict(item) for item in manifest.partitions]
 
-    def get_completed_status(self, partition_names: list[str]) -> dict[str, bool]:
+    def get_completed_status(
+        self,
+        partition_names: list[str],
+        *,
+        should_stop: Callable[[], bool] | None = None,
+        on_progress: Callable[[int, int], None] | None = None,
+    ) -> dict[str, bool]:
+        """파티션별로 아카이브에 온전히 들어 있는지 확인한다.
+
+        파일마다 체크섬을 다시 계산하므로 아카이브가 크면 오래 걸린다.
+        크기 비교로 대체하지 않는다 — '완료' 오탐은 사용자가 그 파티션을
+        건너뛰게 만들고, 손상된 데이터가 조용히 남는다.
+
+        Args:
+            should_stop: 중간에 멈춰야 하는지 묻는 콜백.
+            on_progress: (done, total) 진행 상황 콜백.
+        """
         manifest = self.load()
         by_name = {item.get("partition_name"): item for item in manifest.partitions}
         results: dict[str, bool] = {}
-        for name in partition_names:
+        total = len(partition_names)
+        for index, name in enumerate(partition_names, start=1):
+            if should_stop is not None and should_stop():
+                raise ScanCancelled("완료 여부 확인이 취소되었습니다")
+
             item = by_name.get(name)
             if not item:
                 results[name] = False
-                continue
-            try:
-                self.verify_partition_file(ArchivePartitionEntry.from_dict(item))
-                results[name] = True
-            except Exception:
-                results[name] = False
+            else:
+                try:
+                    self.verify_partition_file(
+                        ArchivePartitionEntry.from_dict(item),
+                        should_stop=should_stop,
+                    )
+                    results[name] = True
+                except ScanCancelled:
+                    raise
+                except Exception:
+                    results[name] = False
+
+            if on_progress is not None:
+                on_progress(index, total)
         return results
 
     def filter_partitions(

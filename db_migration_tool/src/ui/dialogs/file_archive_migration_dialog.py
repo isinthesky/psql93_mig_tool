@@ -3,17 +3,13 @@
 from __future__ import annotations
 
 import html
-from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from typing import cast
 
-import psycopg
-from psycopg import sql
 from PySide6.QtCore import Qt, QThread, QTimer
-from PySide6.QtGui import QColor, QCursor, QTextCursor
+from PySide6.QtGui import QColor, QTextCursor
 from PySide6.QtWidgets import (
-    QApplication,
     QButtonGroup,
     QCheckBox,
     QDateEdit,
@@ -35,17 +31,20 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from src.core.archive_manifest import ArchiveManifestStore
 from src.core.file_archive_workers import (
     ArchiveMigrationWorkerBase,
     FileToPostgresArchiveWorker,
     PostgresToFileArchiveWorker,
 )
-from src.core.partition_discovery import PartitionDiscovery
-from src.core.scan_workers import ConnectionCheckWorker, EndpointCheckSpec
+from src.core.scan_workers import (
+    ConnectionCheckWorker,
+    EndpointCheckSpec,
+    PartitionScanWorker,
+    TargetCompletedScanWorker,
+)
 from src.core.table_types import TABLE_TYPE_CONFIG, TableType, get_all_table_types
 from src.models.history import CheckpointManager, HistoryManager, MigrationHistoryItem
-from src.models.profile import ENDPOINT_KIND_FILE, ENDPOINT_KIND_POSTGRES, ConnectionProfile
+from src.models.profile import ENDPOINT_KIND_POSTGRES, ConnectionProfile
 from src.ui.theme import LOG_MAX_BLOCKS, TEXT_MUTED, log_color
 from src.ui.widgets import MetricReadout, StatusLamp, StepRail
 from src.utils.enhanced_logger import log_emitter
@@ -204,6 +203,9 @@ class FileArchiveMigrationDialog(QDialog):
         root.addLayout(nav)
 
         self._update_nav_state()
+        # 조회 버튼도 처음부터 규칙을 따르게 한다(아직 찾은 파티션이 없으므로
+        # '완료여부 확인'은 꺼져 있어야 한다).
+        self._sync_scan_buttons()
 
     def _build_page_connections(self) -> QWidget:
         page = QWidget()
@@ -654,32 +656,6 @@ class FileArchiveMigrationDialog(QDialog):
             "새 작업으로 진행합니다. 다음 단계에서 날짜와 파티션을 선택하세요."
         )
 
-    @contextmanager
-    def _busy(self, message: str, *buttons):
-        """오래 걸리는 동기 작업 동안 '지금 뭔가 하고 있다'를 보이게 한다.
-
-        (본격적인 워커 스레드 전환 전까지의 최소 장치)
-
-        네비게이션 버튼까지 같이 잠근다. processEvents()로 큐를 비울 때
-        탐색 중 눌린 '다음'이 뒤늦게 배달되면, 대상 확인이 끝나기 전
-        상태(=전부 체크됨)로 실행 대상이 굳어버린다. 그 목록으로 import를
-        돌리면 이미 완료된 파티션까지 TRUNCATE 후 다시 적재된다.
-        """
-        self.discover_status.setText(message)
-        nav_buttons = (self.back_btn, self.next_btn, self.close_btn)
-        for btn in (*buttons, *nav_buttons):
-            btn.setEnabled(False)
-        QApplication.setOverrideCursor(QCursor(Qt.CursorShape.WaitCursor))
-        QApplication.processEvents()
-        try:
-            yield
-        finally:
-            QApplication.restoreOverrideCursor()
-            for btn in buttons:
-                btn.setEnabled(True)
-            # 네비게이션은 다시 켜는 게 아니라 현재 규칙대로 되돌린다.
-            self._update_nav_state()
-
     def check_connections(self):
         """소스/대상 엔드포인트를 확인한다(워커 스레드).
 
@@ -804,42 +780,95 @@ class FileArchiveMigrationDialog(QDialog):
             QMessageBox.warning(self, "날짜 오류", "시작 날짜가 종료 날짜보다 늦습니다.")
             return
 
+        if self._closing or self._is_scan_inflight("discover"):
+            return
+
         # 새 탐색이 시작되면 지금 목록은 더 이상 '확인된' 목록이 아니다.
-        self._bump_generation()
+        gen = self._bump_generation()
 
-        with self._busy("파티션 탐색 중...", self.discover_btn, self.check_completed_btn):
-            if self.profile.source_kind == ENDPOINT_KIND_POSTGRES:
-                discovery = PartitionDiscovery(self.profile.source_config)
-                partitions = discovery.discover_partitions(
-                    start_date, end_date, self.selected_table_types
-                )
-            else:
-                store = ArchiveManifestStore(self.profile.source_config["archive_path"])
-                partitions = store.filter_partitions(
-                    start_date=start_date,
-                    end_date=end_date,
-                    table_types=self.selected_table_types,
-                )
+        # 결과를 기다리는 동안 이전 목록이 체크된 채 남아 있으면 안 된다.
+        self.discovered_partitions = []
+        self._target_has_data = {}
+        self._render_partition_list()
+        self._update_counts()
 
-            self.discovered_partitions = [
-                PartitionSummary(
-                    table_name=item["table_name"],
-                    row_count=int(item.get("row_count") or 0),
-                    table_type=item["table_type"],
-                )
-                for item in partitions
-            ]
-            self._target_has_data = {}
-            self._render_partition_list()
-            self._update_counts()
-            self._update_nav_state()
+        self.discover_status.setText("파티션 탐색 중...")
+
+        worker = PartitionScanWorker(
+            gen,
+            self.profile.source_kind,
+            dict(self.profile.source_config or {}),
+            start_date,
+            end_date,
+            list(self.selected_table_types),
+        )
+        worker.result.connect(self._on_discovery_result)
+        worker.failed.connect(self._on_discovery_failed)
+        worker.progress.connect(self._on_discovery_progress)
+        worker.finished.connect(self._on_discovery_finished)
+
+        self._scan_workers["discover"] = worker
+        self._mark_scan_started("discover")
+        self._sync_scan_buttons()
+        worker.start()
+        self._update_nav_state()
+
+    def _on_discovery_progress(self, gen: int, done: int, total: int):
+        if not self._is_current_generation(gen):
+            return
+        self.discover_status.setText(f"파티션 탐색 중... ({done}/{total})")
+
+    def _on_discovery_result(self, gen: int, payload: object):
+        if not self._is_current_generation(gen):
+            return
+
+        self.discovered_partitions = [
+            PartitionSummary(
+                table_name=item["table_name"],
+                row_count=int(item.get("row_count") or 0),
+                table_type=item["table_type"],
+            )
+            for item in cast(list, payload)
+        ]
+        self._target_has_data = {}
+        self._render_partition_list()
+        self._update_counts()
+        self._update_nav_state()
 
         if not self.discovered_partitions:
             self.discover_status.setText("조건에 해당하는 파티션이 없습니다")
             return
 
+        self.add_log(f"파티션 {len(self.discovered_partitions)}개 발견", "INFO")
+        # 대상 확인으로 이어진다. 상태 문구는 그쪽이 이어서 쓴다.
+        # 같은 generation을 물려주므로, 이 결과가 낡았으면 확인도 시작되지 않는다.
         self.check_target_completed()
-        self.discover_status.setText(f"완료: {len(self.discovered_partitions)}개 파티션")
+
+    def _on_discovery_failed(self, gen: int, message: str):
+        if not self._is_current_generation(gen):
+            return
+
+        # 실패했는데 이전 목록이 남아 있으면 사용자가 그걸 실행 대상으로 착각한다.
+        self.discovered_partitions = []
+        self._target_has_data = {}
+        self._render_partition_list()
+        self._update_counts()
+        self.discover_status.setText("파티션 탐색 실패 — 다시 시도하세요")
+        self.add_log(f"파티션 탐색 실패: {message}", "ERROR")
+        self._update_nav_state()
+
+    def _on_discovery_finished(self):
+        """성공·실패·취소 공통 정리."""
+        self._mark_scan_finished("discover")
+        self._sync_scan_buttons()
+
+        worker = self.sender()
+        gen = getattr(worker, "generation", self._scan_gen)
+        if self._is_current_generation(gen) and "탐색 중" in self.discover_status.text():
+            # 결과도 실패도 오지 않았다(취소).
+            self.discover_status.setText("파티션 탐색이 중단되었습니다")
+
+        self._update_nav_state()
 
     def _render_partition_list(self):
         self.partition_list.clear()
@@ -964,95 +993,79 @@ class FileArchiveMigrationDialog(QDialog):
         if not names:
             return
 
-        gen = self._scan_gen
+        if self._closing or self._is_scan_inflight("target"):
+            return
+
         # 확인을 시작하는 순간 이전 확인 결과는 더 이상 유효하지 않다.
         # 여기서 내리지 않으면 '성공 → 재확인 실패' 순서에서 게이트가 열린 채
         # 남아, 확인되지 않은 목록(=전 파티션)이 실행 대상으로 굳는다.
         self._selection_verified = False
+
+        gen = self._scan_gen
+        self.discover_status.setText(f"대상 확인 중... (파티션 {len(names)}개)")
+
+        worker = TargetCompletedScanWorker(
+            gen,
+            self.profile.target_kind,
+            dict(self.profile.target_config or {}),
+            names,
+        )
+        worker.result.connect(self._on_target_check_result)
+        worker.failed.connect(self._on_target_check_failed)
+        worker.progress.connect(self._on_target_check_progress)
+        worker.finished.connect(self._on_target_check_finished)
+
+        self._scan_workers["target"] = worker
         self._mark_scan_started("target")
-        try:
-            with self._busy(
-                f"대상 확인 중... (파티션 {len(names)}개)",
-                self.discover_btn,
-                self.check_completed_btn,
-            ):
-                if self.profile.target_kind == ENDPOINT_KIND_FILE:
-                    store = ArchiveManifestStore(self.profile.target_config["archive_path"])
-                    try:
-                        self._target_has_data = store.get_completed_status(names)
-                    except FileNotFoundError:
-                        # manifest가 없으면 '아무것도 완료되지 않음'이 맞다.
-                        self._target_has_data = dict.fromkeys(names, False)
-                else:
-                    self._target_has_data = self._check_target_postgres_partitions(names)
+        self._sync_scan_buttons()
+        worker.start()
+        self._update_nav_state()
 
-                self._render_partition_list()
-                self._update_counts()
-        except Exception as e:
-            # 확인에 실패하면 _target_has_data를 믿을 수 없다. 이 상태로 진행하면
-            # 전 파티션이 미완료로 보여 이미 옮긴 것까지 다시 적재된다.
-            # _selection_verified를 올리지 않아 '다음'이 잠긴 채로 남는다.
-            self._target_has_data = {}
-            self.discover_status.setText("대상 확인 실패 — 다시 시도하세요")
-            self.add_log(f"완료 여부 확인 실패: {e}", "ERROR")
-            self._render_partition_list()
-            self._update_counts()
-            self._update_nav_state()
+    def _on_target_check_progress(self, gen: int, done: int, total: int):
+        if not self._is_current_generation(gen):
             return
-        finally:
-            self._mark_scan_finished("target")
+        self.discover_status.setText(f"대상 확인 중... ({done}/{total})")
 
+    def _on_target_check_result(self, gen: int, payload: object):
         if not self._is_current_generation(gen):
             # 확인하는 동안 조건이 바뀌었다. 이 결과는 지금 목록의 것이 아니다.
             return
 
+        self._target_has_data = cast(dict, payload)
+        self._render_partition_list()
+        self._update_counts()
         self._selection_verified = True
         self._update_nav_state()
         self.discover_status.setText("대상 확인 완료")
         self.add_log("완료 여부 확인 완료", "INFO")
 
-    def _check_target_postgres_partitions(self, names: list[str]) -> dict[str, bool]:
-        # 워커들과 같은 기본값 규칙을 쓴다 (키가 비어도 KeyError/None 전달로 깨지지 않게)
-        conn_params = {
-            "host": self.profile.target_config.get("host", "localhost"),
-            "port": self.profile.target_config.get("port", 5432),
-            "dbname": self.profile.target_config.get("database", ""),
-            "user": self.profile.target_config.get("username", ""),
-            "password": self.profile.target_config.get("password", ""),
-        }
-        if self.profile.target_config.get("ssl"):
-            conn_params["sslmode"] = "require"
+    def _on_target_check_failed(self, gen: int, message: str):
+        if not self._is_current_generation(gen):
+            return
 
-        results = dict.fromkeys(names, False)
-        conn = psycopg.connect(**conn_params)
-        try:
-            with conn.cursor() as cur:
-                for name in names:
-                    cur.execute(
-                        """
-                        SELECT EXISTS (
-                            SELECT 1 FROM information_schema.tables
-                            WHERE table_schema = 'public' AND table_name = %s
-                        )
-                        """,
-                        (name,),
-                    )
-                    exists_row = cur.fetchone()
-                    exists = bool(exists_row and exists_row[0])
-                    if not exists:
-                        continue
-                    try:
-                        # '데이터가 있는가'만 알면 되므로 COUNT(*)로 전수를 세지 않는다.
-                        # 대용량 파티션에서 확인이 수 분씩 걸리던 원인.
-                        cur.execute(
-                            sql.SQL("SELECT 1 FROM {} LIMIT 1").format(sql.Identifier(name))
-                        )
-                        results[name] = cur.fetchone() is not None
-                    except Exception:
-                        results[name] = False
-        finally:
-            conn.close()
-        return results
+        # 확인에 실패하면 _target_has_data를 믿을 수 없다. 이 상태로 진행하면
+        # 전 파티션이 미완료로 보여 이미 옮긴 것까지 다시 적재된다.
+        # _selection_verified를 올리지 않아 '다음'이 잠긴 채로 남는다.
+        self._target_has_data = {}
+        self._render_partition_list()
+        self._update_counts()
+        self.discover_status.setText("대상 확인 실패 — 다시 시도하세요")
+        self.add_log(f"완료 여부 확인 실패: {message}", "ERROR")
+        self._update_nav_state()
+
+    def _on_target_check_finished(self):
+        """성공·실패·취소 공통 정리."""
+        self._mark_scan_finished("target")
+        self._sync_scan_buttons()
+
+        worker = self.sender()
+        gen = getattr(worker, "generation", self._scan_gen)
+        if self._is_current_generation(gen) and not self._selection_verified:
+            # 결과도 실패도 오지 않았다(취소). 상태 문구가 '확인 중...'에 멈추지 않게 한다.
+            if "확인 중" in self.discover_status.text():
+                self.discover_status.setText("대상 확인이 중단되었습니다")
+
+        self._update_nav_state()
 
     def go_back(self):
         idx = self.pages.currentIndex()
@@ -1119,11 +1132,41 @@ class FileArchiveMigrationDialog(QDialog):
 
         늦게 도착하는 이전 세대의 결과는 버려지고, 지금 목록은 더 이상
         '확인된' 목록이 아니게 된다.
+
+        돌고 있는 조회는 결과가 어차피 버려지므로 멈추라고 알린다.
+        (아카이브 체크섬 확인은 수 분씩 걸린다 — 날짜만 바꿔도 쓸모없어진
+         작업이 계속 도는 것을 막는다)
         """
         self._scan_gen += 1
         self._selection_verified = False
+        self._interrupt_active_scans()
         self._update_nav_state()
         return self._scan_gen
+
+    def _sync_scan_buttons(self) -> None:
+        """조회 버튼 활성화를 한 곳에서 정한다.
+
+        각 핸들러가 따로 켜고 끄면 순서에 따라 어긋난다. 실제로
+        탐색 완료 핸들러가 (그 뒤에 시작된) 대상 확인 도중에 버튼을
+        되살리는 문제가 있었다.
+        """
+        busy = self._is_scan_inflight("discover") or self._is_scan_inflight("target")
+        self.discover_btn.setEnabled(not busy)
+        # '완료여부 확인'은 찾은 파티션이 있을 때만 의미가 있다.
+        self.check_completed_btn.setEnabled(not busy and bool(self.discovered_partitions))
+
+    def _interrupt_active_scans(self) -> None:
+        """돌고 있는 조회에 중단을 요청한다(기다리지는 않는다)."""
+        for worker in self._scan_workers.values():
+            if worker is None or not worker.isRunning():
+                continue
+            worker.requestInterruption()
+            cancel = getattr(worker, "cancel_query", None)
+            if callable(cancel):
+                try:
+                    cancel()
+                except Exception:
+                    pass
 
     def _is_current_generation(self, gen: int) -> bool:
         return gen == self._scan_gen

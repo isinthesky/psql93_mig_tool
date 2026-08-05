@@ -92,7 +92,9 @@ class TestConnectionCheckWorkerLogic:
                 scan_mod.PostgresOptimizer, "check_connection_quick", return_value=(True, "PG ok")
             ),
             patch.object(
-                scan_mod.ConnectionValidator, "validate_file_archive_config", return_value=(True, "")
+                scan_mod.ConnectionValidator,
+                "validate_file_archive_config",
+                return_value=(True, ""),
             ),
         ):
             payload = worker.execute()
@@ -147,7 +149,9 @@ class TestConnectionCheckWorkerLogic:
                 scan_mod.PostgresOptimizer, "check_connection_quick", return_value=(True, "ok")
             ),
             patch.object(
-                scan_mod.ConnectionValidator, "validate_file_archive_config", return_value=(True, "")
+                scan_mod.ConnectionValidator,
+                "validate_file_archive_config",
+                return_value=(True, ""),
             ),
         ):
             worker.run()
@@ -166,7 +170,9 @@ class TestConnectionCheckWorkerLogic:
                 scan_mod.PostgresOptimizer, "check_connection_quick", return_value=(True, "ok")
             ),
             patch.object(
-                scan_mod.ConnectionValidator, "validate_file_archive_config", return_value=(True, "")
+                scan_mod.ConnectionValidator,
+                "validate_file_archive_config",
+                return_value=(True, ""),
             ),
             patch.object(ConnectionCheckWorker, "should_stop", return_value=True),
         ):
@@ -324,9 +330,9 @@ class TestDialogWiring:
         source = textwrap.dedent(
             inspect.getsource(archive_mod.FileArchiveMigrationDialog.check_connections)
         )
-        assert not [
-            node for node in ast.walk(ast.parse(source)) if isinstance(node, ast.Lambda)
-        ], "워커 시그널 연결에 람다를 쓰지 마세요"
+        assert not [node for node in ast.walk(ast.parse(source)) if isinstance(node, ast.Lambda)], (
+            "워커 시그널 연결에 람다를 쓰지 마세요"
+        )
 
 
 class TestThreadingIntegration:
