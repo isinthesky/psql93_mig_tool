@@ -76,9 +76,8 @@ class MigrationWorker(BaseMigrationWorker):
             if self.is_running:  # 정상 완료
                 self._log("마이그레이션이 정상적으로 완료되었습니다", "SUCCESS")
 
-        except Exception as e:
-            self._log(f"마이그레이션 오류: {str(e)}", "ERROR")
-            raise
+        # 예외는 그대로 run()으로 올려보낸다. 여기서 화면 로그를 남기면
+        # run()이 같은 메시지를 또 찍어 두 줄이 된다.
         finally:
             # 연결 종료 (성공/실패/취소 모두 확실히 닫기)
             for conn in (self.source_conn, target_conn):

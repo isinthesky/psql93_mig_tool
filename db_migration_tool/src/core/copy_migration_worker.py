@@ -359,7 +359,9 @@ class CopyMigrationWorker(BaseMigrationWorker):
                 )
 
         except Exception as e:
-            self.log.emit(f"마이그레이션 오류: {str(e)}", "ERROR")
+            # 화면 로그(self.log)는 run()이 공통으로 한 번 남긴다. 여기서 같이 emit하면
+            # 다시 던진 예외를 run()이 또 찍어 같은 줄이 두 번 보인다.
+            # 영속 로그는 run()이 남기지 않으므로 여기서만 기록한다.
             log_emitter.emit_log("ERROR", f"마이그레이션 오류: {str(e)}")
             raise
         finally:

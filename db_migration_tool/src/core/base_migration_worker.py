@@ -30,10 +30,14 @@ class BaseMigrationWorker(QThread, metaclass=QThreadABCMeta):
     """
 
     # 공통 시그널
+    #
+    # finished는 선언하지 않는다. QThread가 이미 같은 이름으로 '스레드 종료'를
+    # 알리기 때문에, 여기서 다시 선언하고 직접 emit하면 같은 슬롯이 두 번 불린다
+    # (직접 emit 1회 + run() 반환 시 QThread 자체 emit 1회).
+    # 그러면 완료 핸들러가 두 번 돌면서 "완료" 다음에 "중단"이 이어 찍힌다.
     progress = Signal(dict)  # 진행 상황
     log = Signal(str, str)  # 메시지, 레벨
     error = Signal(str)  # 오류 메시지
-    finished = Signal()  # 완료
 
     def __init__(
         self,
@@ -89,10 +93,10 @@ class BaseMigrationWorker(QThread, metaclass=QThreadABCMeta):
             error_msg = str(e)
             self._log(f"마이그레이션 오류: {error_msg}", "ERROR")
             self.error.emit(error_msg)
-        finally:
-            # 정상 완료·취소·오류 모두 finished를 발행하여 UI 핸들러가 확실히 호출되도록 한다.
-            # 완료 유형 판정은 handler 측에서 is_running 스냅샷으로 수행한다.
-            self.finished.emit()
+
+        # finished는 직접 발행하지 않는다. 예외를 여기서 모두 삼키므로 run()은 항상
+        # 정상 반환하고, 그 시점에 QThread가 finished를 정확히 한 번 발행한다.
+        # 완료 유형 판정은 handler 측에서 is_running 스냅샷으로 수행한다.
 
     @abstractmethod
     def _execute_migration(self):
