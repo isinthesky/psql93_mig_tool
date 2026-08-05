@@ -175,17 +175,42 @@ winget은 `%LOCALAPPDATA%\Programs\Inno Setup 6`에 설치한다.
 무음 설치(사내 배포용):
 
 ```bash
-DBMigrationTool-Setup-1.0.0.exe /VERYSILENT /SUPPRESSMSGBOXES /NORESTART
+DBMigrationTool-Setup-1.2.1.exe /VERYSILENT /SUPPRESSMSGBOXES /NORESTART
 ```
+
+### 버전 관리
+
+버전은 세 곳에 있다 — `pyproject.toml`(패키징), `src/version.py`(앱이 실행 중
+표시), `installer/DBMigrationTool.iss`(인스톨러 이름·표시). **손으로 고치지 말고
+`tools/bump_version.py`만 쓴다.** 따로 고치면 어긋난다(인스톨러는 1.2.1인데
+정보 창은 1.0.0인 상태가 실제로 있었다).
+
+```bash
+python tools/bump_version.py            # patch +1 (1.2.1 -> 1.2.2)
+python tools/bump_version.py --set 1.3.0   # 메이저·마이너는 직접 지정
+python tools/bump_version.py --sync     # 올리지 않고 세 곳을 현재 값으로 정렬
+python tools/bump_version.py --show     # 현재 버전 출력
+```
+
+`build.bat`은 빌드 직전에 patch를 자동으로 올린다. 따라서 **빌드할 때마다
+버전이 1씩 증가**한다. 올리지 않고 다시 빌드하려면 PyInstaller를 직접 부른다:
+
+```bash
+python -m PyInstaller DBMigrationTool.spec --clean --noconfirm
+```
+
+메이저·마이너를 올릴 때는 `--set`으로 먼저 지정한 뒤 빌드한다(빌드가 patch를
+한 번 더 올리므로, 원하는 값보다 1 낮게 지정한다).
 
 ### 주의
 
-- 버전을 올릴 때 `installer\DBMigrationTool.iss`의 `AppVersion`과
-  `pyproject.toml`의 `version`을 함께 고친다.
 - `AppId`(GUID)는 **바꾸지 않는다.** 바꾸면 업그레이드가 아니라 별개 프로그램으로
   설치되어 이전 버전이 남는다.
 - `.iss`는 **UTF-8 BOM**으로 저장한다. BOM이 없으면 Inno Setup이 시스템
-  코드페이지로 읽어 한글이 깨진다.
+  코드페이지로 읽어 한글이 깨진다. `bump_version.py`는 파일을 바이트로 읽고 써서
+  인코딩을 보존한다 — 텍스트로 다시 쓰면 BOM과 한글이 깨진다.
+- `build.bat`은 `dist`를 통째로 지우지 않는다. 인스톨러가 `dist\prerequisites\`를
+  입력으로 쓰고 `dist\installer\`에 산출물이 쌓이기 때문이다.
 
 ---
 

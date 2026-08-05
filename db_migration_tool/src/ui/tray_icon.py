@@ -164,12 +164,16 @@ class TrayIconManager(QObject):
         """정보 다이얼로그 표시"""
         from PySide6.QtWidgets import QMessageBox
 
+        # 버전은 여기에 적지 않는다. 손으로 적어 두면 인스톨러만 올라가고
+        # 이 문구는 옛 버전에 머문다(실제로 인스톨러 1.2.1 / 정보 창 1.0.0이었다).
+        from src.version import __version__
+
         QMessageBox.about(
             self.main_window,
             "DB Migration Tool 정보",
             "<h3>DB Migration Tool</h3>"
             "<p>PostgreSQL 파티션 테이블 마이그레이션 도구</p>"
-            "<p>버전: 1.0.0</p>"
+            f"<p>버전: {__version__}</p>"
             "<p>PySide6 기반 데스크톱 애플리케이션</p>",
         )
 

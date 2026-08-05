@@ -1,6 +1,6 @@
 [project]
 name = "db-migration-tool"
-version = "1.0.0"
+version = "1.2.1"
 description = "PostgreSQL 파티션 테이블 마이그레이션 도구"
 authors = [{name = "DB Migration Team"}]
 readme = "README.md"

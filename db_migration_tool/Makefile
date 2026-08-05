@@ -44,7 +44,7 @@ YELLOW := \033[0;33m
 RED := \033[0;31m
 NC := \033[0m # No Color
 
-.PHONY: help setup install install-dev install-test build clean test run check-uv
+.PHONY: help setup install install-dev install-test build clean test run check-uv bump bump-sync
 
 help: ## Show this help message
 	@echo "$(CYAN)DB Migration Tool - Make Commands$(NC)"
@@ -224,7 +224,13 @@ update: ## Update dependencies
 
 version: ## Show project version
 	@echo "$(CYAN)DB Migration Tool$(NC)"
-	@$(PYTHON) -c "import toml; print('Version:', toml.load('pyproject.toml')['project']['version'])" 2>/dev/null || echo "Version: 1.0.0"
+	@$(PYTHON) tools/bump_version.py --show
+
+bump: ## Bump patch version (pyproject.toml + src/version.py + installer .iss)
+	@$(PYTHON) tools/bump_version.py
+
+bump-sync: ## Re-align all version locations without bumping
+	@$(PYTHON) tools/bump_version.py --sync
 
 python-version: ## Show Python version
 	@echo "$(CYAN)Python version:$(NC)"

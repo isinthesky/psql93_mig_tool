@@ -52,10 +52,23 @@ if errorlevel 1 (
 )
 echo [OK] 의존성 설치 완료
 
+REM 버전 자동 증가 (patch +1)
+REM pyproject.toml / src\version.py / installer\DBMigrationTool.iss 를 함께 고친다.
+echo.
+echo [INFO] 버전을 올립니다...
+python tools\bump_version.py
+if errorlevel 1 (
+    echo [ERROR] 버전 증가 실패
+    pause
+    exit /b 1
+)
+
 REM 이전 빌드 제거
+REM dist 는 통째로 지우지 않는다. 인스톨러가 dist\prerequisites\vc_redist.x64.exe 를
+REM 입력으로 쓰고 dist\installer\ 에 산출물이 쌓인다. 지우면 인스톨러 빌드가 실패한다.
+REM exe 는 PyInstaller 가 --noconfirm 으로 덮어쓴다.
 echo.
 echo [INFO] 이전 빌드를 정리합니다...
-if exist dist rmdir /s /q dist
 if exist build rmdir /s /q build
 echo [OK] 정리 완료
 
