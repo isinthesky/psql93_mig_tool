@@ -134,6 +134,61 @@ create-dmg \
     "dist/"
 ```
 
+## Windows 인스톨러 (배포용)
+
+### 1. 실행 파일 빌드
+
+```bash
+python -m PyInstaller DBMigrationTool.spec --clean --noconfirm
+```
+
+`build.bat`도 같은 일을 하지만 **`dist` 폴더를 통째로 지운다.** 과거 릴리스
+아티팩트를 dist에 보관 중이라면 위 명령을 직접 쓴다.
+
+### 2. 인스톨러 빌드
+
+```bash
+installer\build_installer.bat
+```
+
+산출물: `dist\installer\DBMigrationTool-Setup-<버전>.exe`
+
+Inno Setup이 필요하다:
+
+```bash
+winget install --id JRSoftware.InnoSetup
+```
+
+winget은 `%LOCALAPPDATA%\Programs\Inno Setup 6`에 설치한다.
+`build_installer.bat`이 그곳과 Program Files 양쪽을 찾는다.
+
+### 인스톨러가 하는 일
+
+| 항목 | 내용 |
+|---|---|
+| VC++ 런타임 | 없을 때만 조용히 선설치. PySide6의 QtCore 로드 실패를 막는다 |
+| 설치 위치 | 관리자 권한이 있으면 Program Files, 없으면 사용자 폴더 |
+| 바로가기 | 시작 메뉴(항상), 바탕화면(선택) |
+| 제거 | 프로그램 추가/제거에 등록 |
+| Server 2012 R2 | KB2999226이 필요하다고 알린다(자동 설치 불가) |
+
+무음 설치(사내 배포용):
+
+```bash
+DBMigrationTool-Setup-1.0.0.exe /VERYSILENT /SUPPRESSMSGBOXES /NORESTART
+```
+
+### 주의
+
+- 버전을 올릴 때 `installer\DBMigrationTool.iss`의 `AppVersion`과
+  `pyproject.toml`의 `version`을 함께 고친다.
+- `AppId`(GUID)는 **바꾸지 않는다.** 바꾸면 업그레이드가 아니라 별개 프로그램으로
+  설치되어 이전 버전이 남는다.
+- `.iss`는 **UTF-8 BOM**으로 저장한다. BOM이 없으면 Inno Setup이 시스템
+  코드페이지로 읽어 한글이 깨진다.
+
+---
+
 ## 의존성 관리
 
 ### 의존성 업데이트
