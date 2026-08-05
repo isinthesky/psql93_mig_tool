@@ -372,3 +372,21 @@ class TestArchiveBusyGuard:
         assert archive_dialog.close_btn.isEnabled()
         # 연결이 안 됐으므로 '다음'은 여전히 잠겨 있어야 한다
         assert not archive_dialog.next_btn.isEnabled()
+
+    def test_connection_check_failure_does_not_lock_the_dialog(self, archive_dialog):
+        """연결 확인 실패가 창을 잠그면 안 된다.
+
+        복구를 성공 경로에만 두면, 실패했을 때 '닫기'까지 영구 비활성이 되어
+        Esc 말고는 창을 빠져나갈 수 없다. 그래서 복구는 성공·실패 공통인
+        QThread.finished 쪽에 있어야 한다.
+        """
+        gen = archive_dialog._scan_gen
+        archive_dialog.recheck_btn.setEnabled(False)
+
+        archive_dialog._on_connection_check_failed(gen, "boom")
+        archive_dialog._on_connection_check_finished()
+
+        assert archive_dialog.close_btn.isEnabled()
+        assert archive_dialog.recheck_btn.isEnabled()
+        assert archive_dialog.source_lamp.state == "error", "실패가 램프에 드러나야 합니다"
+        assert not archive_dialog.source_connected

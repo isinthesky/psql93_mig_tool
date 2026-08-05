@@ -42,14 +42,13 @@ from src.core.file_archive_workers import (
     PostgresToFileArchiveWorker,
 )
 from src.core.partition_discovery import PartitionDiscovery
+from src.core.scan_workers import ConnectionCheckWorker, EndpointCheckSpec
 from src.core.table_types import TABLE_TYPE_CONFIG, TableType, get_all_table_types
-from src.database.postgres_utils import PostgresOptimizer
 from src.models.history import CheckpointManager, HistoryManager, MigrationHistoryItem
 from src.models.profile import ENDPOINT_KIND_FILE, ENDPOINT_KIND_POSTGRES, ConnectionProfile
 from src.ui.theme import LOG_MAX_BLOCKS, TEXT_MUTED, log_color
 from src.ui.widgets import MetricReadout, StatusLamp, StepRail
 from src.utils.enhanced_logger import log_emitter
-from src.utils.validators import ConnectionValidator
 
 
 @dataclass
@@ -91,6 +90,12 @@ class FileArchiveMigrationDialog(QDialog):
         "failed": ("error", "오류"),
     }
 
+    # 창을 닫을 때 조회 워커를 기다리는 방식.
+    # 한 번에 오래 붙잡으면 창이 굳어 보이므로 짧게 여러 번 시도하고,
+    # 총 대기(약 2초)를 넘기면 워커를 떼어내고 창을 닫는다.
+    SCAN_SHUTDOWN_STEP_MS = 200
+    SCAN_SHUTDOWN_MAX_ATTEMPTS = 10
+
     def __init__(self, parent, profile: ConnectionProfile):
         super().__init__(parent)
         self.profile = profile
@@ -127,6 +132,10 @@ class FileArchiveMigrationDialog(QDialog):
         self._scan_workers: dict[str, QThread] = {}
         self._inflight: set[str] = set()
         self._selection_verified: bool = False
+        self._close_attempts: int = 0
+        # 창이 닫히는 중인가. 예약된 작업(QTimer.singleShot)이 닫힌 뒤에
+        # 뒤늦게 발화해 워커를 띄우는 것을 막는다.
+        self._closing: bool = False
 
         self.setWindowTitle(self._build_title())
         self.resize(980, 760)
@@ -672,46 +681,92 @@ class FileArchiveMigrationDialog(QDialog):
             self._update_nav_state()
 
     def check_connections(self):
+        """소스/대상 엔드포인트를 확인한다(워커 스레드).
+
+        이 이름과 호출 위치는 유지해야 한다. 테스트 픽스처들이 이 메서드를
+        패치해 생성자에서 실제 DB에 붙는 것을 막는다.
+        """
+        # 생성자에서 QTimer.singleShot으로 예약되므로, 창이 뜨자마자 Esc를 누르면
+        # 닫힌 뒤에 이 호출이 도착할 수 있다.
+        if self._closing:
+            return
+        if self._is_scan_inflight("conn"):
+            return
+
+        gen = self._scan_gen
         self.source_lamp.set_state("busy", "확인 중...")
         self.target_lamp.set_state("busy", "확인 중...")
+        self.connection_hint.setText("")
         self.recheck_btn.setEnabled(False)
-        # 확인이 끝나기 전에 큐에 있던 '다음'이 배달되지 않도록 같이 잠근다.
-        for btn in (self.back_btn, self.next_btn, self.close_btn):
-            btn.setEnabled(False)
-        QApplication.setOverrideCursor(QCursor(Qt.CursorShape.WaitCursor))
-        QApplication.processEvents()
 
-        try:
-            if self.profile.source_kind == ENDPOINT_KIND_POSTGRES:
-                s_ok, s_msg = PostgresOptimizer.check_connection_quick(self.profile.source_config)
-            else:
-                s_ok, s_msg = ConnectionValidator.validate_file_archive_config(
-                    self.profile.source_config,
-                    must_exist=True,
-                )
-                s_msg = "경로 확인 완료" if s_ok else s_msg
+        worker = ConnectionCheckWorker(
+            gen,
+            EndpointCheckSpec(
+                kind=self.profile.source_kind,
+                config=dict(self.profile.source_config or {}),
+                must_exist=True,
+            ),
+            EndpointCheckSpec(
+                kind=self.profile.target_kind,
+                config=dict(self.profile.target_config or {}),
+                must_exist=False,
+            ),
+        )
+        # 람다로 연결하지 않는다. 람다는 수신자 QObject가 없어 다이얼로그가
+        # 먼저 사라지면 죽은 위젯을 건드린다.
+        worker.result.connect(self._on_connection_check_result)
+        worker.failed.connect(self._on_connection_check_failed)
+        worker.finished.connect(self._on_connection_check_finished)
 
-            if self.profile.target_kind == ENDPOINT_KIND_POSTGRES:
-                t_ok, t_msg = PostgresOptimizer.check_connection_quick(self.profile.target_config)
-            else:
-                t_ok, t_msg = ConnectionValidator.validate_file_archive_config(
-                    self.profile.target_config,
-                    must_exist=False,
-                )
-                t_msg = "출력 경로 사용 가능" if t_ok else t_msg
-        except Exception as e:
-            # 예외가 나도 창은 계속 쓸 수 있어야 하고, 램프가 '확인 중...'에
-            # 멈춰 있으면 안 된다.
-            self._update_connection_ui(False, False, f"확인 실패: {e}", f"확인 실패: {e}")
+        self._scan_workers["conn"] = worker
+        self._mark_scan_started("conn")
+        worker.start()
+        self._update_nav_state()
+
+    def _on_connection_check_result(self, gen: int, payload: object):
+        if not self._is_current_generation(gen):
+            # 확인하는 동안 조건이 바뀌었다. 이 결과는 지금 상태의 것이 아니다.
+            # (연결 상태 문구는 작업 이력에도 기록되므로 덮어쓰면 안 된다)
             return
-        finally:
-            QApplication.restoreOverrideCursor()
-            self.recheck_btn.setEnabled(True)
-            # 잠근 네비게이션은 성공 경로가 아니라 여기서 되돌린다.
-            # (성공 시에만 복구하면 예외 발생 시 '닫기'까지 영구 비활성이 된다)
-            self._update_nav_state()
+        results = cast(dict, payload)
+        source = results["source"]
+        target = results["target"]
+        self._update_connection_ui(source.ok, target.ok, source.message, target.message)
 
-        self._update_connection_ui(s_ok, t_ok, s_msg, t_msg)
+    def _on_connection_check_failed(self, gen: int, message: str):
+        if not self._is_current_generation(gen):
+            return
+        # 램프가 '확인 중...'에 멈춰 있으면 안 된다.
+        self._update_connection_ui(False, False, f"확인 실패: {message}", f"확인 실패: {message}")
+
+    def _on_connection_check_finished(self):
+        """성공·실패 공통 정리.
+
+        결과 슬롯이 아니라 여기서 되돌린다. 성공 경로에만 복구를 두면
+        실패했을 때 버튼이 영구 비활성으로 남는다.
+        """
+        self._mark_scan_finished("conn")
+        self.recheck_btn.setEnabled(True)
+
+        # 이 finished가 어느 세대의 것인지 확인한다. 낡은 워커가 끝나면서
+        # 연결 상태 문구를 덮으면, 그 문구가 그대로 작업 이력에 기록된다.
+        worker = self.sender()
+        gen = getattr(worker, "generation", self._scan_gen)
+        if not self._is_current_generation(gen):
+            self._update_nav_state()
+            return
+
+        # 취소된 워커는 결과도 실패도 보내지 않는다. 그대로 두면 램프가
+        # '확인 중...'에 영원히 멈춘다.
+        # (result/failed는 run() 안에서 먼저 emit되고 finished는 그 뒤에
+        #  전달되므로, 여기서 여전히 busy면 아무것도 도착하지 않은 것이다)
+        if "busy" in (self.source_lamp.state, self.target_lamp.state):
+            self._update_connection_ui(
+                False, False, "확인이 중단되었습니다", "확인이 중단되었습니다"
+            )
+            return
+
+        self._update_nav_state()
 
     def _update_connection_ui(
         self, source_ok: bool, target_ok: bool, source_msg: str, target_msg: str
@@ -910,6 +965,10 @@ class FileArchiveMigrationDialog(QDialog):
             return
 
         gen = self._scan_gen
+        # 확인을 시작하는 순간 이전 확인 결과는 더 이상 유효하지 않다.
+        # 여기서 내리지 않으면 '성공 → 재확인 실패' 순서에서 게이트가 열린 채
+        # 남아, 확인되지 않은 목록(=전 파티션)이 실행 대상으로 굳는다.
+        self._selection_verified = False
         self._mark_scan_started("target")
         try:
             with self._busy(
@@ -1121,6 +1180,26 @@ class FileArchiveMigrationDialog(QDialog):
         if all_stopped:
             self._inflight.clear()
         return all_stopped
+
+    def _abandon_scans(self) -> None:
+        """멈추지 않는 워커를 떼어내고 창을 놓아준다.
+
+        마지막 수단이다. 워커 시그널을 끊어 사라질 위젯을 건드리지 못하게 하고,
+        스레드 객체는 전역에 맡겨 참조가 살아 있게 한다(참조가 끊기면 프로세스가 죽는다).
+        """
+        for worker in self._scan_workers.values():
+            if worker is None:
+                continue
+            try:
+                # 인자 없는 disconnect()는 이 객체의 모든 연결을 끊는 Qt의 유효한
+                # 사용법이지만 PySide6 스텁에 해당 오버로드가 없다.
+                worker.disconnect()  # type: ignore[call-overload]
+            except (RuntimeError, TypeError):
+                pass
+            if worker.isRunning():
+                _park_orphan_worker(worker)
+        self._scan_workers.clear()
+        self._inflight.clear()
 
     def _is_running(self) -> bool:
         if self.run_state in ("running", "paused"):
@@ -1416,14 +1495,39 @@ class FileArchiveMigrationDialog(QDialog):
         )
         return True
 
+    def _prepare_close(self) -> bool:
+        """닫기 전에 조회 워커를 정리한다.
+
+        조회는 파괴적이지 않으므로 닫기를 막지 않는다. 다만 정리하지 않고 닫으면
+        워커가 사라진 위젯을 갱신하거나, 실행 중인 QThread가 파괴돼 프로세스가 죽는다.
+
+        Returns:
+            닫아도 되면 True. 잠시 더 기다려야 하면 False.
+        """
+        # 예약된 작업이 닫힌 뒤에 워커를 띄우지 못하게 먼저 표시한다.
+        self._closing = True
+
+        if self._shutdown_scans(self.SCAN_SHUTDOWN_STEP_MS):
+            self._close_attempts = 0
+            return True
+
+        self._close_attempts += 1
+        if self._close_attempts >= self.SCAN_SHUTDOWN_MAX_ATTEMPTS:
+            # 끝내 안 멈춘다. 창을 인질로 잡지 않는다 — 떼어내고 닫는다.
+            self.add_log("조회 작업이 멈추지 않아 분리하고 창을 닫습니다", "WARNING")
+            self._abandon_scans()
+            self._close_attempts = 0
+            return True
+
+        self.discover_status.setText("조회 작업 정리 중...")
+        return False
+
     def reject(self):
         # Esc 키는 closeEvent를 거치지 않을 수 있으므로 여기서도 막는다.
         if self._block_close_while_running():
             return
-        if not self._shutdown_scans():
-            # 아직 멈추지 않았다. 잠시 뒤 다시 시도한다(창은 열어둔다).
-            self.discover_status.setText("조회 작업 정리 중...")
-            QTimer.singleShot(200, self.reject)
+        if not self._prepare_close():
+            QTimer.singleShot(self.SCAN_SHUTDOWN_STEP_MS, self.reject)
             return
         super().reject()
 
@@ -1431,12 +1535,8 @@ class FileArchiveMigrationDialog(QDialog):
         if self._block_close_while_running():
             event.ignore()
             return
-        # 조회 작업은 닫기를 막지 않는다(파괴적이지 않다). 대신 먼저 정리한다.
-        # 정리하지 않고 닫으면 워커가 파괴된 위젯을 갱신하거나,
-        # QThread가 실행 중인 채로 파괴돼 프로세스가 죽는다.
-        if not self._shutdown_scans():
-            self.discover_status.setText("조회 작업 정리 중...")
+        if not self._prepare_close():
             event.ignore()
-            QTimer.singleShot(200, self.close)
+            QTimer.singleShot(self.SCAN_SHUTDOWN_STEP_MS, self.close)
             return
         event.accept()
