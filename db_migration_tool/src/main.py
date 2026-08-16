@@ -97,6 +97,24 @@ def main():
     # 메인 윈도우 생성
     window = MainWindow()
 
+    # 라이선스 확인 — DB 초기화 뒤, 창을 띄우기 전에 딱 한 번만 한다.
+    # 실행 중에는 다시 확인하지 않는다. 마이그레이션이 도는 도중 만료됐다고
+    # 작업을 끊으면 소스와 대상이 어긋난 채로 남는다.
+    from src.licensing import check_license
+
+    try:
+        license_state = check_license()
+    except Exception as e:
+        # 라이선스 확인이 실패했다고 도구를 못 쓰게 만들지 않는다.
+        # 중단된 마이그레이션을 재개해야 할 수도 있다.
+        print(f"Warning: 라이선스 확인 실패 ({e})")
+        license_state = None
+
+    window.set_license_state(license_state)
+
+    if license_state is not None and license_state.is_restricted:
+        window.show_license_dialog()
+
     # 트레이 아이콘 설정
     from src.ui.tray_icon import TrayIconManager
 

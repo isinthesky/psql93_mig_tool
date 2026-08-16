@@ -89,9 +89,12 @@ class FileArchiveMigrationDialog(ScanHostMixin, QDialog):
         "failed": ("error", "오류"),
     }
 
-    def __init__(self, parent, profile: ConnectionProfile):
+    def __init__(self, parent, profile: ConnectionProfile, restricted: bool = False):
         super().__init__(parent)
         self.profile = profile
+        # 라이선스 제한 모드. True면 새 실행만 막는다 — 재개(resume_mode)는
+        # 항상 열어 둔다. 막으면 중단된 마이그레이션을 복구할 길이 사라진다.
+        self.restricted = restricted
         self.history_manager = HistoryManager()
         self.checkpoint_manager = CheckpointManager()
 
@@ -127,6 +130,12 @@ class FileArchiveMigrationDialog(ScanHostMixin, QDialog):
         self.setWindowTitle(self._build_title())
         self.resize(980, 760)
         self._build_ui()
+
+        # 버튼 초기 상태도 _set_run_state 한 곳에서 정한다. 생성 시 기본값에
+        # 맡기면 '새 작업으로 진행'을 거치지 않고 다음으로만 이동한 경우
+        # 제한 모드 게이트를 타지 않은 시작 버튼이 남는다.
+        self._set_run_state("idle")
+
         self._guard_last_table_type()
         self._check_incomplete_migration()
         # 연결 확인은 최대 수 초 걸린다. 창을 먼저 그린 뒤 시작해야
@@ -356,13 +365,24 @@ class FileArchiveMigrationDialog(ScanHostMixin, QDialog):
         # 각 핸들러에서 따로 알리면 한 경로만 빠져도 트레이가 계속 '실행 중'으로 남는다.
         self.migration_running_changed.emit(running)
 
+        # 제한 모드에서는 새 실행만 막는다. 재개로 들어온 경우(resume_mode)는
+        # 라이선스 상태와 무관하게 끝까지 갈 수 있어야 한다.
+        license_blocked = self.restricted and not self.resume_mode
+
         start_labels = {
             "stopped": "이어서 시작",
             "partial": "실패분 다시 실행",
             "failed": "다시 시도",
         }
         self.start_btn.setText(start_labels.get(state, "시작"))
-        self.start_btn.setEnabled(state in ("idle", "stopped", "partial", "failed"))
+        self.start_btn.setEnabled(
+            state in ("idle", "stopped", "partial", "failed") and not license_blocked
+        )
+        self.start_btn.setToolTip(
+            "라이선스 제한 모드입니다. 중단된 작업의 재개만 시작할 수 있습니다."
+            if license_blocked
+            else "선택한 범위와 파티션으로 마이그레이션을 시작합니다."
+        )
         self.cancel_btn.setEnabled(running)
         self._update_nav_state()
 

@@ -43,6 +43,10 @@ class MainWindow(QMainWindow):
         self.log_viewer_dialog = None
         self.history_dialog = None
 
+        # 라이선스 상태 (main.py에서 set_license_state로 주입).
+        # None 이면 확인 전 — 확인 전에는 아무것도 막지 않는다.
+        self.license_state = None
+
         # 트레이 아이콘 관련
         self.tray_icon = None  # TrayIconManager 인스턴스 (main.py에서 설정)
         self.minimize_to_tray = True  # 트레이 최소화 활성화 (설정으로 관리 가능)
@@ -318,6 +322,13 @@ class MainWindow(QMainWindow):
 
     def new_connection(self):
         """새 연결 생성 (ViewModel로 위임)"""
+        # 새 프로필은 새 마이그레이션을 벌이기 위한 것이므로 제한 모드에서 막는다.
+        # 기존 프로필 '편집'은 막지 않는다 — DB 암호가 바뀐 채 중단된 작업을
+        # 재개하려면 연결 정보를 고칠 수 있어야 한다(재개 경로 보장).
+        if self.license_state is not None and self.license_state.is_restricted:
+            self._explain_restricted_mode("새 연결 프로필을 만들 수 없습니다.")
+            return
+
         dialog = ConnectionDialog(self)
         if dialog.exec():
             profile_data = dialog.get_profile_data()
@@ -359,14 +370,24 @@ class MainWindow(QMainWindow):
             return
 
         profile = self.vm.current_profile
+
+        # 제한 모드에서는 새 작업만 막는다. 중단된 작업이 남아 있으면 반드시 열어 줘야 한다 —
+        # 재개 경로를 막으면 소스와 대상이 어긋난 채로 복구할 방법이 사라진다.
+        restricted = self.license_state is not None and self.license_state.is_restricted
+        if restricted and not self._has_resumable_work(profile):
+            self._explain_restricted_mode()
+            return
+
         self.status_bar.showMessage(
             f"{self._migration_mode_text(profile)} 실행 준비 · {self._endpoint_summary(profile)}"
         )
+        # restricted를 넘겨야 마법사 안에서도 '새 작업으로 진행'이 막힌다.
+        # 여기 게이트만으로는 재개하러 들어간 사용자가 새 실행을 시작할 수 있다.
         dialog: MigrationWizardDialog | FileArchiveMigrationDialog
         if profile.source_kind == "postgres" and profile.target_kind == "postgres":
-            dialog = MigrationWizardDialog(self, profile)
+            dialog = MigrationWizardDialog(self, profile, restricted=restricted)
         else:
-            dialog = FileArchiveMigrationDialog(self, profile)
+            dialog = FileArchiveMigrationDialog(self, profile, restricted=restricted)
 
         dialog.migration_running_changed.connect(self.set_migration_running)
         try:
@@ -406,6 +427,72 @@ class MainWindow(QMainWindow):
         else:
             self.log_viewer_dialog.raise_()
             self.log_viewer_dialog.activateWindow()
+
+    # === 라이선스 ===
+
+    def _has_resumable_work(self, profile) -> bool:
+        """이 프로필에 이어서 끝내야 할 작업이 남아 있는가.
+
+        조회가 실패하면 **있다고 본다.** 판정을 못 했다고 재개를 막으면,
+        중단된 마이그레이션을 복구할 길이 사라진다. 여기서는 안전한 쪽이
+        '열어 주는 쪽'이다.
+        """
+        try:
+            return self.vm.history_manager.get_incomplete_history(profile.id) is not None
+        except Exception:
+            return True
+
+    def _explain_restricted_mode(
+        self, blocked: str = "새 마이그레이션을 시작할 수 없습니다."
+    ) -> None:
+        """왜 시작할 수 없는지 알리고 등록 창으로 안내한다."""
+        state = self.license_state
+        message = state.message if state else "라이선스를 확인할 수 없습니다."
+
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle("라이선스")
+        box.setText(blocked)
+        box.setInformativeText(
+            f"{message}\n\n중단된 작업의 재개와 검증·이력 조회는 계속 사용할 수 있습니다."
+        )
+        register_btn = box.addButton("라이선스 등록", QMessageBox.ButtonRole.AcceptRole)
+        box.addButton("닫기", QMessageBox.ButtonRole.RejectRole)
+        box.exec()
+
+        if box.clickedButton() is register_btn:
+            self.show_license_dialog()
+
+    def show_license_dialog(self) -> None:
+        """라이선스 등록·상태 창을 연다."""
+        from src.licensing import check_license
+        from src.ui.dialogs.license_dialog import LicenseDialog
+
+        state = self.license_state or check_license()
+        dialog = LicenseDialog(self, state)
+        dialog.exec()
+
+        # 등록에 성공했으면 새 상태를 반영한다.
+        self.set_license_state(dialog.state)
+        dialog.deleteLater()
+
+    def set_license_state(self, state) -> None:
+        """라이선스 상태를 반영한다. 상태바 표시와 신규 시작 가능 여부가 여기서 갈린다."""
+        self.license_state = state
+        if state is None:
+            return
+
+        if state.is_restricted:
+            self.status_bar.showMessage(f"제한 모드 · {state.message}")
+        elif state.status.name == "EXPIRING":
+            self.status_bar.showMessage(state.message)
+
+        if hasattr(self, "migrate_action"):
+            self.migrate_action.setToolTip(
+                "제한 모드입니다. 중단된 작업의 재개만 가능합니다."
+                if state.is_restricted
+                else "선택한 연결로 마이그레이션을 시작합니다."
+            )
 
     # === 트레이 아이콘 관련 메서드 ===
 

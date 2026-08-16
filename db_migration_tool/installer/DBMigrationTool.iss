@@ -11,7 +11,7 @@
 ;   여기서는 인스톨러가 조용히 선설치한다.
 
 #define AppName "DB Migration Tool"
-#define AppVersion "1.2.1"
+#define AppVersion "1.2.2"
 #define AppPublisher "CIMON"
 #define ExeName "DBMigrationTool.exe"
 
@@ -69,12 +69,78 @@ Filename: "{tmp}\vc_redist.x64.exe"; \
 Filename: "{app}\{#ExeName}"; Description: "{#AppName} 실행"; \
     Flags: nowait postinstall skipifsilent
 
+[UninstallDelete]
+; 설치 중 만든 씨앗 파일. [Files] 로 넣은 게 아니라 자동 삭제되지 않는다.
+; 사용자별 license.key 와 .activation 은 지우지 않는다 — 재설치 후에도 등록이 유지돼야 한다.
+Type: files; Name: "{app}\license.seed"
+
 [Icons]
 Name: "{group}\{#AppName}"; Filename: "{app}\{#ExeName}"
 Name: "{group}\{cm:UninstallProgram,{#AppName}}"; Filename: "{uninstallexe}"
 Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#ExeName}"; Tasks: desktopicon
 
 [Code]
+var
+  LicensePage: TInputQueryWizardPage;
+
+{ /LICENSEKEY=... 로 넘어온 값. 무음 설치(/VERYSILENT)에서는 입력 페이지가 뜨지 않으므로
+  이 경로가 유일한 입력 수단이다. }
+function GetLicenseKeyParam: String;
+var
+  I: Integer;
+  Param: String;
+  Prefix: String;
+begin
+  Result := '';
+  Prefix := '/LICENSEKEY=';
+  for I := 1 to ParamCount do
+  begin
+    Param := ParamStr(I);
+    if Pos(Prefix, Uppercase(Param)) = 1 then
+    begin
+      Result := Copy(Param, Length(Prefix) + 1, MaxInt);
+      Exit;
+    end;
+  end;
+end;
+
+procedure InitializeWizard;
+begin
+  LicensePage := CreateInputQueryPage(wpSelectDir,
+    '라이선스 등록',
+    '공급사에서 받은 라이선스 키를 입력하세요.',
+    '지금 비워 두어도 설치는 진행됩니다. 나중에 프로그램의 라이선스 창에서 등록할 수 있습니다.' + #13#10 +
+    '하이픈과 대소문자는 신경 쓰지 않아도 됩니다.');
+  LicensePage.Add('라이선스 키:', False);
+  LicensePage.Values[0] := GetLicenseKeyParam;
+end;
+
+(* 키를 설치 폴더에 씨앗으로 남긴다.
+
+   사용자 로컬 폴더에 직접 쓰지 않는 이유: 그 경로는 '설치를 실행한 계정'을 가리킨다.
+   관리자로 승격해 설치하면 실제로 프로그램을 쓰는 사용자와 다른 계정이 되어
+   키가 엉뚱한 곳에 남는다. 앱이 첫 실행에서 자기 계정 폴더로 옮긴다. *)
+procedure SaveLicenseSeed;
+var
+  Key: String;
+begin
+  Key := Trim(GetLicenseKeyParam);
+  if (Key = '') and (LicensePage <> nil) then
+    Key := Trim(LicensePage.Values[0]);
+
+  { 빈 값이면 아무것도 하지 않는다. 덮어쓰면 앱에서 갱신한 키가 무음 업그레이드로 지워진다. }
+  if Key = '' then
+    Exit;
+
+  SaveStringToFile(ExpandConstant('{app}\license.seed'), Key + #13#10, False);
+end;
+
+procedure CurStepChanged(CurStep: TSetupStep);
+begin
+  if CurStep = ssPostInstall then
+    SaveLicenseSeed;
+end;
+
 function NeedsVCRedist: Boolean;
 var
   Installed: Cardinal;

@@ -202,6 +202,13 @@ python -m PyInstaller DBMigrationTool.spec --clean --noconfirm
 메이저·마이너를 올릴 때는 `--set`으로 먼저 지정한 뒤 빌드한다(빌드가 patch를
 한 번 더 올리므로, 원하는 값보다 1 낮게 지정한다).
 
+### 라이선스
+
+인스톨러에 라이선스 키 입력 단계가 있고, 무음 설치는 `/LICENSEKEY=...`로 넘긴다.
+**공개키(`src/licensing/keys.py`)가 비어 있으면 만들어진 exe는 어떤 키도 받지 않는다.**
+
+키 생성·발급·배포 절차는 [`LICENSE_GUIDE.md`](LICENSE_GUIDE.md)를 본다.
+
 ### 주의
 
 - `AppId`(GUID)는 **바꾸지 않는다.** 바꾸면 업그레이드가 아니라 별개 프로그램으로
