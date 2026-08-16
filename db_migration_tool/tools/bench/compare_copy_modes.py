@@ -7,7 +7,6 @@ from pathlib import Path
 import psycopg
 
 from src.core.copy_migration_worker import CopyMigrationWorker
-from src.database.local_db import LocalDatabase
 from src.models.history import CheckpointManager, HistoryManager
 from src.models.profile import ProfileManager
 from src.utils.app_paths import AppPaths
@@ -50,7 +49,6 @@ def pick_smallest_adjacent_window(parts: list[Part], count: int) -> list[Part]:
     return best_parts
 
 
-
 def load_profile_bms93_to_bms30():
     appdata = os.environ.get("APPDATA")
     if not appdata:
@@ -60,9 +58,9 @@ def load_profile_bms93_to_bms30():
 
     # Ensure global DB instance is initialized with the correct root
     import src.database.local_db as local_db
+
     local_db._db_instance = None
     local_db.get_db()
-
 
     pm = ProfileManager()
     profiles = pm.get_all_profiles()
@@ -148,16 +146,22 @@ def verify_counts(profile, table_names: list[str]) -> tuple[bool, list[dict]]:
             t_count = int(tcur.fetchone()[0])
             ok = s_count == t_count
             ok_all = ok_all and ok
-            results.append(
-                {"table": name, "source": s_count, "target": t_count, "ok": ok}
-            )
+            results.append({"table": name, "source": s_count, "target": t_count, "ok": ok})
 
     sconn.close()
     tconn.close()
     return ok_all, results
 
 
-def run_once(profile, partitions: list[str], start_day: str, end_day: str, bench_tag: str, copy_mode: str, batch_size: int) -> dict:
+def run_once(
+    profile,
+    partitions: list[str],
+    start_day: str,
+    end_day: str,
+    bench_tag: str,
+    copy_mode: str,
+    batch_size: int,
+) -> dict:
     hm = HistoryManager()
     cm = CheckpointManager()
 
@@ -273,7 +277,9 @@ def main():
             v_elapsed = time.time() - v0
             print(f"[VERIFY] ok={ok} elapsed={v_elapsed:.2f}s")
             for d in detail:
-                print(f"  - {d['table']}: source={d['source']:,} target={d['target']:,} ok={d['ok']}")
+                print(
+                    f"  - {d['table']}: source={d['source']:,} target={d['target']:,} ok={d['ok']}"
+                )
 
             r["verify_ok"] = ok
             r["verify_elapsed_sec"] = v_elapsed
@@ -284,7 +290,10 @@ def main():
             rows = int(r.get("processed_rows") or 0)
             sec = float(r.get("elapsed_sec") or 0)
             speed = rows / sec if sec > 0 else 0
-            print(f"- {r['copy_mode']:>6}: elapsed={sec:7.1f}s  rows={rows:,}  speed={speed:,.0f} rows/sec  verify_ok={r['verify_ok']}")
+            print(
+                f"- {r['copy_mode']:>6}: elapsed={sec:7.1f}s  rows={rows:,}  speed={speed:,.0f} rows/sec  verify_ok={r['verify_ok']}"
+            )
+
 
 if __name__ == "__main__":
     main()
