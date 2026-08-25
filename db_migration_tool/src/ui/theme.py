@@ -249,6 +249,12 @@ QPushButton:disabled {
     background-color: #243244;
     color: $muted;
     border-color: $border;
+    /* qdarkstyle's state selector is more specific than the base rule.  Repeat
+       geometry here so buttons created disabled keep the same size hint. */
+    border-radius: 5px;
+    padding: 7px 12px;
+    font-weight: 600;
+    min-width: 96px;
 }
 QDialogButtonBox QPushButton {
     min-width: 96px;
@@ -271,27 +277,40 @@ QPushButton[variant="chip"]:hover {
     border-color: $focus;
 }
 
-QPushButton#newProfileButton, QPushButton#primaryAction, QPushButton#startButton {
+QPushButton#newProfileButton, QPushButton#primaryAction {
     background-color: $accent;
     border-color: $accent_border;
     color: #ffffff;
 }
-QPushButton#newProfileButton:hover, QPushButton#primaryAction:hover,
-QPushButton#startButton:hover {
+QPushButton#newProfileButton:hover, QPushButton#primaryAction:hover {
     background-color: $accent_hover;
 }
-QPushButton#migrationButton {
+QPushButton#startButton, QPushButton#migrationButton {
     background-color: $go;
     border-color: $go_border;
     color: #ffffff;
 }
-QPushButton#migrationButton:hover {
+QPushButton#startButton:hover, QPushButton#migrationButton:hover {
     background-color: $go_hover;
 }
 /* id 선택자가 QPushButton:disabled 를 이기므로 비활성 상태를 따로 적어준다.
    (없으면 못 누르는 버튼이 눌리는 버튼처럼 밝게 보인다) */
 QPushButton#newProfileButton:disabled, QPushButton#primaryAction:disabled,
 QPushButton#startButton:disabled, QPushButton#migrationButton:disabled {
+    background-color: #243244;
+    color: $muted;
+    border-color: $border;
+}
+/* 실행을 멈추는 버튼은 삭제와 달리 실행 행의 핵심 액션이므로 빨간색으로 채운다. */
+QPushButton#cancelAction {
+    background-color: $danger;
+    border-color: $danger_border;
+    color: #ffffff;
+}
+QPushButton#cancelAction:hover {
+    background-color: $danger_hover;
+}
+QPushButton#cancelAction:disabled {
     background-color: #243244;
     color: $muted;
     border-color: $border;

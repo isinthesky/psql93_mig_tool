@@ -300,6 +300,7 @@ class CopyMigrationWorker(BaseMigrationWorker):
                     self.log.emit(f"{partition} - 이미 완료됨, 건너뛰기", "INFO")
                     log_emitter.emit_log("INFO", f"{partition} - 이미 완료됨, 건너뛰기")
                     self.performance_metrics.completed_partitions += 1
+                    self._emit_performance_metrics(force=True)
                     continue
 
                 # 파티션 마이그레이션
@@ -594,6 +595,7 @@ class CopyMigrationWorker(BaseMigrationWorker):
                 self._log(f"{partition_name} - 소스 테이블이 존재하지 않음, 건너뛰기", "WARNING")
                 self.performance_metrics.completed_partitions += 1
                 self._update_checkpoint_completed(checkpoint, 0, copy_method="COPY")
+                self._emit_performance_metrics(force=True)
                 return
             total_rows, is_empty = self._resolve_total_rows(partition_name, table_info)
             total_mb = table_info["total_size_mb"]
@@ -601,10 +603,12 @@ class CopyMigrationWorker(BaseMigrationWorker):
                 self._log(f"{partition_name} - 데이터 없음", "WARNING")
                 self._update_checkpoint_completed(checkpoint, 0, copy_method="COPY")
                 self.performance_metrics.completed_partitions += 1
+                self._emit_performance_metrics(force=True)
                 return
             self._log(f"{partition_name} - {total_rows:,}개 행, {total_mb:.1f}MB")
             # 성능 지표 시작
             self.performance_metrics.start_partition(partition_name, total_rows)
+            self._emit_performance_metrics(force=True)
             # --- checkpoint 기반(보조) 재개 지점 로드 ---
             if checkpoint:
                 if checkpoint.last_path_id is not None:
@@ -863,6 +867,7 @@ class CopyMigrationWorker(BaseMigrationWorker):
                 last_issued_date_text=last_issued_date_text,
                 copy_method="COPY",
             )
+            self._emit_performance_metrics(force=True)
             self._log(f"{partition_name} COPY 완료: 총 {accumulated_rows:,}개 행", "SUCCESS")
         except Exception as e:
             # 트랜잭션 롤백 (skip_on_error 시 다음 파티션이 정상 동작하도록)
@@ -912,6 +917,7 @@ class CopyMigrationWorker(BaseMigrationWorker):
                 log_emitter.emit_log("WARNING", f"{partition_name} - 소스 테이블이 존재하지 않음")
                 self.performance_metrics.completed_partitions += 1
                 self._update_checkpoint_completed(checkpoint, 0)
+                self._emit_performance_metrics(force=True)
                 return
 
             total_rows, is_empty = self._resolve_total_rows(partition_name, table_info)
@@ -921,12 +927,14 @@ class CopyMigrationWorker(BaseMigrationWorker):
                 self.log.emit(f"{partition_name} - 데이터 없음", "WARNING")
                 self._update_checkpoint_completed(checkpoint, 0)
                 self.performance_metrics.completed_partitions += 1
+                self._emit_performance_metrics(force=True)
                 return
 
             self.log.emit(f"{partition_name} - {total_rows:,}개 행, {total_mb:.1f}MB", "INFO")
 
             # 2. 성능 지표 시작
             self.performance_metrics.start_partition(partition_name, total_rows)
+            self._emit_performance_metrics(force=True)
 
             # 3. 대상 테이블 준비 (서버 모드는 항상 full restart → resume_expected=False)
             self._prepare_target_table(partition_name, checkpoint=checkpoint, resume_expected=False)
@@ -988,6 +996,9 @@ class CopyMigrationWorker(BaseMigrationWorker):
                     except Exception:
                         pass
 
+            # 단일 COPY 명령 안에서는 정확한 행 진행률을 알 수 없으므로 UI에
+            # 무한 진행 상태를 알린 뒤 블로킹 스트리밍을 시작한다.
+            self._emit_performance_metrics(force=True, current_indeterminate=True)
             producer = threading.Thread(target=_pump_source, daemon=True)
             producer.start()
 
@@ -1014,11 +1025,12 @@ class CopyMigrationWorker(BaseMigrationWorker):
             # 9. 성능 지표 업데이트 (1회)
             estimated_bytes = int(total_mb * 1024 * 1024)
             self.performance_metrics.update(copied_rows, estimated_bytes)
-            self._emit_performance_metrics()
+            self._emit_performance_metrics(force=True)
 
             # 10. 파티션 완료
             self.performance_metrics.complete_partition()
             self._update_checkpoint_completed(checkpoint, copied_rows, copy_method="COPY_SRV")
+            self._emit_performance_metrics(force=True)
 
             self.log.emit(
                 f"{partition_name} Server-side COPY 완료: {copied_rows:,}개 행", "SUCCESS"
@@ -1194,27 +1206,37 @@ class CopyMigrationWorker(BaseMigrationWorker):
                 last_issued_date_text=last_issued_date_text,
             )
 
-    def _emit_performance_metrics(self):
+    def _emit_performance_metrics(
+        self, *, force: bool = False, current_indeterminate: bool = False
+    ):
         """성능 지표 시그널 전송"""
         current_time = time.time()
-        if current_time - self.last_metric_update >= self.metric_update_interval:
-            stats = self.performance_metrics.get_stats()
-            self.performance.emit(stats)
+        if not force and current_time - self.last_metric_update < self.metric_update_interval:
+            return
 
-            # 진행 상황도 함께 업데이트
-            self.progress.emit(
+        stats = self.performance_metrics.get_stats()
+        self.performance.emit(stats)
+
+        # 완료 직후에는 current_partition이 비어 있다. 이때 현재 바를 0으로
+        # 되돌리지 않고 전체 진행률만 갱신한다.
+        progress_data: dict[str, Any] = {
+            "total_progress": int(stats["total_progress"]),
+            "total_partitions": stats["total_partitions"],
+            "completed_partitions": stats["completed_partitions"],
+            "speed": stats["instant_rows_per_sec"],
+        }
+        if stats["current_partition"] is not None:
+            progress_data.update(
                 {
-                    "total_progress": int(stats["total_progress"]),
                     "current_progress": int(stats["partition_progress"]),
-                    "total_partitions": stats["total_partitions"],
-                    "completed_partitions": stats["completed_partitions"],
                     "current_partition": stats["current_partition"],
                     "current_rows": stats["current_partition_rows"],
-                    "speed": stats["instant_rows_per_sec"],
+                    "current_indeterminate": current_indeterminate,
                 }
             )
+        self.progress.emit(progress_data)
 
-            self.last_metric_update = current_time
+        self.last_metric_update = current_time
 
     def get_stats(self) -> dict[str, Any]:
         """통계 정보 반환 (오버라이드 - 성능 지표 사용)"""

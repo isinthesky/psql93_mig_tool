@@ -299,6 +299,26 @@ class TestCopyMigrationWorkerRefactoring:
         assert stats == mock_stats
         worker.performance_metrics.get_stats.assert_called_once()
 
+    def test_copy_worker_emits_indeterminate_and_completed_progress(self, mock_profile):
+        worker = CopyMigrationWorker(mock_profile, ["partition_1", "partition_2"], history_id=1)
+        worker.performance_metrics.total_partitions = 2
+        seen = []
+        worker.progress.connect(seen.append)
+
+        worker.performance_metrics.start_partition("partition_1", 100)
+        worker._emit_performance_metrics(force=True, current_indeterminate=True)
+
+        assert seen[-1]["current_indeterminate"] is True
+        assert seen[-1]["current_partition"] == "partition_1"
+
+        worker.performance_metrics.update(100, 1024)
+        worker.performance_metrics.complete_partition()
+        worker._emit_performance_metrics(force=True)
+
+        assert seen[-1]["total_progress"] == 50
+        assert seen[-1]["completed_partitions"] == 1
+        assert "current_progress" not in seen[-1]
+
 
 class TestCheckpointCaching:
     """체크포인트 딕셔너리 캐싱 검증"""

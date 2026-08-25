@@ -1,6 +1,8 @@
 """디자인 토큰과 계기 위젯 테스트"""
 
 import pytest
+import qdarkstyle
+from PySide6.QtWidgets import QPushButton
 
 from src.ui import theme
 
@@ -29,6 +31,27 @@ class TestTheme:
         qss = theme.build_stylesheet()
         for name in ("newProfileButton", "primaryAction", "startButton", "migrationButton"):
             assert f"QPushButton#{name}:disabled" in qss, f"{name}의 비활성 스타일이 없습니다"
+
+    def test_run_actions_have_semantic_color_selectors(self):
+        qss = theme.build_stylesheet()
+
+        assert "QPushButton#startButton, QPushButton#migrationButton" in qss
+        assert "QPushButton#cancelAction" in qss
+        assert "QPushButton#cancelAction:disabled" in qss
+
+    def test_disabled_button_keeps_enabled_size(self, qapp):
+        previous_stylesheet = qapp.styleSheet()
+        try:
+            qapp.setStyleSheet(
+                qdarkstyle.load_stylesheet(qt_api="pyside6") + theme.build_stylesheet()
+            )
+            enabled = QPushButton("기준 버튼")
+            disabled = QPushButton("기준 버튼")
+            disabled.setEnabled(False)
+
+            assert disabled.sizeHint() == enabled.sizeHint()
+        finally:
+            qapp.setStyleSheet(previous_stylesheet)
 
     def test_log_color_falls_back_to_body_text(self):
         assert theme.log_color("ERROR") == theme.LOG_LEVEL_COLORS["ERROR"]

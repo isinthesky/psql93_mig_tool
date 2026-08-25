@@ -175,6 +175,32 @@ class TestWizardPartitionList:
 
 
 class TestWizardNavigation:
+    def test_default_dialog_size_and_compact_date_row(self, wizard):
+        assert wizard.size().toTuple() == (1000, 1200)
+
+        date_group = wizard.start_date_edit.parentWidget()
+        assert date_group.layout().count() == 1
+        date_row = date_group.layout().itemAt(0).layout()
+        assert date_row.indexOf(wizard.start_date_edit) >= 0
+        assert date_row.indexOf(wizard.preset_today_btn) >= 0
+        assert date_row.indexOf(wizard.preset_30d_btn) >= 0
+
+    def test_run_summary_uses_two_columns(self, wizard):
+        wizard._refresh_summary()
+
+        summary_layout = wizard.summary_labels[0].parentWidget().layout()
+        assert len(wizard.summary_labels) == 6
+        assert summary_layout.getItemPosition(summary_layout.indexOf(wizard.summary_labels[0]))[
+            :2
+        ] == (0, 0)
+        assert summary_layout.getItemPosition(summary_layout.indexOf(wizard.summary_labels[1]))[
+            :2
+        ] == (0, 1)
+        assert summary_layout.getItemPosition(summary_layout.indexOf(wizard.summary_labels[5]))[
+            :2
+        ] == (2, 1)
+        assert all(not label.isHidden() for label in wizard.summary_labels)
+
     def test_back_is_locked_after_a_run_started(self, wizard):
         """이미 실행한 뒤 범위를 다시 고르면 선택과 작업 이력이 어긋난다."""
         wizard.pages.setCurrentIndex(2)
@@ -207,6 +233,54 @@ class TestWizardNavigation:
         wizard.go_next()
         assert wizard.pages.currentIndex() == 2
         assert wizard._frozen_selection == ["tbl_a", "tbl_b"]
+
+
+class TestWizardProgress:
+    def test_start_is_rightmost_with_cancel_immediately_before_it(self, wizard):
+        controls = wizard.start_btn.parentWidget().layout()
+
+        assert controls.itemAt(controls.count() - 1).widget() is wizard.start_btn
+        assert controls.itemAt(controls.count() - 2).widget() is wizard.cancel_btn
+
+    def test_server_copy_uses_busy_indicator_until_percent_is_known(self, wizard):
+        wizard.on_progress(
+            {
+                "total_progress": 0,
+                "total_partitions": 2,
+                "completed_partitions": 0,
+                "current_progress": 0,
+                "current_partition": "tbl_a",
+                "current_rows": 0,
+                "current_indeterminate": True,
+                "speed": 0,
+            }
+        )
+
+        assert wizard.current_progress.minimum() == 0
+        assert wizard.current_progress.maximum() == 0
+        assert "Server-side COPY 진행 중" in wizard.current_label.text()
+
+        wizard.on_progress(
+            {
+                "current_progress": 37,
+                "current_partition": "tbl_a",
+                "current_rows": 370,
+                "current_indeterminate": False,
+            }
+        )
+
+        assert wizard.current_progress.minimum() == 0
+        assert wizard.current_progress.maximum() == 100
+        assert wizard.current_progress.value() == 37
+        assert wizard.current_label.text() == "tbl_a (370 rows)"
+
+    def test_terminal_transition_restores_percent_range(self, wizard):
+        wizard._set_current_progress_indeterminate(True)
+
+        wizard._set_run_state("failed")
+
+        assert wizard.current_progress.minimum() == 0
+        assert wizard.current_progress.maximum() == 100
 
 
 class TestArchiveRunState:

@@ -341,15 +341,15 @@ class FileArchiveMigrationDialog(ScanHostMixin, QDialog):
         # `pause()`를 호출해도 계속 돈다. 눌러도 안 멈추는 버튼을 두느니
         # 없는 게 낫다 — 취소는 실제로 동작한다.
         self.cancel_btn = QPushButton("작업 취소")
-        self.cancel_btn.setObjectName("dangerAction")
+        self.cancel_btn.setObjectName("cancelAction")
         self.cancel_btn.setToolTip("진행 중인 작업을 멈춥니다. 완료된 파티션은 그대로 남습니다.")
         self.cancel_btn.setEnabled(False)
         self.cancel_btn.clicked.connect(self.cancel_migration)
         for btn in (self.start_btn, self.cancel_btn):
             btn.setAutoDefault(False)
-        controls.addWidget(self.start_btn)
         controls.addStretch(1)
         controls.addWidget(self.cancel_btn)
+        controls.addWidget(self.start_btn)
         layout.addLayout(controls)
         return page
 

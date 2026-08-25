@@ -28,6 +28,7 @@ from PySide6.QtWidgets import (
     QDateEdit,
     QDialog,
     QFrame,
+    QGridLayout,
     QGroupBox,
     QHBoxLayout,
     QLabel,
@@ -168,7 +169,7 @@ class MigrationWizardDialog(ScanHostMixin, QDialog):
     def setup_ui(self):
         self.setWindowTitle(f"마이그레이션 마법사 - {self.profile.name}")
         self.setModal(True)
-        self.resize(1000, 850)
+        self.resize(1000, 1200)
 
         root = QVBoxLayout(self)
 
@@ -429,10 +430,8 @@ class MigrationWizardDialog(ScanHostMixin, QDialog):
         self.end_date_edit.setCalendarPopup(True)
         self.end_date_edit.dateChanged.connect(self._on_scan_condition_changed)
         row_dates.addWidget(self.end_date_edit)
-        row_dates.addStretch(1)
-        date_layout.addLayout(row_dates)
+        row_dates.addSpacing(16)
 
-        preset = QHBoxLayout()
         self.preset_today_btn = QPushButton("오늘")
         self.preset_yesterday_btn = QPushButton("어제")
         self.preset_7d_btn = QPushButton("최근 7일")
@@ -449,9 +448,9 @@ class MigrationWizardDialog(ScanHostMixin, QDialog):
         ):
             btn.setProperty("variant", "chip")
             btn.setAutoDefault(False)
-            preset.addWidget(btn)
-        preset.addStretch(1)
-        date_layout.addLayout(preset)
+            row_dates.addWidget(btn)
+        row_dates.addStretch(1)
+        date_layout.addLayout(row_dates)
 
         layout.addWidget(date_group)
 
@@ -549,12 +548,25 @@ class MigrationWizardDialog(ScanHostMixin, QDialog):
 
     def _create_run_summary_group(self) -> QGroupBox:
         group = QGroupBox("실행 요약")
-        layout = QVBoxLayout(group)
-        self.summary_label = QLabel("")
-        self.summary_label.setProperty("role", "summary")
-        self.summary_label.setWordWrap(True)
-        layout.addWidget(self.summary_label)
+        layout = QGridLayout(group)
+        layout.setHorizontalSpacing(24)
+        layout.setVerticalSpacing(4)
+        layout.setColumnStretch(0, 1)
+        layout.setColumnStretch(1, 1)
+
+        self.summary_labels: list[QLabel] = []
+        for index in range(6):
+            label = QLabel("")
+            label.setProperty("role", "summary")
+            label.setWordWrap(True)
+            layout.addWidget(label, index // 2, index % 2)
+            self.summary_labels.append(label)
         return group
+
+    def _set_summary_items(self, items: list[str]) -> None:
+        for index, label in enumerate(self.summary_labels):
+            label.setText(items[index] if index < len(items) else "")
+            label.setVisible(index < len(items))
 
     def _create_progress_group(self) -> QGroupBox:
         group = QGroupBox("진행 상황")
@@ -626,26 +638,24 @@ class MigrationWizardDialog(ScanHostMixin, QDialog):
         self.pause_btn.clicked.connect(self.pause_migration)
         self.pause_btn.setEnabled(False)
 
-        layout.addWidget(self.start_btn)
-        layout.addWidget(self.pause_btn)
-
         self.verify_btn = QPushButton("검증 실행")
         self.verify_btn.setToolTip(
             "실행한 파티션의 소스/대상 행 수를 COUNT(*)로 비교합니다. 시간이 오래 걸릴 수 있습니다."
         )
         self.verify_btn.clicked.connect(self.run_rowcount_verification)
         self.verify_btn.setEnabled(False)
-        layout.addWidget(self.verify_btn)
-
-        # 파괴적 액션 분리
-        layout.addStretch(1)
 
         self.cancel_btn = QPushButton("작업 취소")
-        self.cancel_btn.setObjectName("dangerAction")
+        self.cancel_btn.setObjectName("cancelAction")
         self.cancel_btn.setToolTip("진행 중인 작업을 멈춥니다. 완료된 파티션은 그대로 남습니다.")
         self.cancel_btn.clicked.connect(self.cancel_migration)
         self.cancel_btn.setEnabled(False)
+
+        layout.addWidget(self.pause_btn)
+        layout.addWidget(self.verify_btn)
+        layout.addStretch(1)
         layout.addWidget(self.cancel_btn)
+        layout.addWidget(self.start_btn)
 
         for btn in (self.start_btn, self.pause_btn, self.verify_btn, self.cancel_btn):
             btn.setAutoDefault(False)
@@ -796,6 +806,8 @@ class MigrationWizardDialog(ScanHostMixin, QDialog):
         self.run_detail_label.setText(detail)
 
         running = state in ("running", "paused")
+        if not running:
+            self._set_current_progress_indeterminate(False)
         # 실행 상태가 갈리는 유일한 지점이므로 트레이 통지도 여기서 낸다.
         # 각 핸들러에서 따로 알리면 한 경로만 빠져도 트레이가 계속 '실행 중'으로 남는다.
         self.migration_running_changed.emit(running)
@@ -1469,7 +1481,7 @@ class MigrationWizardDialog(ScanHostMixin, QDialog):
                 f"파티션      {len(parts):,}개 (미완료만)",
                 f"에러 처리   {error_text}",
             ]
-            self.summary_label.setText("\n".join(lines))
+            self._set_summary_items(lines)
             return
 
         start_date = self.start_date_edit.date().toPython()
@@ -1485,7 +1497,7 @@ class MigrationWizardDialog(ScanHostMixin, QDialog):
             f"파티션      {len(parts):,}개 · {format_row_count(*self._row_total(parts))}",
             f"에러 처리   {error_text} · 배치 {int(self.batch_size_spin.value()):,} rows",
         ]
-        self.summary_label.setText("\n".join(lines))
+        self._set_summary_items(lines)
 
     def start_migration(self):
         if self.worker and self.worker.isRunning():
@@ -1773,7 +1785,12 @@ class MigrationWizardDialog(ScanHostMixin, QDialog):
             if self.run_state in ("running", "paused"):
                 self.run_detail_label.setText(f"파티션 {done} / {total} 완료")
 
-        if "current_progress" in data:
+        if data.get("current_indeterminate", False):
+            self._set_current_progress_indeterminate(True)
+            part = data.get("current_partition", "")
+            self.current_label.setText(f"{part} (Server-side COPY 진행 중)")
+        elif "current_progress" in data:
+            self._set_current_progress_indeterminate(False)
             self.current_progress.setValue(int(data["current_progress"]))
             part = data.get("current_partition", "")
             rows = int(data.get("current_rows", 0) or 0)
@@ -1781,6 +1798,12 @@ class MigrationWizardDialog(ScanHostMixin, QDialog):
 
         if "speed" in data:
             self.speed_metric.set_value(f"{int(data['speed']):,} rows/s")
+
+    def _set_current_progress_indeterminate(self, active: bool):
+        if active:
+            self.current_progress.setRange(0, 0)
+        elif self.current_progress.minimum() == 0 and self.current_progress.maximum() == 0:
+            self.current_progress.setRange(0, 100)
 
     def on_performance_update(self, stats: dict):
         rows_per_sec = float(stats.get("instant_rows_per_sec", 0) or 0)
@@ -1814,6 +1837,7 @@ class MigrationWizardDialog(ScanHostMixin, QDialog):
         was_normal_completion = self.worker and getattr(self.worker, "is_running", False)
         if self.worker:
             self.worker.is_running = False
+        self._set_current_progress_indeterminate(False)
 
         # 오류 케이스는 on_error에서 status=failed 처리하므로 여기선 건드리지 않는다.
         if getattr(self, "_worker_had_error", False):
