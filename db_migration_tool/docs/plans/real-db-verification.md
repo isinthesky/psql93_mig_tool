@@ -34,28 +34,28 @@ WHERE datname = current_database() AND pid <> pg_backend_pid();
 
 ```sql
 -- 1) 물리 테이블 생성 + 데이터 적재
-CREATE TABLE point_history_991231 (LIKE point_history INCLUDING ALL);
-INSERT INTO point_history_991231 SELECT * FROM point_history_<실데이터> LIMIT 50000;
+CREATE TABLE history_data_991231 (LIKE history_data INCLUDING ALL);
+INSERT INTO history_data_991231 SELECT * FROM history_data_<실데이터> LIMIT 50000;
 
 -- 2) 메타 테이블에도 등록한다.
 --    등록하지 않으면 물리 테이블 패턴 fallback 경로로만 발견되어,
 --    1차 탐색 경로(partition_table_info)를 확인하지 못한다.
 --    from_date/to_date는 **밀리초** 타임스탬프다. table_data는 타입 코드
---    (PH=point_history, PS=point_sec_history, TH=trend_history,
+--    (PH=history_data, PS=point_sec_history, TH=trend_history,
 --     ED=energy_display, RT=running_time_history).
 INSERT INTO partition_table_info (table_name, table_data, from_date, to_date, use_flag)
-VALUES ('point_history_991231', 'PH', 4102326000000, 4102412399999, true);
+VALUES ('history_data_991231', 'PH', 4102326000000, 4102412399999, true);
 
 -- 3) ANALYZE 하지 않는다. reltuples가 0(9.3) 또는 -1(14+)로 남아야 한다.
-SELECT relname, reltuples FROM pg_class WHERE relname = 'point_history_991231';
+SELECT relname, reltuples FROM pg_class WHERE relname = 'history_data_991231';
 ```
 
 **UI에서 날짜 범위를 `2099-12-31`로 맞춰야** 이 파티션이 탐색된다.
 
 정리:
 ```sql
-DROP TABLE point_history_991231;
-DELETE FROM partition_table_info WHERE table_name = 'point_history_991231';
+DROP TABLE history_data_991231;
+DELETE FROM partition_table_info WHERE table_name = 'history_data_991231';
 ```
 
 ---
@@ -69,7 +69,7 @@ DELETE FROM partition_table_info WHERE table_name = 'point_history_991231';
   - **실패 신호**: `0행, 건너뜀`으로 넘어가고 체크포인트가 `completed`가 된다
 - [ ] **A-2** 실행 후 대상에서 행 수 대조
   ```sql
-  SELECT count(*) FROM point_history_991231;  -- 50000이어야 한다
+  SELECT count(*) FROM history_data_991231;  -- 50000이어야 한다
   ```
 - [ ] **A-3** 소스에 **진짜 빈 파티션**(0행)을 하나 넣고 실행 — 이건 건너뛰어야 한다
   - **실패 신호**: 빈 테이블에 COPY를 시도하다 오류

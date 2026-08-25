@@ -7,17 +7,17 @@
 - **Database**: bms93 (PostgreSQL 9.3)
 - **Host**: localhost:5432
 
-## Partition Table Types Found
+## Data Table Types Found
 
-### 1. Point History (PH)
-- **Parent Table**: `point_history`
+### 1. History Data (PH)
+- **Parent Table**: `history_data`
 - **Partition Count**: Not counted (uses TRIGGER-based partitioning)
 - **Partitioning Mechanism**: **TRIGGER**
-- **Trigger**: `point_history_trigger` → `point_history_partition_insert()` function
+- **Trigger**: `history_data_trigger` → `history_data_partition_insert()` function
 
 #### Schema
 ```sql
-CREATE TABLE point_history (
+CREATE TABLE history_data (
     path_id              bigint NOT NULL,
     issued_date          bigint NOT NULL,           -- Unix timestamp (ms)
     changed_value        character varying(100),
@@ -27,7 +27,7 @@ CREATE TABLE point_history (
 
 #### Partitioning Logic
 - **Type**: BEFORE INSERT TRIGGER
-- **Function**: `point_history_partition_insert()`
+- **Function**: `history_data_partition_insert()`
 - **Date Column**: `issued_date` (bigint - Unix timestamp in milliseconds)
 
 ---
@@ -166,7 +166,7 @@ CREATE RULE rule_running_time_history_1811 AS
 ### Partitioning Mechanisms
 | Table Type | Mechanism | Count | Date Type | Date Column |
 |------------|-----------|-------|-----------|-------------|
-| point_history | TRIGGER | N/A | bigint | issued_date |
+| history_data | TRIGGER | N/A | bigint | issued_date |
 | trend_history | RULES | 59 | bigint | issued_date |
 | energy_display | RULES | 59 | timestamp | issued_date |
 | running_time_history | RULES | 59 | bigint | issued_date |
@@ -179,11 +179,11 @@ CREATE RULE rule_running_time_history_1811 AS
    - This requires different WHERE clause generation for RULES
 
 2. **Partitioning Strategy**:
-   - `point_history`: Dynamic TRIGGER-based (calls PL/pgSQL function)
+   - `history_data`: Dynamic TRIGGER-based (calls PL/pgSQL function)
    - Others: Static RULE-based (one rule per partition)
 
 3. **Schema Complexity**:
-   - `point_history`, `trend_history`: 4 columns (simple)
+   - `history_data`, `trend_history`: 4 columns (simple)
    - `energy_display`: 6 columns (medium)
    - `running_time_history`: 10 columns (complex)
 
@@ -193,12 +193,12 @@ CREATE RULE rule_running_time_history_1811 AS
 
 ### For `partition_discovery.py`
 - Must support filtering by multiple table types
-- Query should use `IN ('point_history', 'trend_history', ...)` clause
+- Query should use `IN ('history_data', 'trend_history', ...)` clause
 - May need table-specific logic for partition naming patterns
 
 ### For `table_creator.py`
 - Must detect table type and choose:
-  - **TRIGGER** generation for `point_history`
+  - **TRIGGER** generation for `history_data`
   - **RULE** generation for `trend_history`, `energy_display`, `running_time_history`
 - Must handle different date column types:
   - `bigint` for PH, TH, RT

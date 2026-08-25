@@ -4,7 +4,7 @@
 2025-11-19
 
 ## 🎯 Goal
-Enhance the database migration tool to support multiple partition table types (Point History, Trend History, Energy Display, Running Time History) instead of just Point History.
+Enhance the database migration tool to support multiple data table types (History Data, Trend History, Energy Display, Running Time History) instead of just History Data.
 
 ---
 
@@ -21,7 +21,7 @@ Enhance the database migration tool to support multiple partition table types (P
 **Key Findings**:
 | Table Type | Mechanism | Rule/Trigger Count | Date Column Type |
 |------------|-----------|-------------------|------------------|
-| `point_history` | TRIGGER | 1 trigger | bigint (ms) |
+| `history_data` | TRIGGER | 1 trigger | bigint (ms) |
 | `trend_history` | RULES | 59 rules | bigint (ms) |
 | `energy_display` | RULES | 59 rules | **timestamp** |
 | `running_time_history` | RULES | 59 rules | bigint (ms) |
@@ -40,7 +40,7 @@ Enhance the database migration tool to support multiple partition table types (P
 **Key Components**:
 ```python
 class TableType(str, Enum):
-    POINT_HISTORY = "PH"
+    HISTORY_DATA = "PH"
     TREND_HISTORY = "TH"
     ENERGY_DISPLAY = "ED"
     RUNNING_TIME_HISTORY = "RT"
@@ -68,7 +68,7 @@ class TableType(str, Enum):
 - ✅ Added `table_types: Optional[List[TableType]]` parameter to `discover_partitions()`
 - ✅ Modified SQL query to use `IN` clause for multiple table types
 - ✅ Added `table_type` (enum) and `table_type_code` to return dict
-- ✅ Maintained backward compatibility (default: `[TableType.POINT_HISTORY]`)
+- ✅ Maintained backward compatibility (default: `[TableType.HISTORY_DATA]`)
 
 **Before**:
 ```python
@@ -99,7 +99,7 @@ def discover_partitions(
 **New Methods**:
 1. `_create_trigger_based_partitioning()`
    - Creates TRIGGER function and trigger
-   - Point History only
+   - History Data only
 
 2. `_create_parent_indexes()`
    - Creates appropriate indexes per table type
@@ -139,9 +139,9 @@ else:
 - ✅ Enhanced partition list display with table type labels
 
 **UI Features**:
-- 4 checkboxes: Point History, Trend History, Energy Display, Running Time History
+- 4 checkboxes: History Data, Trend History, Energy Display, Running Time History
 - Tooltips showing description for each type
-- Point History checked by default (backward compatibility)
+- History Data checked by default (backward compatibility)
 - Minimum 1 type must be selected (validation)
 - Partition list shows: `[Table Type] partition_name (row_count)`
 
@@ -205,13 +205,13 @@ from .table_types import (
 ## 🔄 Backward Compatibility
 
 ### Maintained Compatibility
-- ✅ `discover_partitions()` defaults to `[TableType.POINT_HISTORY]`
-- ✅ UI defaults to Point History checkbox checked
+- ✅ `discover_partitions()` defaults to `[TableType.HISTORY_DATA]`
+- ✅ UI defaults to History Data checkbox checked
 - ✅ Existing migrations work without changes
 - ✅ All existing tests should pass (if available)
 
 ### Migration Path
-- Old code: Still works (defaults to Point History)
+- Old code: Still works (defaults to History Data)
 - New code: Can select multiple table types
 - No breaking changes to existing functionality
 
@@ -219,11 +219,11 @@ from .table_types import (
 
 ## 📊 Database Schema Support
 
-### TRIGGER-based (Point History)
+### TRIGGER-based (History Data)
 ```sql
-CREATE TRIGGER point_history_trigger
-BEFORE INSERT ON point_history
-FOR EACH ROW EXECUTE PROCEDURE point_history_partition_insert();
+CREATE TRIGGER history_data_trigger
+BEFORE INSERT ON history_data
+FOR EACH ROW EXECUTE PROCEDURE history_data_partition_insert();
 ```
 
 ### RULE-based (TH, ED, RT)
@@ -261,7 +261,7 @@ DO INSTEAD INSERT INTO trend_history_1811 (...);
 4. Attempt migration with TH/ED/RT tables
 5. Query target database to verify:
    - Parent table created with correct columns
-   - Partition tables created with correct constraints
+   - Data tables created with correct constraints
    - RULES created (for TH/ED/RT) or TRIGGER (for PH)
    - Data migrated correctly
 
@@ -343,8 +343,8 @@ The RULE generation dynamically constructs INSERT statements based on `TABLE_TYP
 
 ## ✨ Summary
 
-This implementation successfully extends the DB Migration Tool to support all 4 partition table types:
-- ✅ **Point History** (TRIGGER-based, bigint)
+This implementation successfully extends the DB Migration Tool to support all 4 data table types:
+- ✅ **History Data** (TRIGGER-based, bigint)
 - ✅ **Trend History** (RULE-based, bigint)
 - ✅ **Energy Display** (RULE-based, **timestamp**)
 - ✅ **Running Time History** (RULE-based, bigint)

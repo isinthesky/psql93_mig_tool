@@ -19,41 +19,41 @@ CREATE TABLE public.partition_table_info (
 
 ---
 
-point_history_240920	PH	1726758000000	1726844399999	true	2024-09-19 00:30:00.075	true
-point_history_240921	PH	1726844400000	1726930799999	true	2024-09-20 00:30:00.025	true
-point_history_240922	PH	1726930800000	1727017199999	true	2024-09-21 00:30:00.054	true
+history_data_240920	PH	1726758000000	1726844399999	true	2024-09-19 00:30:00.075	true
+history_data_240921	PH	1726844400000	1726930799999	true	2024-09-20 00:30:00.025	true
+history_data_240922	PH	1726930800000	1727017199999	true	2024-09-21 00:30:00.054	true
 trend_history_2002	TH	1580482800000	1582988399999	true	2020-01-01 00:30:00.616	true
 trend_history_1808	TH	1533049200000	1535727599999	true	2018-07-01 00:30:00.356	true
 energy_display_2002	ED	1580482800000	1582988399999	true	2020-01-01 00:30:00.467	true
 trend_history_2402	TH	1706713200000	1709218799999	true	2024-01-01 00:30:00.917	true
-point_history_240923	PH	1727017200000	1727103599999	true	2024-09-22 00:30:00.110	true
+history_data_240923	PH	1727017200000	1727103599999	true	2024-09-22 00:30:00.110	true
 energy_display_2402	ED	1706713200000	1709218799999	true	2024-01-01 00:30:00.696	true
 running_time_history_2106	RT	1622473200000	1625065199999	true	2021-05-01 00:30:00.113	false
-point_history_240924	PH	1727103600000	1727189999999	true	2024-09-23 00:30:00.019	true
-point_history_240925	PH	1727190000000	1727276399999	true	2024-09-24 00:30:00.017	true
-point_history_240926	PH	1727276400000	1727362799999	true	2024-09-25 00:30:00.056	true
-point_history_240927	PH	1727362800000	1727449199999	true	2024-09-26 00:30:00.060	true
-point_history_240928	PH	1727449200000	1727535599999	true	2024-09-27 00:30:00.034	true
+history_data_240924	PH	1727103600000	1727189999999	true	2024-09-23 00:30:00.019	true
+history_data_240925	PH	1727190000000	1727276399999	true	2024-09-24 00:30:00.017	true
+history_data_240926	PH	1727276400000	1727362799999	true	2024-09-25 00:30:00.056	true
+history_data_240927	PH	1727362800000	1727449199999	true	2024-09-26 00:30:00.060	true
+history_data_240928	PH	1727449200000	1727535599999	true	2024-09-27 00:30:00.034	true
 
 
 ---
 
-## point_history
+## history_data
 
--- public.point_history definition
+-- public.history_data definition
 
 -- Drop table
 
--- DROP TABLE public.point_history;
+-- DROP TABLE public.history_data;
 
-CREATE TABLE public.point_history (
+CREATE TABLE public.history_data (
 	path_id int8 NOT NULL,
 	issued_date int8 NOT NULL,
 	changed_value varchar(100) NULL,
 	connection_status bool NULL
 );
-CREATE INDEX point_history_path_id_date ON public.point_history USING btree (path_id, issued_date);
-CREATE INDEX point_history_path_id_idx ON public.point_history USING btree (path_id);
+CREATE INDEX history_data_path_id_date ON public.history_data USING btree (path_id, issued_date);
+CREATE INDEX history_data_path_id_idx ON public.history_data USING btree (path_id);
 
 ---
 
@@ -114,18 +114,18 @@ CREATE INDEX point_history_path_id_idx ON public.point_history USING btree (path
 
 ---
 
-## point_history_{YYMMDD}
+## history_data_{YYMMDD}
 
--- public.point_history_231216 definition
+-- public.history_data_231216 definition
 
 -- Drop table
 
--- DROP TABLE public.point_history_231216;
+-- DROP TABLE public.history_data_231216;
 
-CREATE TABLE public.point_history_231216 (
-	CONSTRAINT point_history_231216_issued_date_check CHECK (((issued_date >= 1702652400000::bigint) AND (issued_date <= 1702738799999::bigint)))
+CREATE TABLE public.history_data_231216 (
+	CONSTRAINT history_data_231216_issued_date_check CHECK (((issued_date >= 1702652400000::bigint) AND (issued_date <= 1702738799999::bigint)))
 )
-INHERITS (public.point_history);
+INHERITS (public.history_data);
 
 ---
 
@@ -218,9 +218,9 @@ $function$
 
 ---
 
--- DROP FUNCTION public.get_point_history_tz_offset();
+-- DROP FUNCTION public.get_history_data_tz_offset();
 
-CREATE OR REPLACE FUNCTION public.get_point_history_tz_offset()
+CREATE OR REPLACE FUNCTION public.get_history_data_tz_offset()
  RETURNS bigint
  LANGUAGE sql
 AS $function$
@@ -232,9 +232,9 @@ $function$
 
 ---
 
--- DROP FUNCTION public.point_history_partition_insert();
+-- DROP FUNCTION public.history_data_partition_insert();
 
-CREATE OR REPLACE FUNCTION public.point_history_partition_insert()
+CREATE OR REPLACE FUNCTION public.history_data_partition_insert()
  RETURNS trigger
  LANGUAGE plpgsql
 AS $function$
@@ -246,7 +246,7 @@ BEGIN
     _insert_time := (NEW.issued_date/1000)::bigint; -- conversion time from milliseconds to seconds
     _insert_date := to_char(to_timestamp(_insert_time), 'YYMMDD');
  
-    EXECUTE  'INSERT INTO point_history_'||_insert_date||' VALUES ($1.*);' USING NEW;
+    EXECUTE  'INSERT INTO history_data_'||_insert_date||' VALUES ($1.*);' USING NEW;
  
     RETURN NULL;
 END;
@@ -256,9 +256,9 @@ $function$
 
 --- 
 
--- DROP FUNCTION public.point_history_pt(text, text, int8, int8);
+-- DROP FUNCTION public.history_data_pt(text, text, int8, int8);
 
-CREATE OR REPLACE FUNCTION public.point_history_pt(text, text, bigint, bigint)
+CREATE OR REPLACE FUNCTION public.history_data_pt(text, text, bigint, bigint)
  RETURNS integer
  LANGUAGE plpgsql
 AS $function$
@@ -268,12 +268,12 @@ data record;
 rtval integer;
 
 BEGIN
-EXECUTE 'SELECT tablename from pg_tables where tablename=''point_history_'||$1||''' AND schemaname=''public''' INTO data;
+EXECUTE 'SELECT tablename from pg_tables where tablename=''history_data_'||$1||''' AND schemaname=''public''' INTO data;
 
 IF data.tablename is null THEN
-	EXECUTE 'CREATE TABLE point_history_'||$1||' (PRIMARY KEY(path_id, issued_date), CHECK(issued_date >= '||$3||' AND issued_date <= '||$4||')) INHERITS (point_history);
-	INSERT INTO partition_table_info VALUES(''point_history_'||$1||''', '''||$2||''', '||$3||', '||$4||', ''Y'', NOW());
-	CLUSTER point_history_'||$1||' USING point_history_'||$1||'_pkey;';
+	EXECUTE 'CREATE TABLE history_data_'||$1||' (PRIMARY KEY(path_id, issued_date), CHECK(issued_date >= '||$3||' AND issued_date <= '||$4||')) INHERITS (history_data);
+	INSERT INTO partition_table_info VALUES(''history_data_'||$1||''', '''||$2||''', '||$3||', '||$4||', ''Y'', NOW());
+	CLUSTER history_data_'||$1||' USING history_data_'||$1||'_pkey;';
 	rtval = 1;
 ELSE
 	rtval = 0;
