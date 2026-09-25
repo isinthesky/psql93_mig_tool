@@ -6,18 +6,22 @@ import pytest
 
 from src.models.history import CheckpointManager, HistoryManager
 from src.models.profile import ProfileManager
+from src.utils.secret_store import WrappedKeyFile
+from tests.utils.fake_protectors import FakeDpapi
 
 
 class TestProfileManager:
     """ProfileManager의 session_scope 적용 검증"""
 
     @pytest.fixture
-    def profile_manager(self, temp_db, monkeypatch):
-        """ProfileManager 픽스처 (temp_db 사용)"""
-        manager = ProfileManager()
-        # temp_db를 사용하도록 패치
-        monkeypatch.setattr(manager, "db", temp_db)
-        return manager
+    def profile_manager(self, temp_db, tmp_path):
+        """ProfileManager 픽스처 (temp_db + 임시 키 파일)
+
+        생성자가 키 준비·마이그레이션을 수행하므로, 실제 앱 데이터 디렉터리의 키 파일·DB를
+        건드리지 않도록 DB와 키 파일을 생성 시점에 주입한다.
+        """
+        key_file = WrappedKeyFile(tmp_path / ".encryption_key", FakeDpapi())
+        return ProfileManager(db=temp_db, key_file=key_file)
 
     def test_create_profile_with_session_scope(self, profile_manager, sample_profile_data):
         """create_profile이 session_scope를 사용하여 프로필을 생성하는지 확인"""
