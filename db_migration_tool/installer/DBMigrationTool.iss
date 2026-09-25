@@ -11,7 +11,7 @@
 ;   여기서는 인스톨러가 조용히 선설치한다.
 
 #define AppName "DB Migration Tool"
-#define AppVersion "1.2.5"
+#define AppVersion "1.2.6"
 #define AppPublisher "CIMON"
 #define ExeName "DBMigrationTool.exe"
 
