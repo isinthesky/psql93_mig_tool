@@ -203,6 +203,69 @@ class TestWizardResumeGate:
         item = hm.get_history(legacy.id)
         assert item is not None and item.plan_version == 1
 
+    def _truncated_legacy(self) -> int:
+        """구버전 H-09로 3일 범위에 checkpoint가 2개만 남은 legacy 이력."""
+        hm, cm = HistoryManager(), CheckpointManager()
+        legacy = hm.create_history(1, "2026-01-01", "2026-01-03")
+        assert legacy.id is not None
+        for name in PLAN[:2]:
+            cm.create_checkpoint(legacy.id, name)
+        return legacy.id
+
+    def test_legacy_gap_is_shown_and_supplemented_on_confirm(self, qtbot, db):
+        hid = self._truncated_legacy()
+        dlg = _wizard(qtbot, _profile())
+
+        with patch.object(resume_guard.QMessageBox, "question", return_value=YES) as question:
+            dlg._on_resume_clicked()
+
+        question.assert_called_once()
+        shown = question.call_args.args[2]
+        # 범위 대비 누락을 수치와 이름으로 보여 주고, 보충된다고 알린다.
+        assert "누락 1개" in shown
+        assert PLAN[2] in shown
+        assert "보충" in shown
+        # 남은 2개만이 아니라 범위 전체(3개)가 계획·재개 대상이 된다.
+        assert dlg.resume_mode is True
+        assert dlg._frozen_selection == PLAN
+        item = HistoryManager().get_history(hid)
+        assert item is not None and item.planned_count == 3
+
+    def test_legacy_gap_declined_writes_nothing(self, qtbot, db):
+        hid = self._truncated_legacy()
+        dlg = _wizard(qtbot, _profile())
+
+        with patch.object(resume_guard.QMessageBox, "question", return_value=NO):
+            dlg._on_resume_clicked()
+
+        assert dlg.resume_mode is False
+        item = HistoryManager().get_history(hid)
+        assert item is not None and item.plan_version is None
+        assert _counts(db) == (1, 2)
+
+    def test_legacy_with_unreadable_range_is_not_adopted(self, qtbot, db):
+        """범위를 모르면 누락을 확인할 수 없으므로 채택 확인 대신 거부·폐기 안내로 간다."""
+        hm, cm = HistoryManager(), CheckpointManager()
+        legacy = hm.create_history(1, "", "")
+        assert legacy.id is not None
+        cm.create_checkpoint(legacy.id, PLAN[0])
+        dlg = _wizard(qtbot, _profile())
+
+        with (
+            patch.object(resume_guard.QMessageBox, "warning") as warning,
+            patch.object(resume_guard.QMessageBox, "question", return_value=NO) as question,
+        ):
+            dlg._on_resume_clicked()
+
+        warning.assert_called_once()
+        assert "범위" in warning.call_args.args[2]
+        # 묻는 것은 폐기 여부 하나뿐이다(채택 확인 없음).
+        question.assert_called_once()
+        assert question.call_args.args[1] == "미완료 작업 폐기"
+        assert dlg.resume_mode is False
+        item = hm.get_history(legacy.id)
+        assert item is not None and item.plan_version is None
+
     def test_restart_after_stop_revalidates_plan(self, qtbot, db):
         """같은 창에서 중단 후 '다시 시작'도 계획 기준 pending을 쓴다."""
         hid = _planned_history()

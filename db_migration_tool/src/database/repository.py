@@ -304,17 +304,25 @@ class HistoryRepository(BaseRepository[MigrationHistory]):
             return [(name, status) for name, status in rows]
 
     def bind_legacy_plan(
-        self, history_id: int, expected_partitions: Iterable[str], **plan_fields: Any
+        self,
+        history_id: int,
+        expected_partitions: Iterable[str],
+        *,
+        add_partitions: Iterable[str] = (),
+        **plan_fields: Any,
     ) -> bool:
         """계획이 없는(legacy) 이력에 계획·identity를 한 번만 기록한다.
 
         같은 트랜잭션에서 (1) 아직 legacy인지, (2) checkpoint 집합이 확인 시점과
         같은지를 다시 보고 기록한다. 둘 중 하나라도 어긋나면 아무것도 쓰지 않는다.
+        `add_partitions`(범위 대비 누락 보충분)는 계획 기록과 **같은 트랜잭션**에서
+        pending checkpoint로 만든다 — 보충이 실패하면 계획 기록도 rollback된다.
 
         Returns:
             기록했으면 True, 이미 계획이 있거나 집합이 바뀌었으면 False.
         """
         expected = sorted(set(expected_partitions))
+        extra = sorted(set(add_partitions) - set(expected))
         with self._session_scope() as session:
             names = sorted(
                 {
@@ -326,13 +334,29 @@ class HistoryRepository(BaseRepository[MigrationHistory]):
             )
             if names != expected:
                 return False
+            # 조건부 UPDATE를 먼저 한다. 0건이면 아직 아무것도 쓰지 않았다.
             updated = (
                 session.query(MigrationHistory)
                 .filter(MigrationHistory.id == history_id)
                 .filter(MigrationHistory.plan_version.is_(None))
                 .update(dict[Any, Any](plan_fields), synchronize_session=False)
             )
-            return updated == 1
+            if updated != 1:
+                return False
+            if extra:
+                session.execute(
+                    insert(Checkpoint),
+                    [
+                        {
+                            "history_id": history_id,
+                            "partition_name": name,
+                            "status": "pending",
+                            "rows_processed": 0,
+                        }
+                        for name in extra
+                    ],
+                )
+            return True
 
     def count_incomplete_by_profile(self, profile_id: int) -> int:
         """프로필에 남은 미완료 이력 수(M-12 삭제 차단 판정)."""

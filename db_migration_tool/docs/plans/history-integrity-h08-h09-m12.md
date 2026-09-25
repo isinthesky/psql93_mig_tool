@@ -59,19 +59,44 @@ checkpoint bulk INSERT → commit한다. 어느 INSERT에서 실패하든 histor
 ## 5. legacy 이력(지문 없음) 재개 정책
 
 기존 사용자 DB(Windows 기준 이력 56건 규모)의 이력은 새 컬럼이 전부 NULL이다.
-가짜 계획을 backfill하지 않는다 — 과거 checkpoint가 H-09로 일부 빠졌을 수 있어서, 남은 행으로
-계획을 만들면 그 누락을 '정상'으로 고정해 버린다.
+스키마 마이그레이션 때 가짜 계획을 backfill하지 않는다. 구버전은 checkpoint를 하나씩 commit했으므로
+(H-09) 일부가 빠져 있을 수 있고, **남은 행만으로 계획을 만들면 그 누락을 '정상'으로 고정해 버린다**
+— 사용자가 '예'를 한 번 누르면 일부 파티션만 처리하고 completed로 닫힌다(subset 완료).
+그래서 채택할 때 기록된 날짜 범위로 기대 집합을 다시 계산해 누락을 보충하게 한다.
 
-1. 자동 재개하지 않는다. `prepare_resume`은 `LEGACY`와 남은 미완료 목록만 돌려준다.
-2. UI는 다음을 보여 주고 **예/아니오(기본 아니오)**로 확인을 받는다.
-   - 연결 지문이 없어 같은 원본·대상인지 자동 확인할 수 없다는 사실
-   - 기록된 날짜 범위와 남아 있는 checkpoint 수(완료 수) — 범위의 파티션이 다 있는지 확인 요청
-   - 재개에 쓸 **현재 연결 라벨**
-3. "예"면 `adopt_legacy_history()`가 현재 identity와 **남아 있는 checkpoint 집합**을 계획으로 한 번
-   기록하고 `legacy_adopted_at`을 남긴다. 기록은 조건부 UPDATE(`plan_version IS NULL`)와 checkpoint
-   집합 재확인을 같은 트랜잭션에서 하므로 두 번 채택되거나 확인 중 바뀐 집합으로 채택되지 않는다.
-4. 채택 이후에는 일반 이력과 같이 엄격하게 검사한다(연결이 바뀌면 거부).
-5. checkpoint가 하나도 없는 legacy 이력은 계획을 복원할 근거가 없으므로 채택을 거부하고 폐기를 안내한다.
+1. 자동 재개하지 않는다. `prepare_resume`은 `LEGACY`와 남은 미완료 목록, 그리고 범위 대비
+   커버리지(`ResumeCheck.legacy: LegacyCoverage`)를 돌려준다.
+2. **커버리지 계산**(`LegacyCoverage.compute`, 로컬 데이터만 사용 — DB 재스캔 없음):
+   - 기대 집합 = 기록된 `start_date ~ end_date`와 파티션 명명 규칙(`legacy_range_candidates`):
+     daily 유형은 범위의 모든 날 `<table>_YYMMDD`, monthly 유형은 범위와 겹치는 모든 달 `<table>_YYMM`
+     (`PartitionDiscovery`의 겹침 규칙과 같다).
+   - legacy 이력은 당시 선택한 테이블 유형을 저장하지 않았다. **checkpoint가 하나라도 있는 유형**을
+     원래 선택된 유형으로 본다.
+   - `gaps` = 그 유형들의 기대 파티션 중 checkpoint가 없는 것. `absent_types` = checkpoint가 전혀
+     없는 유형의 범위 내 후보. `outside` = 범위 밖·규칙 밖 checkpoint(계획에 그대로 둔다).
+3. UI(`resolve_resume`)는 예/아니오(기본 아니오)로 확인을 받는다. 확인 창에는 다음을 수치로 보여 준다.
+   - 연결 지문이 없어 같은 원본·대상인지 자동 확인할 수 없다는 사실, 재개에 쓸 **현재 연결 라벨**
+   - 범위(일수), checkpoint가 있는 유형, 기대 개수, 남은 checkpoint 수(완료 수), **누락 개수와 이름**
+   - checkpoint가 없는 유형별 후보 수 — 원래 작업에 포함됐다면 이어서 진행하지 말고 새 작업으로
+     진행하라는 안내
+   - 범위를 해석할 수 없으면(빈 값·형식 오류·시작>끝) 채택 확인 없이 거부하고 폐기를 안내한다.
+4. "예"면 `adopt_legacy_history(..., supplement=gaps)`가 현재 identity와
+   **(남은 checkpoint ∪ 누락 보충분)**을 계획으로 한 번 기록하고 `legacy_adopted_at`을 남긴다.
+   - `gaps`를 전부 보충하지 않으면 `LegacyPlanGapError`로 거부한다(모델 계층 규칙 — UI를 거치지 않는
+     호출도 subset 채택을 할 수 없다).
+   - `supplement`는 범위의 기대 파티션이어야 한다(범위 밖 이름은 `ValueError`). `absent_types`의
+     후보는 명시적으로 넘길 때만 계획에 들어간다(UI는 넘기지 않는다).
+   - 보충 checkpoint INSERT와 계획 기록(조건부 UPDATE `plan_version IS NULL` + checkpoint 집합 재확인)을
+     **한 트랜잭션**에서 한다. 보충이 실패하면 계획 기록도 rollback되고, 두 번 채택되거나 확인 중 바뀐
+     집합으로 채택되지 않는다.
+   - 보충한 파티션이 원본에 없으면 워커가 0건 완료로 건너뛴다. 대상에 이미 데이터가 있으면(당시 사용자가
+     일부러 뺀 파티션) 워커가 TRUNCATE 여부를 묻는다 — 조용히 덮어쓰지 않는다.
+5. 채택 이후에는 일반 이력과 같이 엄격하게 검사한다(연결이 바뀌면 거부).
+6. checkpoint가 하나도 없는 legacy 이력은 유형을 추정할 근거가 없으므로 채택을 거부하고 폐기를 안내한다.
+7. 한계: checkpoint가 있는 유형 기준이라, 구버전 루프가 **유형 경계에서 정확히** 끊겨 뒤 유형이 통째로
+   빠진 경우는 `gaps`로 잡히지 않는다. 이 경우는 확인 창의 "checkpoint가 없는 유형" 수치로만 드러나며,
+   사용자가 새 작업으로 진행해야 한다. 원본 DB 재스캔(실제 존재 파티션 비교)은 하지 않는다 — 재개 확인이
+   UI 스레드에서 동기적으로 일어나고, 누락 보충분이 원본에 없어도 워커가 안전하게 건너뛰기 때문이다.
 
 ## 6. 프로필 수명주기 (M-12)
 
@@ -98,8 +123,9 @@ checkpoint bulk INSERT → commit한다. 어느 INSERT에서 실패하든 histor
 |---|---|
 | `tests/models/test_history_plan_integrity.py` | N번째(첫/중간/마지막) checkpoint INSERT를 SQLite 트리거로 실패 → history·checkpoint 0건, 계획 기준 pending, 누락 보충, 계획 변조·계획 밖 checkpoint 차단 |
 | `tests/models/test_history_endpoint_identity.py` | 지문 규칙(비밀번호·SSL 무시, 각 identity 필드 반영, 비밀 미포함), identity·방향·mode·schema 변경 거부, 비밀번호 교체 허용, legacy 확인·채택 |
+| `tests/models/test_history_legacy_coverage.py` | legacy 채택 커버리지: 리뷰 재현(범위 3일·checkpoint 2개) 누락 보고, 보충 없는 채택 거부(무기록), 보충 채택 시 범위 전체 계획, 월 단위 누락, 범위 밖 checkpoint 유지, 범위 밖 보충 거부, 범위 해석 불가 거부, 보충 INSERT 실패 시 계획 기록까지 rollback |
 | `tests/database/test_local_db_schema_migration.py` | 구버전 DB 파일 fixture 업그레이드·멱등성 |
-| `tests/ui/test_history_guards.py` | 마법사 원자 생성 실패 시 orphan 0·워커 미시작, 두 다이얼로그의 재개 거부·허용·폐기·legacy 확인, 프로필 삭제 차단·폐기 후 삭제·조회 실패 차단, 편집 경고 |
+| `tests/ui/test_history_guards.py` | 마법사 원자 생성 실패 시 orphan 0·워커 미시작, 두 다이얼로그의 재개 거부·허용·폐기·legacy 확인(누락 수치 표시·보충 채택·거절 시 무기록·범위 불명 거부), 프로필 삭제 차단·폐기 후 삭제·조회 실패 차단, 편집 경고 |
 | `tests/models/test_e2e_tool_history_api.py` | `tools/e2e_verify_copy.py`가 새 API로 이력을 만들고 identity 게이트를 검사 |
 
 ## 9. 남은 한계

@@ -56,23 +56,33 @@ def resolve_resume(
         return None
 
     if check.verdict is ResumeVerdict.LEGACY:
+        coverage = check.legacy
+        if coverage is None or not coverage.range_ok:
+            # 범위를 모르면 누락 여부를 확인할 수 없다 — 남은 일부로 계획을 고정하지 않는다.
+            QMessageBox.warning(parent, "재개할 수 없습니다", check.message)
+            _offer_abandon(parent, history_manager, history_id)
+            return None
+        gaps = list(coverage.gaps)
+        total = len(check.pending) + len(gaps)
+        supplement_note = f"(누락 보충 {len(gaps):,}개 포함)" if gaps else ""
         reply = QMessageBox.question(
             parent,
             "이전 버전 작업 재개",
             f"{check.message}\n\n"
-            f"미완료 파티션 {len(check.pending):,}개를 현재 프로필의 연결로 이어서 진행합니다.\n"
+            f"미완료 파티션 {total:,}개{supplement_note}를 현재 프로필의 연결로 이어서 진행합니다.\n"
             f"현재 연결: {endpoint_label(profile.source_config)} → "
             f"{endpoint_label(profile.target_config)}\n\n"
             "원래 작업과 같은 원본·대상이 맞는지 확인하셨습니까?\n\n"
-            "예를 누르면 현재 연결과 이 작업에 남아 있는 파티션 목록이 계획으로 고정되고,\n"
-            "이후에는 연결이 바뀌면 재개가 거부됩니다.",
+            "예를 누르면 현재 연결과 이 작업의 파티션 목록(남은 체크포인트와 범위 대비 누락 "
+            "보충분)이 계획으로 고정되고,\n이후에는 연결이 바뀌면 재개가 거부됩니다.",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         )
         if reply != QMessageBox.StandardButton.Yes:
             return None
         try:
-            check = history_manager.adopt_legacy_history(history_id, profile)
+            # 체크포인트가 있는 유형 안의 누락은 반드시 보충한다(H-09 subset 완료 방지).
+            check = history_manager.adopt_legacy_history(history_id, profile, supplement=gaps)
         except ValueError as exc:
             QMessageBox.warning(parent, "재개할 수 없습니다", str(exc))
             _offer_abandon(parent, history_manager, history_id)
