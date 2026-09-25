@@ -2,49 +2,59 @@
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime
 from typing import Any
 
-from cryptography.fernet import Fernet
+from cryptography.fernet import InvalidToken
 
-from src.database.local_db import SavedConnection, get_db
+from src.database.local_db import LocalDatabase, SavedConnection, get_db
+from src.models.profile import (
+    ProfileCipher,
+    ProfileKeyUnavailableError,
+    default_profile_key_file,
+    ensure_profile_cipher,
+)
+from src.utils.secret_store import WrappedKeyFile
+
+logger = logging.getLogger(__name__)
 
 
 class SavedConnectionManager:
-    """PostgreSQL 연결 프리셋 CRUD"""
+    """PostgreSQL 연결 프리셋 CRUD
 
-    def __init__(self):
-        self.db = get_db()
-        self._cipher = self._get_cipher()
+    프로필과 같은 암호화 키를 쓴다. 키 준비·마이그레이션은 `ensure_profile_cipher()`
+    하나로 모아, 이 관리자가 먼저 열려도 키를 따로 만들거나 legacy 암호문을 남기지 않는다.
+    """
 
-    @staticmethod
-    def _get_cipher() -> Fernet:
-        from src.utils.app_paths import AppPaths
-
-        key_file = AppPaths.get_app_data_dir() / ".encryption_key"
-        if key_file.exists():
-            return Fernet(key_file.read_bytes().strip())
-        # 키 파일이 없으면 새로 생성 (하드코딩 키 사용 금지)
-        key = Fernet.generate_key()
-        key_file.parent.mkdir(parents=True, exist_ok=True)
-        key_file.write_bytes(key)
+    def __init__(
+        self,
+        db: LocalDatabase | None = None,
+        key_file: WrappedKeyFile | None = None,
+    ):
+        self.db = db if db is not None else get_db()
+        self._key_file = key_file if key_file is not None else default_profile_key_file()
+        self._cipher: ProfileCipher | None = None
+        self._key_error: Exception | None = None
         try:
-            import os
-
-            os.chmod(key_file, 0o600)
-        except (OSError, AttributeError):
-            pass
-        return Fernet(key)
+            self._cipher = ensure_profile_cipher(self.db, self._key_file)
+        except Exception as exc:  # 앱을 멈추지 않는다 — 저장 시 오류로 알린다
+            logger.error("연결 프리셋 암호화 키를 준비하지 못했습니다: %s", exc)
+            self._key_error = exc
 
     def _encrypt(self, text: str) -> str:
+        if self._cipher is None:
+            raise ProfileKeyUnavailableError(
+                f"암호화 키를 사용할 수 없어 연결 정보를 저장할 수 없습니다: {self._key_error}"
+            ) from self._key_error
         return self._cipher.encrypt(text.encode()).decode()
 
     def _decrypt(self, token: str) -> str:
-        if not token:
+        if not token or self._cipher is None:
             return ""
         try:
             return self._cipher.decrypt(token.encode()).decode()
-        except Exception:
+        except InvalidToken:
             return ""
 
     def save_connection(self, config: dict[str, Any]) -> SavedConnection:

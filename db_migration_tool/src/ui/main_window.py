@@ -208,6 +208,7 @@ class MainWindow(QMainWindow):
         self.vm.current_profile_changed.connect(self.update_profile_selection)
         self.vm.error_occurred.connect(self.show_error)
         self.vm.message_sent.connect(self.show_message)
+        self.vm.key_problem.connect(self.on_key_problem)
 
         # UI → ViewModel 시그널
         self.profile_list.itemSelectionChanged.connect(self.on_profile_selected)
@@ -259,6 +260,17 @@ class MainWindow(QMainWindow):
             return
 
         for profile in profiles:
+            if getattr(profile, "locked", False) is True:
+                # 현재 키로 풀 수 없는 프로필: 이름만 보이고, 편집(재입력)·삭제만 할 수 있다.
+                item = QListWidgetItem(f"[잠김] {profile.name}")
+                item.setToolTip(
+                    f"프로필: {profile.name}\n"
+                    f"잠김: {profile.lock_reason}\n"
+                    "편집에서 연결 정보를 다시 입력하거나 프로필을 삭제하십시오."
+                )
+                item.setData(Qt.ItemDataRole.UserRole, profile.id)
+                self.profile_list.addItem(item)
+                continue
             summary = self._endpoint_summary(profile)
             item = QListWidgetItem(f"{profile.name}  [{summary}]")
             item.setToolTip(
@@ -272,9 +284,10 @@ class MainWindow(QMainWindow):
     def update_profile_selection(self, profile):
         """프로필 선택 UI 업데이트"""
         has_profile = profile is not None
+        locked = has_profile and getattr(profile, "locked", False) is True
         self.edit_btn.setEnabled(has_profile)
         self.delete_btn.setEnabled(has_profile)
-        self.migrate_btn.setEnabled(has_profile)
+        self.migrate_btn.setEnabled(has_profile and not locked)
 
         label = self._migration_mode_text(profile)
         self.migrate_btn.setText(label)
@@ -291,12 +304,21 @@ class MainWindow(QMainWindow):
             self.delete_btn.setToolTip(
                 "연결 프로필을 선택하면 삭제할 수 있습니다. 작업 이력은 삭제하지 않습니다."
             )
+        if locked:
+            migrate_tip = (
+                f"잠긴 프로필 '{profile.name}'입니다. 편집에서 연결 정보를 다시 입력하면 "
+                "사용할 수 있습니다."
+            )
         self.migrate_btn.setToolTip(migrate_tip)
         if hasattr(self, "migrate_action"):
             self.migrate_action.setText(label)
             self.migrate_action.setToolTip(migrate_tip)
 
-        if has_profile:
+        if locked:
+            self.status_bar.showMessage(
+                f"잠긴 프로필 선택됨: {profile.name} · 연결 정보를 다시 입력하거나 삭제하십시오"
+            )
+        elif has_profile:
             self.status_bar.showMessage(
                 f"프로필 선택됨: {profile.name} · {self._endpoint_summary(profile)}"
             )
@@ -306,6 +328,34 @@ class MainWindow(QMainWindow):
     def show_error(self, message):
         """오류 메시지 표시"""
         QMessageBox.critical(self, "오류", message)
+
+    def on_key_problem(self, message: str) -> None:
+        """암호화 키를 쓸 수 없을 때 명시적인 재설정 경로를 한 번 제안한다."""
+        if getattr(self, "_key_problem_prompted", False) is True:
+            return
+        self._key_problem_prompted = True
+        if self._confirm_key_reset(message):
+            self.vm.reset_encryption_key()
+
+    def _confirm_key_reset(self, message: str) -> bool:
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle("프로필 암호화 키를 사용할 수 없음")
+        box.setText(
+            "저장된 연결 프로필의 암호화 키를 이 PC·사용자 계정에서 열 수 없습니다.\n\n"
+            f"{message}\n\n"
+            "다른 PC나 사용자 계정에서 옮겨 왔거나 Windows 사용자 프로필이 재설정되면 "
+            "생깁니다. 원래 PC에서는 계속 열 수 있습니다."
+        )
+        box.setInformativeText(
+            "'키 재설정'을 누르면 새 키를 만듭니다. 기존 프로필은 이름만 남은 잠긴 상태가 "
+            "되어 연결 정보를 다시 입력하거나 삭제할 수 있습니다. 작업 이력은 유지되고, "
+            "옛 키 파일은 지우지 않고 보관합니다."
+        )
+        reset_btn = box.addButton("키 재설정", QMessageBox.ButtonRole.DestructiveRole)
+        box.addButton("나중에", QMessageBox.ButtonRole.RejectRole)
+        box.exec()
+        return box.clickedButton() is reset_btn
 
     def show_message(self, title, message):
         """일반 메시지 표시"""
@@ -370,6 +420,14 @@ class MainWindow(QMainWindow):
             return
 
         profile = self.vm.current_profile
+
+        if getattr(profile, "locked", False) is True:
+            self.show_error(
+                f"잠긴 프로필 '{profile.name}'로는 작업을 시작할 수 없습니다.\n"
+                f"{profile.lock_reason}\n\n"
+                "편집에서 연결 정보를 다시 입력하거나 프로필을 삭제하십시오."
+            )
+            return
 
         # 제한 모드에서는 새 작업만 막는다. 중단된 작업이 남아 있으면 반드시 열어 줘야 한다 —
         # 재개 경로를 막으면 소스와 대상이 어긋난 채로 복구할 방법이 사라진다.

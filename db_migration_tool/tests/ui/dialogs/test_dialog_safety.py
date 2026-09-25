@@ -274,7 +274,10 @@ class TestLogViewerRefreshCost:
 def connection_dialog(qapp):
     from src.ui.dialogs.connection_dialog import ConnectionDialog
 
-    dialog = ConnectionDialog(None)
+    # 프리셋 관리자는 생성 시 실제 앱 데이터의 키 파일·DB를 열고 마이그레이션할 수 있다.
+    with patch("src.ui.dialogs.connection_dialog.SavedConnectionManager") as manager:
+        manager.return_value.get_all.return_value = []
+        dialog = ConnectionDialog(None)
     yield dialog
     dialog.deleteLater()
 

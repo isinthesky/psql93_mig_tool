@@ -25,6 +25,9 @@ class MainViewModel(BaseViewModel):
     # 이력 관련 시그널
     histories_changed = Signal(list)  # 이력 목록 변경
 
+    # 프로필 암호화 키를 쓸 수 없음(다른 PC·사용자에서 옮김 등). 인자: 사유
+    key_problem = Signal(str)
+
     def __init__(
         self,
         profile_manager: ProfileManager | None = None,
@@ -49,6 +52,10 @@ class MainViewModel(BaseViewModel):
             self.is_loading = True
             self._profiles = self.profile_manager.get_all_profiles()
             self.profiles_changed.emit(self._profiles)
+            # 키를 쓸 수 없어도 목록(잠긴 프로필)은 보이고, 복구 경로를 따로 알린다.
+            if getattr(self.profile_manager, "key_available", True) is False:
+                reason = getattr(self.profile_manager, "key_error", None)
+                self.key_problem.emit(reason or "프로필 암호화 키를 사용할 수 없습니다.")
         except Exception as e:
             self.handle_error(e)
         finally:
@@ -110,6 +117,23 @@ class MainViewModel(BaseViewModel):
         except Exception as e:
             self.handle_error(e)
             return False
+
+    def reset_encryption_key(self) -> bool:
+        """쓸 수 없는 암호화 키를 새 키로 재설정한다(사용자 확인 뒤에만 호출).
+
+        기존 프로필은 잠긴 상태로 남고 작업 이력은 유지된다.
+        """
+        try:
+            self.profile_manager.reset_encryption_key()
+        except Exception as e:
+            self.handle_error(e)
+            return False
+        self.load_profiles()
+        self.send_message(
+            "완료",
+            "암호화 키를 재설정했습니다. 잠긴 프로필은 연결 정보를 다시 입력하거나 삭제하십시오.",
+        )
+        return True
 
     def delete_profile(self, profile_id: int) -> bool:
         """프로필 삭제

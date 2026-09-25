@@ -76,8 +76,9 @@ class HistoryDialog(QDialog):
 
     def _resolve_profile_name(self, profile_id: int) -> str:
         if profile_id not in self._profile_name_cache:
-            profile = self.profile_manager.get_profile(profile_id)
-            self._profile_name_cache[profile_id] = profile.name if profile else "알 수 없음"
+            # 이름 표시에는 복호화가 필요 없다 — 키를 못 써도 이력은 보여야 한다.
+            name = self.profile_manager.get_profile_name(profile_id)
+            self._profile_name_cache[profile_id] = name or "알 수 없음"
         return self._profile_name_cache[profile_id]
 
     def refresh(self):
