@@ -2,6 +2,7 @@
 파티션 테이블 탐색 및 분석
 """
 
+import logging
 from collections.abc import Callable
 from datetime import date, datetime
 from typing import Any
@@ -9,9 +10,12 @@ from typing import Any
 import psycopg
 
 from src.database.connection_params import connect_psycopg
+from src.database.postgres_utils import connection_unusable, is_db_error, isolated_statement
 
 from .archive_manifest import ScanCancelled
 from .table_types import DEFAULT_TABLE_TYPE, TableType, infer_partition_range
+
+logger = logging.getLogger(__name__)
 
 # 커넥션 수립 대기 상한(초).
 CONNECT_TIMEOUT_SECONDS = 10
@@ -93,7 +97,7 @@ class PartitionDiscovery:
                         from_date,
                         to_date,
                         use_flag
-                    FROM partition_table_info
+                    FROM public.partition_table_info
                     WHERE table_data IN ({placeholders})
                     AND use_flag = true
                     AND from_date <= %s
@@ -261,25 +265,35 @@ class PartitionDiscovery:
         ANALYZE 전이면 통계가 없다. PG14+는 `-1`, 그 이전은 `0`을 준다.
         둘 다 '모른다'는 뜻이므로 0으로 눕힌다 — 음수가 합계를 깎으면
         화면의 총합이 실제보다 작아진다.
+
+        조회가 실패해도(잠금 대기 시간 초과·권한 등) 탐색은 이어져야 한다. 탐색 커넥션은
+        autocommit이 아니어서 실패한 문장이 트랜잭션을 중단시키므로, SAVEPOINT로 이 조회만
+        되돌린다(감사 M-01). SAVEPOINT 복구마저 실패하면(연결 끊김) 예외를 그대로 올린다.
         """
+        conn = getattr(cursor, "connection", None)
         try:
-            cursor.execute(
-                """
-                SELECT c.reltuples::bigint
-                FROM pg_class c
-                JOIN pg_namespace n ON n.oid = c.relnamespace
-                WHERE c.relname = %s
-                  AND n.nspname = 'public'
-                  AND c.relkind IN ('r', 'p')
-                """,
-                (table_name,),
-            )
-            row = cursor.fetchone()
-            if not row or row[0] is None:
-                return 0
-            return max(0, int(row[0]))
-        except (psycopg.DatabaseError, psycopg.OperationalError):
+            with isolated_statement(conn, cursor, name="dbmig_estimate"):
+                cursor.execute(
+                    """
+                    SELECT c.reltuples::bigint
+                    FROM pg_catalog.pg_class c
+                    JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+                    WHERE c.relname = %s
+                      AND n.nspname = 'public'
+                      AND c.relkind IN ('r', 'p')
+                    """,
+                    (table_name,),
+                )
+                row = cursor.fetchone()
+        except Exception as exc:
+            if not is_db_error(exc) or connection_unusable(conn):
+                # 드라이버 오류가 아니거나, SAVEPOINT 복구가 실패해 연결을 더 쓸 수 없는 경우.
+                raise
+            logger.warning("행 수 추정 실패(0으로 표시하고 계속): %s - %s", table_name, exc)
             return 0
+        if not row or row[0] is None:
+            return 0
+        return max(0, int(row[0]))
 
     def _date_to_timestamp(self, d: date) -> int:
         """날짜를 밀리초 타임스탬프로 변환"""

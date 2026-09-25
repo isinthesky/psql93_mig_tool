@@ -127,7 +127,6 @@ class ManifestTableCreator(TableCreator):
                 f"manifest 부모 테이블 타입 불일치: parent={parent_table}, expected={resolved_type.value}, actual={table_type.value}"
             )
 
-        config = TABLE_TYPE_CONFIG[table_type]
         columns = metadata.get("columns", [])
         if not columns:
             raise Exception(f"manifest에 부모 테이블 컬럼 정보가 없습니다: {parent_table}")
@@ -135,16 +134,8 @@ class ManifestTableCreator(TableCreator):
         _validate_identifier(parent_table)
         column_defs = [_build_column_definition(col) for col in columns]
 
-        create_sql = f"CREATE TABLE IF NOT EXISTS {parent_table} (\n"
-        create_sql += ",\n".join(column_defs) + "\n)"
-
-        with self.target_conn.cursor() as target_cur:
-            target_cur.execute(create_sql)
-            if config.uses_trigger:
-                self._create_trigger_based_partitioning(parent_table, table_type, target_cur)
-            elif config.uses_rules:
-                self._create_parent_indexes(parent_table, table_type, target_cur)
-            self.target_conn.commit()
+        # public 한정 DDL·SAVEPOINT 격리·커밋 경계는 TableCreator와 같은 경로를 쓴다(H-04/M-14).
+        self._execute_parent_ddl(parent_table, table_type, column_defs)
 
 
 class ArchiveMigrationWorkerBase(BaseMigrationWorker):

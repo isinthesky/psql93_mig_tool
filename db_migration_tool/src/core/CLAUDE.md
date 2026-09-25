@@ -41,6 +41,22 @@
 커넥션에 `cancel()`을 걸어야 실제로 끊깁니다. 커넥션을 2개 이상 쓰는 워커는 **전부** 추적해야
 합니다 — 하나만 걸면 나머지 구간에서 취소가 조용히 무시됩니다.
 
+## SQL 경계 규칙 (감사 H-04 / M-01 / M-14)
+헬퍼는 `src/database/postgres_utils.py`에 있다. psycopg2(COPY 워커)·psycopg3(탐색·legacy 워커)가
+섞이므로 드라이버 전용 API 대신 이 헬퍼를 쓴다.
+
+- relation은 `qualified_name(name)`(= `"public"."name"`) 또는 `sql.Identifier("public", name)`로
+  schema를 한정한다. 이름 문자열을 `regclass`로 바꾸는 함수(`pg_table_size('name')`)는 쓰지 않고
+  카탈로그 oid를 쓴다. 연결의 `search_path=public`은 2차 방어일 뿐이다.
+- 실패해도 되는 문장은 `isolated_statement()`/`run_optional_statement()`(SAVEPOINT)로 감싼다.
+  예외를 잡기만 하면 트랜잭션이 중단돼 이후 문장이 전부 `25P02`로 거부된다.
+- 무시 여부는 예외 클래스가 아니라 `sqlstate_of()`로 판단한다(허용 목록 밖은 즉시 실패).
+- 커밋은 `commit_or_raise()` — 중단된 트랜잭션의 COMMIT은 오류 없이 ROLLBACK이 된다.
+- `TableCreator.create_partition_table()`: 부모·파티션·인덱스·트리거/RULE·CLUSTER·
+  `partition_table_info`를 한 트랜잭션으로 묶어 마지막에 한 번 커밋, 실패 시 rollback.
+- 테스트: `tests/database/fake_pg.py`(중단 트랜잭션 규칙을 지키는 가짜 연결), 실DB는
+  `tests/integration/test_sql_boundaries_realdb.py`(`DBMIG_REALDB_SQL_TESTS=1`, temp DB만 씀).
+
 ## 동작 시나리오
 1. UI 또는 서비스가 요청을 보내면 `partition_discovery.py`가 대상 파티션을 반환합니다.
 2. 선택된 워커가 `ConnectionProfile` 정보를 이용해 소스/대상 DB 연결을 생성합니다.
