@@ -84,3 +84,17 @@ def mock_log_emitter():
         mock_emitter.emit_log = MagicMock()  # no-op
 
         yield mock_emitter
+
+
+@pytest.fixture(autouse=True)
+def isolate_profile_key_handles():
+    """프로세스 공유 프로필 키(H-06)가 테스트 사이에 새지 않게 한다.
+
+    `tempfile.mkstemp` 경로는 테스트 사이에 재사용될 수 있어, 앞 테스트의 키 핸들이 같은
+    (DB, 키 파일) 식별자로 남으면 다음 테스트가 준비 과정을 건너뛴다.
+    """
+    from src.models import profile as profile_module
+
+    profile_module._KEY_HANDLES.clear()
+    yield
+    profile_module._KEY_HANDLES.clear()

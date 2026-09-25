@@ -242,8 +242,8 @@ def _can_decrypt(cipher: Fernet | MultiFernet, token: str) -> bool:
         return False
 
 
-def _is_same_key(key: bytes, other: Fernet) -> bool:
-    """`key`가 `other`와 같은 키인지 — 상수를 직접 비교하지 않고 암호문 왕복으로 판정."""
+def _is_same_key(key: bytes, other: ProfileCipher) -> bool:
+    """`key`가 `other`의 기록용 키(MultiFernet이면 첫 키)와 같은지 — 암호문 왕복으로 판정."""
     probe = b"dbmt-key-probe"
     try:
         return Fernet(key).decrypt(other.encrypt(probe)) == probe
@@ -367,6 +367,9 @@ def ensure_profile_cipher(db: LocalDatabase, key_file: WrappedKeyFile) -> Profil
     4. 다시 읽어 검증한 뒤 키 파일에서 이전 키를 버리고 완료 표식을 남긴다.
     5. 백업을 지운다(백업 자체가 노출 경로이므로).
     어떤 경우에도 풀 수 없는 암호문을 지우지 않는다.
+
+    매니저는 이 함수를 직접 부르지 않고 `shared_profile_key()`를 거친다. 같은 프로세스에서
+    두 번 부르면 앞선 호출이 돌려준 fallback 키와 뒤 호출이 교체한 키가 갈라질 수 있다.
 
     Raises:
         ProfileKeyUnavailableError: 쓸 수 있는 키가 없다(다른 장치의 키, 손상, 새 키 기록 실패).
@@ -645,6 +648,113 @@ def reset_profile_key(db: LocalDatabase, key_file: WrappedKeyFile) -> Fernet:
         return Fernet(new_key)
 
 
+# --- 프로세스 공유 키 (H-06 2차 리뷰: 같은 프로세스 복수 매니저의 키 갈림) -----------------
+#
+# 매니저마다 `ensure_profile_cipher()`를 따로 부르면, 첫 매니저가 백업·키 기록 실패로 옛 키
+# (fallback)를 받은 뒤 같은 세션의 다른 매니저가 마이그레이션에 성공해 키를 교체할 수 있다.
+# 그러면 첫 매니저는 옛 키로 목록을 읽고(전부 잠김) 옛 키로 저장한다(재시작 뒤 영구 잠김).
+# 그래서 키 준비는 (DB 파일, 키 파일)마다 프로세스에서 한 번만 하고, 모든 매니저가 그 결과를
+# 공유한다. fallback·진행 중·실패로 끝났어도 같은 프로세스에서는 다시 시도하지 않는다(다음
+# 실행이 이어 간다). 프로세스 안에서 키가 바뀌는 유일한 경로는 명시적 키 재설정이며, 그것도
+# 공유 핸들을 거쳐 모든 매니저에 함께 반영된다.
+
+
+class ProfileKeyHandle:
+    """한 프로세스에서 (DB 파일, 키 파일) 한 쌍이 공유하는 프로필 암호화 키."""
+
+    def __init__(self, db: LocalDatabase, key_file: WrappedKeyFile):
+        self.db = db
+        self.key_file = key_file
+        self._lock = threading.Lock()
+        self._cipher: ProfileCipher | None = None
+        self._error: Exception | None = None
+        try:
+            self._cipher = ensure_profile_cipher(db, key_file)
+        except Exception as exc:  # 앱 시작을 막지 않는다 — 사용하는 순간 오류로 알린다
+            logger.error("프로필 암호화 키를 준비하지 못했습니다: %s", exc)
+            self._error = exc
+
+    @property
+    def cipher(self) -> ProfileCipher | None:
+        """읽기용 키. 쓸 수 없으면 None."""
+        return self._cipher
+
+    @property
+    def error(self) -> Exception | None:
+        return self._error
+
+    def require(self) -> ProfileCipher:
+        cipher = self._cipher
+        if cipher is None:
+            raise ProfileKeyUnavailableError(
+                f"프로필 암호화 키를 사용할 수 없습니다: {self._error}"
+            ) from self._error
+        return cipher
+
+    def for_write(self) -> ProfileCipher:
+        """새 암호문을 쓰기 직전의 키. 키 파일이 이 세션의 키와 다르면 거부한다.
+
+        이 세션이 키를 준비한 뒤 다른 프로세스나 사용자가 키 파일을 바꾸거나 지웠다면, 지금
+        쥔 키로 저장한 값은 다음 실행에서 풀리지 않는다. 저장이 성공한 것처럼 보이고 재시작 뒤
+        잠기는 것보다 지금 실패를 알리는 편이 낫다.
+        """
+        with self._lock:
+            cipher = self.require()
+            try:
+                stored = self.key_file.read()
+            except (SecretStoreError, OSError) as exc:
+                raise ProfileKeyUnavailableError(
+                    "키 파일을 다시 읽지 못해 저장하지 않았습니다"
+                    f"({self.key_file.path.name}): {exc}. 앱을 다시 시작하십시오."
+                ) from exc
+            if stored.key is None or not _is_same_key(stored.key, cipher):
+                raise ProfileKeyUnavailableError(
+                    "키 파일이 이 세션에서 쓰는 암호화 키와 달라져 저장하지 않았습니다(다른 "
+                    "프로그램이 키 파일을 바꾸거나 지웠을 수 있습니다). 앱을 다시 시작하십시오."
+                )
+            return cipher
+
+    def reset(self) -> None:
+        """키를 쓸 수 없을 때만 새 키로 재설정한다. 같은 프로세스의 모든 매니저에 반영된다."""
+        with self._lock:
+            if self._cipher is not None:
+                raise RuntimeError(
+                    "암호화 키를 쓸 수 있는 상태에서는 재설정하지 않습니다(기존 프로필을 잃게 됩니다)."
+                )
+            self._cipher = reset_profile_key(self.db, self.key_file)
+            self._error = None
+
+
+# (DB 파일, 키 파일) → 공유 핸들. 프로세스 수명 동안 유지한다.
+_KEY_HANDLES: dict[tuple[str, str], ProfileKeyHandle] = {}
+_key_handles_lock = threading.Lock()
+
+
+def _key_handle_id(db: LocalDatabase, key_file: WrappedKeyFile) -> tuple[str, str]:
+    db_path = db.db_path
+    if db_path and db_path != ":memory:":
+        db_id = os.path.normcase(os.path.realpath(db_path))
+    else:
+        # 파일이 없는 DB는 객체로 구분한다. 핸들이 db를 붙잡고 있어 id가 재사용되지 않는다.
+        db_id = f"<memory:{id(db)}>"
+    return db_id, os.path.normcase(os.path.realpath(key_file.path))
+
+
+def shared_profile_key(db: LocalDatabase, key_file: WrappedKeyFile) -> ProfileKeyHandle:
+    """이 프로세스에서 (db, key_file)의 공유 키. 처음 한 번만 준비·마이그레이션한다.
+
+    동시에 여러 매니저가 만들어져도 준비는 한 번이며, 나머지는 끝날 때까지 기다렸다가 같은
+    결과를 받는다.
+    """
+    ident = _key_handle_id(db, key_file)
+    with _key_handles_lock:
+        handle = _KEY_HANDLES.get(ident)
+        if handle is None:
+            handle = ProfileKeyHandle(db, key_file)
+            _KEY_HANDLES[ident] = handle
+        return handle
+
+
 class ProfileManager:
     """프로필 관리자 클래스"""
 
@@ -655,68 +765,54 @@ class ProfileManager:
     ):
         self.db = db if db is not None else get_db()
         self._key_file = key_file if key_file is not None else default_profile_key_file()
-        self._cipher_suite: ProfileCipher | None = None
-        self._key_error: Exception | None = None
-        try:
-            self._cipher_suite = ensure_profile_cipher(self.db, self._key_file)
-        except Exception as exc:  # 앱 시작을 막지 않는다 — 사용하는 순간 오류로 알린다
-            logger.error("프로필 암호화 키를 준비하지 못했습니다: %s", exc)
-            self._key_error = exc
+        # 같은 프로세스의 다른 매니저(연결 프리셋·이력 창)와 키를 공유한다(H-06 2차 리뷰).
+        self._keys = shared_profile_key(self.db, self._key_file)
 
     @property
     def key_available(self) -> bool:
-        return self._cipher_suite is not None
+        return self._keys.cipher is not None
 
     @property
     def key_error(self) -> str | None:
-        return None if self._key_error is None else str(self._key_error)
-
-    def _cipher(self) -> ProfileCipher:
-        if self._cipher_suite is None:
-            raise ProfileKeyUnavailableError(
-                f"프로필 암호화 키를 사용할 수 없습니다: {self._key_error}"
-            ) from self._key_error
-        return self._cipher_suite
+        error = self._keys.error
+        return None if error is None else str(error)
 
     def reset_encryption_key(self) -> None:
         """키를 쓸 수 없을 때만 새 키로 재설정한다. 기존 행과 이력은 보존된다."""
-        if self._cipher_suite is not None:
-            raise RuntimeError(
-                "암호화 키를 쓸 수 있는 상태에서는 재설정하지 않습니다(기존 프로필을 잃게 됩니다)."
-            )
-        self._cipher_suite = reset_profile_key(self.db, self._key_file)
-        self._key_error = None
+        self._keys.reset()
 
     def _to_profile(self, db_profile: Profile) -> ConnectionProfile:
         """복호화하지 못한 행은 목록에서 빼지 않고 잠긴 프로필로 돌려준다."""
-        if self._cipher_suite is None:
+        cipher = self._keys.cipher
+        if cipher is None:
             return ConnectionProfile.locked_from_db_model(
-                db_profile, f"암호화 키를 사용할 수 없습니다: {self._key_error}"
+                db_profile, f"암호화 키를 사용할 수 없습니다: {self._keys.error}"
             )
         try:
-            return ConnectionProfile.from_db_model(db_profile, self._cipher_suite)
+            return ConnectionProfile.from_db_model(db_profile, cipher)
         except ProfileDecryptError as exc:
             return ConnectionProfile.locked_from_db_model(db_profile, str(exc))
 
-    def _encrypt_config(self, config: dict[str, Any]) -> str:
+    @staticmethod
+    def _encrypt_config(cipher: ProfileCipher, config: dict[str, Any]) -> str:
         """설정 암호화"""
         json_str = json.dumps(normalize_endpoint_config(config))
-        encrypted = self._cipher().encrypt(json_str.encode())
-        return encrypted.decode()
+        return cipher.encrypt(json_str.encode()).decode()
 
     def create_profile(self, profile_data: dict[str, Any]) -> ConnectionProfile:
         """새 프로필 생성"""
+        cipher = self._keys.for_write()
         with self.db.session_scope() as session:
             db_profile = Profile(
                 name=profile_data["name"],
-                source_config=self._encrypt_config(profile_data["source_config"]),
-                target_config=self._encrypt_config(profile_data["target_config"]),
+                source_config=self._encrypt_config(cipher, profile_data["source_config"]),
+                target_config=self._encrypt_config(cipher, profile_data["target_config"]),
             )
 
             session.add(db_profile)
             session.flush()
 
-            return ConnectionProfile.from_db_model(db_profile, self._cipher())
+            return ConnectionProfile.from_db_model(db_profile, cipher)
 
     def get_profile(self, profile_id: int) -> ConnectionProfile | None:
         """프로필 조회 (복호화하지 못하면 잠긴 프로필)"""
@@ -740,16 +836,17 @@ class ProfileManager:
 
     def update_profile(self, profile_id: int, profile_data: dict[str, Any]) -> ConnectionProfile:
         """프로필 수정 (잠긴 프로필은 연결 정보를 다시 입력하면 현재 키로 풀린다)"""
+        cipher = self._keys.for_write()
         with self.db.session_scope() as session:
             db_profile = session.query(Profile).filter_by(id=profile_id).first()
             if not db_profile:
                 raise ValueError(f"프로필을 찾을 수 없습니다: {profile_id}")
 
             db_profile.name = profile_data["name"]
-            db_profile.source_config = self._encrypt_config(profile_data["source_config"])
-            db_profile.target_config = self._encrypt_config(profile_data["target_config"])
+            db_profile.source_config = self._encrypt_config(cipher, profile_data["source_config"])
+            db_profile.target_config = self._encrypt_config(cipher, profile_data["target_config"])
 
-            return ConnectionProfile.from_db_model(db_profile, self._cipher())
+            return ConnectionProfile.from_db_model(db_profile, cipher)
 
     def delete_profile(self, profile_id: int) -> bool:
         """프로필 삭제 (복호화가 필요 없다)"""

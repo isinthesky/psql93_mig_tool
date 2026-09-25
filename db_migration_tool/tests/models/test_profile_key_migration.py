@@ -13,6 +13,7 @@ import os
 import shutil
 import sqlite3
 import sys
+import threading
 from pathlib import Path
 
 import pytest
@@ -143,6 +144,14 @@ class Env:
 
     def stored_key(self) -> bytes | None:
         return self.key_file().read().key
+
+    def restart(self) -> None:
+        """프로세스 재시작을 모사한다 — 이 프로세스가 공유하던 키 준비 결과를 잊는다.
+
+        같은 프로세스 안에서는 키 준비·마이그레이션을 (DB, 키 파일)마다 한 번만 한다(H-06 2차
+        리뷰). "다음 실행" 동작을 확인하는 테스트는 매니저를 새로 만들기 전에 이것을 부른다.
+        """
+        profile_module._KEY_HANDLES.clear()
 
     def close(self) -> None:
         if self.db.engine is not None:
@@ -363,6 +372,7 @@ class TestKeyWrap:
         env.profiles()
         before = snapshot(env.root)
 
+        env.restart()
         env.profiles()
         env.saved()
 
@@ -398,6 +408,7 @@ class TestFailureSafety:
         assert [p.locked for p in manager.get_all_profiles()] == [True, True, True]
 
         monkeypatch.setattr(profile_module, "_reencrypt_token", real)
+        env.restart()
         recovered = env.profiles().get_all_profiles()
 
         assert [p.name for p in recovered] == ["p0", "p1", "p2"]
@@ -426,6 +437,7 @@ class TestFailureSafety:
         assert not [p for p in env.root.iterdir() if p.name.endswith(".tmp")]
 
         monkeypatch.setattr(secret_store.os, "replace", real_replace)
+        env.restart()
         env.profiles()
         assert env.key_path.read_bytes().startswith(KEY_FILE_HEADER)
 
@@ -450,7 +462,10 @@ class TestFailureSafety:
             manager.create_profile({"name": "x", "source_config": SOURCE, "target_config": TARGET})
 
         monkeypatch.setattr(secret_store.os, "replace", real_replace)
-        assert env.profiles().get_all_profiles()[0].name == "p1"
+        env.restart()
+        recovered = env.profiles()
+        assert recovered.key_available
+        assert [(p.name, p.locked) for p in recovered.get_all_profiles()] == [("p1", False)]
 
     def test_backup_failure_aborts_before_any_change(self, env, monkeypatch):
         env.key_path.write_bytes(PUBLIC_LEGACY_KEY)
@@ -622,6 +637,7 @@ class TestReviewNoLaunderingAfterMigration:
     def test_forged_public_key_row_is_not_reencrypted_on_next_start(self, env):
         seed_profile(env.db, "p1", PUBLIC_LEGACY_KEY)
         env.profiles()  # 1회 마이그레이션
+        env.restart()
         seed_profile(env.db, "forged", PUBLIC_LEGACY_KEY)
         forged_tokens = [t for t in all_tokens(env.db) if decrypts(PUBLIC_LEGACY_KEY, t)]
         assert len(forged_tokens) == 2
@@ -646,6 +662,7 @@ class TestReviewNoLaunderingAfterMigration:
         seed_profile(env.db, "forged", attacker)
         before = snapshot(env.root)
 
+        env.restart()
         manager = env.profiles()
 
         assert snapshot(env.root) == before, "낯선 평문 키를 감싸거나 수용하면 안 된다"
@@ -661,6 +678,7 @@ class TestReviewNoLaunderingAfterMigration:
         env.key_path.unlink()
         before = snapshot(env.root)
 
+        env.restart()
         manager = env.profiles()
 
         assert not env.key_path.exists()
@@ -676,6 +694,7 @@ class TestReviewNoLaunderingAfterMigration:
         assert exposed is not None
         env.key_path.write_bytes(exposed)  # 누군가 현재 키를 평문으로 꺼내 놓았다
         caplog.set_level(logging.WARNING)
+        env.restart()
 
         assert env.profiles().get_all_profiles()[0].source_config["password"] == "src-pw"
 
@@ -693,6 +712,7 @@ class TestReviewNoLaunderingAfterMigration:
             con.execute(f"DELETE FROM {profile_module.KEY_STATE_TABLE}")
         seed_profile(env.db, "forged", PUBLIC_LEGACY_KEY)
 
+        env.restart()
         profiles = by_name(env.profiles().get_all_profiles())
 
         assert profiles["forged"].locked
@@ -776,6 +796,7 @@ class TestReviewRecovery:
                 {"name": "new", "source_config": SOURCE, "target_config": TARGET}
             )
 
+            moved.restart()
             restarted = by_name(moved.profiles().get_all_profiles())
             assert restarted["old"].locked
             assert not restarted["new"].locked
@@ -828,6 +849,7 @@ class TestReviewResumableRotation:
         assert backups_in(env.root), "실패한 동안에는 백업을 남긴다"
 
         monkeypatch.setattr(profile_module, "_reencrypt_token", real)
+        env.restart()
         recovered = env.profiles().get_all_profiles()
 
         assert [p.name for p in recovered] == ["p0", "p1", "p2"]
@@ -856,8 +878,278 @@ class TestReviewResumableRotation:
         assert env.key_file().read().previous == k0
 
         monkeypatch.setattr(WrappedKeyFile, "write", real_write)
+        env.restart()
         assert env.profiles().get_all_profiles()[0].name == "p1"
 
         assert env.key_file().read().previous is None
         assert backups_in(env.root) == []
         assert sum(decrypts(k0, t) for t in sqlite_tokens_in(env.root)) == 0
+
+
+# --- 2차 리뷰 major: 같은 프로세스의 복수 매니저 키 갈림 -----------------------------------
+#
+# 첫 ProfileManager(MainViewModel)가 백업·키 기록 실패로 fallback(k0)을 받은 뒤, 같은 세션의
+# ConnectionDialog(SavedConnectionManager)나 HistoryDialog(ProfileManager)가 마이그레이션을
+# 다시 돌려 K1로 교체·재암호화하면, 첫 매니저는 k0을 계속 쥔다. (1) 목록이 전부 잠기고
+# (2) 이 세션에서 저장한 값이 k0으로 암호화돼 재시작 뒤 영구히 잠긴다.
+
+
+def fail_first_db_backup(monkeypatch) -> dict[str, int]:
+    """첫 DB 백업 한 번만 실패시켜 첫 매니저가 fallback 키로 끝나게 한다."""
+    real = profile_module.backup_sqlite_database
+    calls = {"n": 0}
+
+    def flaky(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise OSError("주입된 첫 백업 실패")
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(profile_module, "backup_sqlite_database", flaky)
+    return calls
+
+
+def other_manager(env: Env, kind: str):
+    """같은 세션에서 나중에 열리는 매니저 — ConnectionDialog 또는 HistoryDialog."""
+    return env.saved() if kind == "connection_dialog" else env.profiles()
+
+
+def saved_passwords(env: Env) -> list[str]:
+    return sorted(c["password"] for c in env.saved().get_all())
+
+
+NEW_SOURCE = {**SOURCE, "password": "new-src-pw"}
+
+
+class TestReviewSameProcessKeyDivergence:
+    @pytest.mark.parametrize("second", ["connection_dialog", "history_dialog"])
+    def test_fallback_then_second_manager_then_create_survives_restart(
+        self, env, monkeypatch, second
+    ):
+        """필수 회귀: 첫 생성 fallback → 둘째 매니저 → 첫 매니저로 create → 재시작 후 잠김 0."""
+        k0 = Fernet.generate_key()
+        env.key_path.write_bytes(k0)
+        seed_profile(env.db, "p1", k0)
+        seed_saved(env.db, k0)
+        fail_first_db_backup(monkeypatch)
+
+        main = env.profiles()  # MainViewModel — 백업 실패로 fallback(k0)
+        assert main.key_available
+        assert env.key_path.read_bytes() == k0
+
+        other_manager(env, second)  # 같은 세션의 다이얼로그
+
+        created = main.create_profile(
+            {"name": "new", "source_config": NEW_SOURCE, "target_config": TARGET}
+        )
+        assert not created.locked
+
+        env.restart()
+        restarted = by_name(env.profiles().get_all_profiles())
+
+        assert sorted(restarted) == ["new", "p1"]
+        assert [n for n, p in restarted.items() if p.locked] == [], "재시작 뒤 잠긴 프로필"
+        assert restarted["new"].source_config["password"] == "new-src-pw"
+        assert restarted["p1"].source_config["password"] == "src-pw"
+        assert saved_passwords(env) == ["preset-pw"]
+        # 재시작한 프로세스가 마이그레이션을 끝냈다 — k0으로 풀리는 사본이 없다.
+        assert env.stored_key() != k0
+        assert sum(decrypts(k0, t) for t in sqlite_tokens_in(env.root)) == 0
+        assert backups_in(env.root) == []
+
+    @pytest.mark.parametrize("second", ["connection_dialog", "history_dialog"])
+    def test_fallback_is_not_retried_in_same_process(self, env, monkeypatch, second):
+        """fallback으로 끝났으면 같은 프로세스에서 백업·키 교체를 다시 시도하지 않는다."""
+        k0 = Fernet.generate_key()
+        env.key_path.write_bytes(k0)
+        seed_profile(env.db, "p1", k0)
+        calls = fail_first_db_backup(monkeypatch)
+
+        env.profiles()
+        other_manager(env, second)
+        other_manager(env, second)
+
+        assert calls["n"] == 1
+        assert env.key_path.read_bytes() == k0, "같은 프로세스에서 키를 다시 교체하면 안 된다"
+        assert backups_in(env.root) == []
+
+    @pytest.mark.parametrize("second", ["connection_dialog", "history_dialog"])
+    def test_first_manager_list_is_not_locked_after_second_manager_opens(
+        self, env, monkeypatch, second
+    ):
+        """지적 (1): 둘째 매니저가 열린 뒤 첫 매니저의 목록 갱신에서 프로필이 잠기지 않는다."""
+        k0 = Fernet.generate_key()
+        env.key_path.write_bytes(k0)
+        seed_profile(env.db, "p1", k0)
+        seed_profile(env.db, "p2", k0)
+        fail_first_db_backup(monkeypatch)
+
+        main = env.profiles()
+        assert [p.locked for p in main.get_all_profiles()] == [False, False]
+
+        other_manager(env, second)
+
+        assert [p.locked for p in main.get_all_profiles()] == [False, False]
+        profile = main.get_profile(main.get_all_profiles()[0].id)
+        assert profile is not None and profile.source_config["password"] == "src-pw"
+
+    def test_update_and_preset_saved_in_fallback_session_survive_restart(self, env, monkeypatch):
+        """지적 (2)의 update_profile·프리셋 저장 경로."""
+        k0 = Fernet.generate_key()
+        env.key_path.write_bytes(k0)
+        seed_profile(env.db, "p1", k0)
+        fail_first_db_backup(monkeypatch)
+
+        main = env.profiles()
+        dialog = env.saved()
+        history = env.profiles()
+        pid = main.get_all_profiles()[0].id
+
+        main.update_profile(
+            pid, {"name": "p1", "source_config": NEW_SOURCE, "target_config": TARGET}
+        )
+        dialog.save_connection({"host": "h2", "database": "d", "username": "u", "password": "p2"})
+        assert history.get_profile(pid).source_config["password"] == "new-src-pw"
+
+        env.restart()
+        restarted = env.profiles().get_all_profiles()
+
+        assert [(p.name, p.locked) for p in restarted] == [("p1", False)]
+        assert restarted[0].source_config["password"] == "new-src-pw"
+        assert saved_passwords(env) == ["p2"]
+
+    def test_concurrent_managers_share_one_key(self, env, monkeypatch):
+        """동시 생성: 여러 매니저가 한꺼번에 열려도 한 번만 준비하고 같은 키를 쓴다."""
+        k0 = Fernet.generate_key()
+        env.key_path.write_bytes(k0)
+        seed_profile(env.db, "p1", k0)
+        seed_saved(env.db, k0)
+        calls = fail_first_db_backup(monkeypatch)
+
+        count = 6
+        barrier = threading.Barrier(count)
+        managers: list = [None] * count
+        errors: list[BaseException] = []
+
+        def build(i: int) -> None:
+            try:
+                barrier.wait()
+                managers[i] = env.profiles() if i % 2 == 0 else env.saved()
+            except BaseException as exc:  # pragma: no cover - 실패 보고용
+                errors.append(exc)
+
+        threads = [threading.Thread(target=build, args=(i,)) for i in range(count)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+        assert not errors
+        assert calls["n"] == 1, "마이그레이션(백업 시도)은 프로세스에서 한 번만 한다"
+        assert env.key_path.read_bytes() == k0
+
+        for i, manager in enumerate(managers):
+            if i % 2 == 0:
+                manager.create_profile(
+                    {"name": f"new-{i}", "source_config": NEW_SOURCE, "target_config": TARGET}
+                )
+            else:
+                manager.save_connection(
+                    {"host": f"h{i}", "database": "d", "username": "u", "password": f"pw-{i}"}
+                )
+
+        env.restart()
+        restarted = by_name(env.profiles().get_all_profiles())
+
+        assert sorted(restarted) == ["new-0", "new-2", "new-4", "p1"]
+        assert [n for n, p in restarted.items() if p.locked] == []
+        assert saved_passwords(env) == ["preset-pw", "pw-1", "pw-3", "pw-5"]
+
+    def test_plain_fallback_key_is_not_rotated_again_in_same_process(self, env):
+        """DPAPI가 잠깐 실패해 평문 키로 시작한 세션에서, 뒤에 열린 매니저가 다시 교체하지 않는다."""
+        first = env.profiles(protector=FakeDpapi(env.machine, fail_protect=True))
+        assert first.key_available
+        plain_key = env.key_path.read_bytes()
+        assert not plain_key.startswith(KEY_FILE_HEADER)
+
+        second = env.saved()  # 보호기는 이제 동작한다
+
+        assert env.key_path.read_bytes() == plain_key
+        first.create_profile({"name": "a", "source_config": SOURCE, "target_config": TARGET})
+        second.save_connection({"host": "h", "database": "d", "username": "u", "password": "pw"})
+
+        env.restart()
+        restarted = env.profiles().get_all_profiles()
+
+        assert [(p.name, p.locked) for p in restarted] == [("a", False)]
+        assert saved_passwords(env) == ["pw"]
+        assert env.key_path.read_bytes().startswith(KEY_FILE_HEADER), "재시작 때 감싼다"
+
+    def test_key_reset_is_shared_by_every_manager_in_the_process(self, env, tmp_path):
+        """키 재설정도 프로세스의 모든 매니저가 함께 본다(재설정 뒤 프리셋 저장이 막히지 않는다)."""
+        env.profiles().create_profile(
+            {"name": "old", "source_config": SOURCE, "target_config": TARGET}
+        )
+        env.close()
+        root_b = tmp_path / "machine-B"
+        shutil.copytree(env.root, root_b)
+        moved = Env(root_b, machine=b"machine-B")
+        try:
+            main = moved.profiles()
+            dialog = moved.saved()
+            assert not main.key_available and not dialog.key_available
+
+            main.reset_encryption_key()
+
+            assert dialog.key_available
+            dialog.save_connection({"host": "h", "database": "d", "username": "u", "password": "p"})
+            moved.restart()
+            assert saved_passwords(moved) == ["p"]
+        finally:
+            moved.close()
+
+
+class TestReviewWriteGuardAgainstKeyFileChange:
+    @staticmethod
+    def _replace(env: Env) -> None:
+        env.key_file().write(Fernet.generate_key(), migrated=True)
+
+    @staticmethod
+    def _delete(env: Env) -> None:
+        env.key_path.unlink()
+
+    @staticmethod
+    def _corrupt(env: Env) -> None:
+        env.key_path.write_bytes(b"garbage")
+
+    @pytest.mark.parametrize("change", ["_replace", "_delete", "_corrupt"])
+    def test_write_refused_when_key_file_changed_outside_session(self, env, change):
+        manager = env.profiles()
+        dialog = env.saved()
+        created = manager.create_profile(
+            {"name": "p1", "source_config": SOURCE, "target_config": TARGET}
+        )
+        tokens = all_tokens(env.db)
+
+        getattr(self, change)(env)  # 다른 프로세스·사용자가 키 파일을 바꿨다
+
+        with pytest.raises(ProfileKeyUnavailableError, match="키 파일"):
+            manager.create_profile({"name": "x", "source_config": SOURCE, "target_config": TARGET})
+        with pytest.raises(ProfileKeyUnavailableError, match="키 파일"):
+            manager.update_profile(
+                created.id, {"name": "p1", "source_config": NEW_SOURCE, "target_config": TARGET}
+            )
+        with pytest.raises(ProfileKeyUnavailableError, match="키 파일"):
+            dialog.save_connection({"host": "h", "database": "d", "username": "u", "password": "p"})
+
+        assert all_tokens(env.db) == tokens, "거부한 쓰기는 DB에 아무것도 남기지 않는다"
+        with env.db.session_scope() as session:
+            assert [p.name for p in session.query(Profile)] == ["p1"]
+
+    def test_write_allowed_while_key_file_unchanged(self, env):
+        manager = env.profiles()
+        dialog = env.saved()
+        manager.create_profile({"name": "p1", "source_config": SOURCE, "target_config": TARGET})
+        dialog.save_connection({"host": "h", "database": "d", "username": "u", "password": "p"})
+        env.restart()
+        assert [p.locked for p in env.profiles().get_all_profiles()] == [False]
+        assert saved_passwords(env) == ["p"]
