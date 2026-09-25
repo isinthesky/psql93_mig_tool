@@ -11,6 +11,7 @@ from PySide6.QtCore import Signal
 
 from src.core.base_migration_worker import BaseMigrationWorker
 from src.core.table_creator import TableCreator
+from src.database.connection_params import connect_psycopg
 from src.models.profile import ConnectionProfile
 
 
@@ -88,19 +89,9 @@ class MigrationWorker(BaseMigrationWorker):
                         pass
 
     def _create_connection(self, config: dict[str, Any]) -> psycopg.Connection:
-        """데이터베이스 연결 생성"""
-        conn_params = {
-            "host": config.get("host", "localhost"),
-            "port": config.get("port", 5432),
-            "dbname": config.get("database", ""),
-            "user": config.get("username", ""),
-            "password": config.get("password", ""),
-        }
-
-        if config.get("ssl"):
-            conn_params["sslmode"] = "require"
-
-        return psycopg.connect(**conn_params)
+        """데이터베이스 연결 생성 (공용 빌더: TLS 검증·timeout·search_path)"""
+        conn: psycopg.Connection = connect_psycopg(config)
+        return conn
 
     def _migrate_partition(
         self,

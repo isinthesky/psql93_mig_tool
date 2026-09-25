@@ -8,6 +8,8 @@ from typing import Any
 
 import psycopg
 
+from src.database.connection_params import connect_psycopg
+
 from .archive_manifest import ScanCancelled
 from .table_types import DEFAULT_TABLE_TYPE, TableType, infer_partition_range
 
@@ -221,23 +223,12 @@ class PartitionDiscovery:
 
     def _create_connection(self) -> psycopg.Connection:
         """소스 데이터베이스 연결 생성"""
-        config = self.connection_config
-
-        conn_params = {
-            "host": config.get("host", "localhost"),
-            "port": config.get("port", 5432),
-            "dbname": config.get("database", ""),
-            "user": config.get("username", ""),
-            "password": config.get("password", ""),
-            # 상한이 없으면 방화벽이 패킷을 버릴 때 OS 타임아웃(수십 초)까지
-            # 붙잡혀 있고, 그동안 취소 요청조차 읽지 못한다.
-            "connect_timeout": CONNECT_TIMEOUT_SECONDS,
-        }
-
-        if config.get("ssl"):
-            conn_params["sslmode"] = "require"
-
-        return psycopg.connect(**conn_params)
+        # connect_timeout 상한이 없으면 방화벽이 패킷을 버릴 때 OS 타임아웃(수십 초)까지
+        # 붙잡혀 있고, 그동안 취소 요청조차 읽지 못한다.
+        conn: psycopg.Connection = connect_psycopg(
+            self.connection_config, connect_timeout=CONNECT_TIMEOUT_SECONDS
+        )
+        return conn
 
     def _check_table_exists(self, cursor, table_name: str) -> bool:
         """테이블 존재 여부 확인"""

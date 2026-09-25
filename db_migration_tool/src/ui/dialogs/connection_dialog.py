@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
-import psycopg
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QCursor
 from PySide6.QtWidgets import (
@@ -27,6 +27,19 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from src.database.connection_params import (
+    DEFAULT_SSLMODE,
+    PROFILE_KEY_ALLOW_INSECURE,
+    PROFILE_KEY_SSL,
+    PROFILE_KEY_SSLMODE,
+    PROFILE_KEY_SSLROOTCERT,
+    SSLMODE_REQUIRE,
+    SSLMODE_VERIFY_CA,
+    SSLMODE_VERIFY_FULL,
+    ConnectionConfigError,
+    connect_psycopg,
+    validate_tls_settings,
+)
 from src.database.version_info import parse_version_string
 from src.models.profile import (
     ENDPOINT_KIND_FILE,
@@ -41,6 +54,13 @@ from .connection_mapper import (
     COMPAT_MODE_LABELS,
     ENDPOINT_KIND_LABELS,
     ConnectionMapper,
+)
+
+# (표시 이름, sslmode) — 검증하는 모드를 앞에 둔다.
+SSL_MODE_CHOICES: tuple[tuple[str, str], ...] = (
+    ("verify-full — 인증서·호스트 이름 검증 (권장)", SSLMODE_VERIFY_FULL),
+    ("verify-ca — 인증서만 검증 (호스트 이름 미검증)", SSLMODE_VERIFY_CA),
+    ("require — 검증 안 함 (위험, 승인 필요)", SSLMODE_REQUIRE),
 )
 
 
@@ -166,8 +186,42 @@ class ConnectionDialog(QDialog):
         postgres_layout.addRow("비밀번호:", password_edit)
 
         ssl_check = QCheckBox("SSL 연결 사용")
-        ssl_check.setToolTip("서버가 SSL 접속을 요구할 때 선택하세요.")
+        ssl_check.setToolTip(
+            "서버와 TLS로 연결합니다. 기본은 서버 인증서와 호스트 이름을 검증(verify-full)합니다."
+        )
         postgres_layout.addRow("", ssl_check)
+
+        sslmode_combo = QComboBox()
+        for label, mode in SSL_MODE_CHOICES:
+            sslmode_combo.addItem(label, mode)
+        sslmode_combo.setToolTip(
+            "verify-full: 신뢰하는 CA가 서명했고 호스트 이름이 인증서와 일치할 때만 연결합니다.\n"
+            "verify-ca: CA 서명만 확인합니다(호스트 이름은 확인하지 않음).\n"
+            "require: 암호화만 하고 서버 신원을 확인하지 않습니다 — 중간자 공격에 노출됩니다."
+        )
+        postgres_layout.addRow("SSL 모드:", sslmode_combo)
+
+        ca_row = QHBoxLayout()
+        sslrootcert_edit = QLineEdit()
+        sslrootcert_edit.setPlaceholderText("비우면 OS 신뢰 인증서 저장소(공인 CA) 사용")
+        sslrootcert_edit.setToolTip(
+            "서버 인증서를 서명한 CA(루트) 인증서 파일(.crt/.pem)입니다.\n"
+            "비우면 OS 신뢰 저장소(Windows 인증서 저장소, macOS /etc/ssl/cert.pem)로 검증합니다.\n"
+            "사설 CA·자체 서명 인증서(또는 macOS 키체인에만 넣은 사내 CA)라면 반드시 지정하세요."
+        )
+        sslrootcert_browse = QPushButton("찾아보기")
+        sslrootcert_browse.setAutoDefault(False)
+        sslrootcert_browse.setToolTip("CA 인증서 파일을 선택합니다.")
+        sslrootcert_browse.clicked.connect(lambda _=False, side=key: self.browse_ca_file(side))
+        ca_row.addWidget(sslrootcert_edit, 1)
+        ca_row.addWidget(sslrootcert_browse)
+        postgres_layout.addRow("CA 인증서:", ca_row)
+
+        insecure_check = QCheckBox("위험 승인: 서버 인증서·호스트 이름을 검증하지 않고 연결")
+        insecure_check.setToolTip(
+            "require 모드는 이 승인이 있어야 연결합니다. 사용할 때마다 보안 감사 로그가 남습니다."
+        )
+        postgres_layout.addRow("", insecure_check)
 
         compat_combo = QComboBox()
         compat_combo.addItems(list(COMPAT_MODE_LABELS.values()))
@@ -237,6 +291,12 @@ class ConnectionDialog(QDialog):
             edit.textChanged.connect(lambda _text, side=key: self._reset_test_result(side))
         port_spin.valueChanged.connect(lambda _v, side=key: self._reset_test_result(side))
         ssl_check.toggled.connect(lambda _c, side=key: self._reset_test_result(side))
+        ssl_check.toggled.connect(lambda _c, side=key: self._update_tls_widgets(side))
+        sslmode_combo.currentIndexChanged.connect(
+            lambda _i, side=key: self._on_tls_setting_changed(side)
+        )
+        sslrootcert_edit.textChanged.connect(lambda _t, side=key: self._reset_test_result(side))
+        insecure_check.toggled.connect(lambda _c, side=key: self._reset_test_result(side))
 
         self.endpoint_widgets[key] = {
             "kind": kind_combo,
@@ -250,6 +310,10 @@ class ConnectionDialog(QDialog):
             "username": username_edit,
             "password": password_edit,
             "ssl": ssl_check,
+            "sslmode": sslmode_combo,
+            "sslrootcert": sslrootcert_edit,
+            "sslrootcert_browse": sslrootcert_browse,
+            "ssl_allow_insecure": insecure_check,
             "compat_mode": compat_combo,
             "test_btn": test_btn,
             "save_preset_btn": save_preset_btn,
@@ -258,7 +322,64 @@ class ConnectionDialog(QDialog):
         }
         self._refresh_presets(key)
         self.on_endpoint_kind_changed(key)
+        self._update_tls_widgets(key)
         return widget
+
+    # ── TLS 설정 ────────────────────────────────────────────
+    def browse_ca_file(self, side: str):
+        current = self.endpoint_widgets[side]["sslrootcert"].text().strip()
+        start_dir = str(Path(current).expanduser().parent) if current else str(Path.home())
+        selected, _ = QFileDialog.getOpenFileName(
+            self,
+            "CA 인증서 선택",
+            start_dir,
+            "인증서 (*.crt *.pem *.cer);;모든 파일 (*)",
+        )
+        if selected:
+            self.endpoint_widgets[side]["sslrootcert"].setText(selected)
+
+    def _on_tls_setting_changed(self, side: str):
+        self._update_tls_widgets(side)
+        self._reset_test_result(side)
+
+    def _update_tls_widgets(self, side: str):
+        widgets = self.endpoint_widgets.get(side)
+        if not widgets or "sslmode" not in widgets:
+            return
+        enabled = widgets["ssl"].isChecked()
+        for name in ("sslmode", "sslrootcert", "sslrootcert_browse", "ssl_allow_insecure"):
+            widgets[name].setEnabled(enabled)
+        # 위험 승인은 검증 없는 모드를 골랐을 때만 보인다.
+        widgets["ssl_allow_insecure"].setVisible(
+            widgets["sslmode"].currentData() == SSLMODE_REQUIRE
+        )
+
+    def _set_tls_ui(self, side: str, config: dict[str, Any]):
+        """프로필/프리셋의 TLS 세부 설정을 UI에 반영한다.
+
+        기존 'SSL 사용' 체크만 있는 프로필은 sslmode가 없으므로 verify-full로 보인다
+        (예전의 검증 없는 require로 되돌리지 않는다).
+        """
+        widgets = self.endpoint_widgets[side]
+        mode = str(config.get(PROFILE_KEY_SSLMODE) or DEFAULT_SSLMODE)
+        index = widgets["sslmode"].findData(mode)
+        widgets["sslmode"].setCurrentIndex(index if index >= 0 else 0)
+        widgets["sslrootcert"].setText(str(config.get(PROFILE_KEY_SSLROOTCERT) or ""))
+        widgets["ssl_allow_insecure"].setChecked(bool(config.get(PROFILE_KEY_ALLOW_INSECURE)))
+        self._update_tls_widgets(side)
+
+    def _apply_tls_to_config(self, side: str, config: dict[str, Any]) -> dict[str, Any]:
+        """SSL을 켠 PostgreSQL 엔드포인트에만 TLS 세부 설정을 싣는다.
+
+        SSL을 끈 프로필은 예전과 같은 모양으로 저장된다.
+        """
+        if config.get("kind") == ENDPOINT_KIND_FILE or not config.get(PROFILE_KEY_SSL):
+            return config
+        widgets = self.endpoint_widgets[side]
+        config[PROFILE_KEY_SSLMODE] = widgets["sslmode"].currentData() or DEFAULT_SSLMODE
+        config[PROFILE_KEY_SSLROOTCERT] = widgets["sslrootcert"].text().strip()
+        config[PROFILE_KEY_ALLOW_INSECURE] = widgets["ssl_allow_insecure"].isChecked()
+        return config
 
     def browse_archive_path(self, side: str):
         current = self.endpoint_widgets[side]["archive_path"].text().strip()
@@ -293,6 +414,8 @@ class ConnectionDialog(QDialog):
         w["username"].setText(preset["username"])
         w["password"].setText(preset["password"])
         w["ssl"].setChecked(preset["ssl"])
+        # 저장된 연결은 SSL 사용 여부만 기억한다. 세부 설정은 안전한 기본값으로 되돌린다.
+        self._set_tls_ui(side, preset)
         mode_label = COMPAT_MODE_LABELS.get(preset["compat_mode"], COMPAT_MODE_LABELS["auto"])
         idx = w["compat_mode"].findText(mode_label)
         if idx >= 0:
@@ -371,6 +494,7 @@ class ConnectionDialog(QDialog):
             ssl=self.endpoint_widgets["source"]["ssl"],
             compat_mode=self.endpoint_widgets["source"]["compat_mode"],
         )
+        self._set_tls_ui("source", self.profile.source_config)
         self.on_endpoint_kind_changed("source")
 
         ConnectionMapper.set_endpoint_ui_from_config(
@@ -385,11 +509,12 @@ class ConnectionDialog(QDialog):
             ssl=self.endpoint_widgets["target"]["ssl"],
             compat_mode=self.endpoint_widgets["target"]["compat_mode"],
         )
+        self._set_tls_ui("target", self.profile.target_config)
         self.on_endpoint_kind_changed("target")
 
     def _get_endpoint_profile_config(self, side: str) -> dict:
         widgets = self.endpoint_widgets[side]
-        return ConnectionMapper.ui_to_endpoint_profile_config(
+        config = ConnectionMapper.ui_to_endpoint_profile_config(
             kind_combo=widgets["kind"],
             archive_path=widgets["archive_path"],
             host=widgets["host"],
@@ -400,6 +525,7 @@ class ConnectionDialog(QDialog):
             ssl=widgets["ssl"],
             compat_mode=widgets["compat_mode"],
         )
+        return self._apply_tls_to_config(side, config)
 
     def _get_endpoint_validation_config(self, side: str) -> dict:
         widgets = self.endpoint_widgets[side]
@@ -449,20 +575,12 @@ class ConnectionDialog(QDialog):
             )
             return
 
-        psycopg_config = ConnectionMapper.ui_to_psycopg_config(
-            widgets["host"],
-            widgets["port"],
-            widgets["database"],
-            widgets["username"],
-            widgets["password"],
-            widgets["ssl"],
-        )
-
         widgets["test_btn"].setEnabled(False)
         QApplication.setOverrideCursor(QCursor(Qt.CursorShape.WaitCursor))
         QApplication.processEvents()  # '확인 중...'이 실제로 보이게 한 번 그린다
         try:
-            with psycopg.connect(**psycopg_config, connect_timeout=7) as conn:
+            # 공용 빌더: 워커와 같은 TLS 검증·search_path로 확인한다.
+            with connect_psycopg(config, connect_timeout=7) as conn:
                 with conn.cursor() as cur:
                     cur.execute("SELECT version()")
                     version_row = cur.fetchone()
@@ -471,6 +589,9 @@ class ConnectionDialog(QDialog):
                         return
                     version_str = version_row[0]
                     version_info = parse_version_string(version_str)
+        except ConnectionConfigError as e:
+            lamp.set_state("error", f"연결 설정 오류 · {e}")
+            return
         except Exception as e:
             lamp.set_state("error", f"연결 실패 · {e}")
             return
@@ -538,6 +659,14 @@ class ConnectionDialog(QDialog):
             valid, msg = VersionValidator.validate_compat_mode(target_compat)
             if not valid:
                 QMessageBox.warning(self, "대상 DB 호환 모드 오류", msg)
+                return
+
+        for title, profile_config in (("소스", source_profile), ("대상", target_profile)):
+            if profile_config.get("kind") == ENDPOINT_KIND_FILE:
+                continue
+            tls_error = validate_tls_settings(profile_config)
+            if tls_error:
+                QMessageBox.warning(self, f"{title} SSL 설정 오류", tls_error)
                 return
 
         valid, msg = ConnectionValidator.validate_endpoint_pair(source_profile, target_profile)

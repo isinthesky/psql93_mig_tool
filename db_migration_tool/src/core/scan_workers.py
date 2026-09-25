@@ -29,12 +29,13 @@ from dataclasses import dataclass
 from datetime import date
 from typing import Any
 
-import psycopg
+import psycopg  # noqa: F401 — 연결은 connect_psycopg로. 기존 테스트가 scan_workers.psycopg.connect를 패치한다
 from psycopg import sql
 from PySide6.QtCore import QThread, Signal
 
 from src.core.archive_manifest import ArchiveManifestStore, ScanCancelled
 from src.core.partition_discovery import PartitionDiscovery
+from src.database.connection_params import connect_psycopg
 from src.database.postgres_utils import PostgresOptimizer
 from src.models.profile import ENDPOINT_KIND_POSTGRES
 from src.utils.validators import ConnectionValidator
@@ -211,20 +212,10 @@ class TargetCompletedScanWorker(ScanWorker):
         # 기본값은 ConnectionProfile이 정규화로 넣어 주지만, 워커는 임의의 dict를
         # 받을 수 있으므로 여기서도 한 겹 더 둔다(키 누락 시 None이 넘어가면
         # libpq 기본값으로 엉뚱한 DB에 붙을 수 있다).
-        conn_params: dict[str, Any] = {
-            "host": self._target_config.get("host", "localhost"),
-            "port": self._target_config.get("port", 5432),
-            "dbname": self._target_config.get("database", ""),
-            "user": self._target_config.get("username", ""),
-            "password": self._target_config.get("password", ""),
-            # 없으면 방화벽이 패킷을 버릴 때 OS 타임아웃까지 취소도 안 먹는다.
-            "connect_timeout": CONNECT_TIMEOUT_SECONDS,
-        }
-        if self._target_config.get("ssl"):
-            conn_params["sslmode"] = "require"
-
+        # 공용 빌더가 누락 키 기본값·TLS 검증·search_path를 채운다. connect_timeout이
+        # 없으면 방화벽이 패킷을 버릴 때 OS 타임아웃까지 취소도 안 먹는다.
         results = dict.fromkeys(self._names, False)
-        conn = psycopg.connect(**conn_params)
+        conn = connect_psycopg(self._target_config, connect_timeout=CONNECT_TIMEOUT_SECONDS)
         # 취소는 다른 스레드에서 conn.cancel()로 들어온다.
         self._track_connection(conn)
         try:
@@ -297,26 +288,16 @@ class RowCountVerifyWorker(ScanWorker):
         self._names = list(table_names)
 
     @staticmethod
-    def _conn_params(config: dict) -> dict[str, Any]:
-        params: dict[str, Any] = {
-            "host": config.get("host", "localhost"),
-            "port": config.get("port", 5432),
-            "dbname": config.get("database", ""),
-            "user": config.get("username", ""),
-            "password": config.get("password", ""),
-            "connect_timeout": CONNECT_TIMEOUT_SECONDS,
-        }
-        if config.get("ssl"):
-            params["sslmode"] = "require"
-        return params
+    def _connect(config: dict) -> Any:
+        return connect_psycopg(config, connect_timeout=CONNECT_TIMEOUT_SECONDS)
 
     def execute(self) -> list[dict[str, Any]]:
         results: list[dict[str, Any]] = []
         total = len(self._names)
 
-        source = psycopg.connect(**self._conn_params(self._source_config))
+        source = self._connect(self._source_config)
         try:
-            target = psycopg.connect(**self._conn_params(self._target_config))
+            target = self._connect(self._target_config)
         except Exception:
             source.close()
             raise

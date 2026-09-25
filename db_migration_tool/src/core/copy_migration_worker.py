@@ -22,6 +22,7 @@ from src.core.table_types import (
     get_partition_primary_key_columns,
     get_table_type,
 )
+from src.database.connection_params import connect_psycopg2
 from src.database.postgres_utils import PostgresOptimizer
 from src.database.version_info import PgVersionInfo
 from src.models.profile import ConnectionProfile
@@ -448,21 +449,8 @@ class CopyMigrationWorker(BaseMigrationWorker):
         Note: 기존 최적화 대신 버전별 최적화를 나중에 적용합니다.
         """
         try:
-            # 연결 파라미터 준비
-            conn_params = {
-                "host": config.get("host", "localhost"),
-                "port": config.get("port", 5432),
-                "database": config.get("database", ""),
-                "user": config.get("username", ""),
-                "password": config.get("password", ""),
-            }
-
-            # SSL 설정
-            if config.get("ssl"):
-                conn_params["sslmode"] = "require"
-
-            # 연결 생성
-            conn = psycopg2.connect(**conn_params)
+            # 공용 빌더: TLS 서버 신원 검증, connect_timeout, search_path=public
+            conn = connect_psycopg2(config)
             conn.autocommit = False
 
             self.log.emit("PostgreSQL 연결 생성 완료", "INFO")
