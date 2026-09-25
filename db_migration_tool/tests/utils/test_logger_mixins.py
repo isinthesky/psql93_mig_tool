@@ -251,3 +251,51 @@ class TestDatabaseLoggerMixin:
 
         mixin1.close()
         mixin2.close()
+
+
+class _RecordingSession:
+    def __init__(self, sink: list):
+        self.sink = sink
+        self._pending: list = []
+
+    def add(self, entry) -> None:
+        self._pending.append(entry)
+
+    def commit(self) -> None:
+        self.sink.extend(self._pending)
+        self._pending = []
+
+    def rollback(self) -> None:
+        self._pending = []
+
+    def close(self) -> None:
+        pass
+
+
+class _RecordingDb:
+    def __init__(self):
+        self.saved: list = []
+
+    def get_session(self):
+        return _RecordingSession(self.saved)
+
+
+class TestDatabaseLoggerShutdownFlush:
+    """앱 종료(감사 M-13): close()는 큐에 남은 DB 로그를 버리지 않고 모두 쓴다."""
+
+    def test_close_writes_every_queued_log(self, monkeypatch):
+        fake_db = _RecordingDb()
+        monkeypatch.setattr("src.database.local_db.get_db", lambda: fake_db)
+        mixin = DatabaseLoggerMixin()
+        mixin.set_session_id("S")
+        for i in range(350):  # writer는 0.1초마다 최대 100건씩 쓴다
+            mixin.log_to_db("INFO", f"m{i}")
+
+        mixin._start_db_thread()
+        mixin.close()
+
+        assert mixin.db_thread is not None and not mixin.db_thread.is_alive()
+        messages = [entry.message for entry in fake_db.saved]
+        assert len(messages) == 350, f"종료 때 로그 {350 - len(messages)}건을 잃었습니다"
+        assert messages[0] == "m0" and messages[-1] == "m349"
+        assert mixin.db_queue.empty()

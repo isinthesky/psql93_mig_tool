@@ -50,6 +50,8 @@ class MainWindow(QMainWindow):
 
         # 트레이 아이콘 관련
         self.tray_icon = None  # TrayIconManager 인스턴스 (main.py에서 설정)
+        # 앱 종료 조정자(감사 M-13, main.py에서 설정). 트레이가 없을 때 창 닫기가 이것을 거친다.
+        self.shutdown_coordinator = None
         self.minimize_to_tray = True  # 트레이 최소화 활성화 (설정으로 관리 가능)
         self.first_minimize = True  # 첫 최소화 여부
 
@@ -678,7 +680,13 @@ class MainWindow(QMainWindow):
                 self.tray_icon.notify_first_minimize()
                 self.first_minimize = False
         else:
-            # 실제 종료
+            # 실제 종료 — 트레이가 없으면 창 닫기가 곧 앱 종료다. 워커를 멈추고 flush한 뒤
+            # 조정자가 이벤트 루프를 끝낸다(감사 M-13). 예전엔 창만 닫히고 프로세스가 남았다.
+            coordinator = getattr(self, "shutdown_coordinator", None)
+            if coordinator is not None and not coordinator.is_finished:
+                event.ignore()
+                coordinator.request_shutdown()
+                return
             event.accept()
 
     def changeEvent(self, event: QEvent):

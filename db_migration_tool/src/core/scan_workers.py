@@ -35,6 +35,7 @@ from PySide6.QtCore import QThread, Signal
 
 from src.core.archive_manifest import ArchiveManifestStore, ScanCancelled
 from src.core.partition_discovery import PartitionDiscovery
+from src.core.worker_registry import register_worker, unregister_worker
 from src.database.connection_params import connect_psycopg
 from src.database.postgres_utils import PUBLIC_SCHEMA, PostgresOptimizer
 from src.models.profile import ENDPOINT_KIND_POSTGRES
@@ -93,7 +94,20 @@ class ScanWorker(QThread):
     def execute(self) -> Any:
         raise NotImplementedError
 
+    def start(self, priority: QThread.Priority = QThread.Priority.InheritPriority) -> None:
+        """스레드를 띄우고 앱 종료 레지스트리에 등록한다(감사 M-13)."""
+        register_worker(self)
+        super().start(priority)
+
     def run(self) -> None:
+        # 앱 종료 레지스트리(M-13). 종료가 이미 시작됐으면 여기서 곧바로 중단 요청을 받는다.
+        register_worker(self)
+        try:
+            self._run_scan()
+        finally:
+            unregister_worker(self)
+
+    def _run_scan(self) -> None:
         try:
             payload = self.execute()
         except ScanCancelled:

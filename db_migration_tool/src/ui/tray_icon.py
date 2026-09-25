@@ -38,6 +38,8 @@ class TrayIconManager(QObject):
         # cleanup() 후에는 다시 None이 되므로 사용 전 항상 확인한다.
         self.tray_icon: QSystemTrayIcon | None = None
         self.is_migration_running = False
+        # 종료 조정자가 워커를 멈추는 중(M-13). 이때 들어오는 '실행 끝' 알림이 '종료 중' 표시를 덮지 않게 한다.
+        self.is_shutting_down = False
 
         # 아이콘 경로 저장 (main.py의 get_resource_path 사용)
         from src.main import get_resource_path
@@ -178,15 +180,27 @@ class TrayIconManager(QObject):
         )
 
     def _quit_app(self):
-        """애플리케이션 종료"""
+        """애플리케이션 종료를 요청한다(감사 M-13).
+
+        여기서 `app.quit()`을 직접 부르지 않는다. 실행 중인 워커를 stop/cancel/wait 없이 끝내면
+        QThread가 파괴돼 프로세스가 abort하고, 진행 중 배치·manifest·로그가 정리되지 않는다.
+        `quit_requested`를 받은 종료 조정자(`ShutdownCoordinator`)가 워커를 멈추고 flush한 뒤
+        트레이를 정리(`cleanup`)하고 이벤트 루프를 끝낸다.
+        """
         # 마이그레이션 실행 중이면 확인 메시지 표시
         if self.is_migration_running:
             from PySide6.QtWidgets import QMessageBox
 
+            from src.core.worker_registry import DEFAULT_SHUTDOWN_TIMEOUT_SECONDS
+
             reply = QMessageBox.question(
                 self.main_window,
                 "종료 확인",
-                "마이그레이션이 실행 중입니다.\n정말 종료하시겠습니까?",
+                "마이그레이션이 실행 중입니다.\n\n"
+                "종료하면 작업을 멈추고(진행 중인 배치는 롤백, 커밋된 배치는 유지) "
+                f"최대 {DEFAULT_SHUTDOWN_TIMEOUT_SECONDS:.0f}초 기다린 뒤 끝냅니다.\n"
+                "다음에 '이어서 시작'으로 남은 부분부터 재개할 수 있습니다.\n\n"
+                "종료하시겠습니까?",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No,
             )
@@ -195,8 +209,6 @@ class TrayIconManager(QObject):
                 return
 
         self.quit_requested.emit()
-        self.cleanup()
-        self.app.quit()
 
     def _on_message_clicked(self):
         """알림 메시지 클릭 처리"""
@@ -237,8 +249,14 @@ class TrayIconManager(QObject):
             self._set_normal_icon()
             tooltip = "DB Migration Tool - 대기 중"
 
-        if self.tray_icon:
+        if self.tray_icon and not self.is_shutting_down:
             self.tray_icon.setToolTip(tooltip)
+
+    def show_shutting_down(self):
+        """종료 조정자가 워커를 멈추는 동안 '종료 중'임을 보여 준다."""
+        self.is_shutting_down = True
+        if self.tray_icon:
+            self.tray_icon.setToolTip("DB Migration Tool - 종료 중(실행 중인 작업 정리)")
 
     def notify_first_minimize(self):
         """첫 최소화 시 안내 메시지"""

@@ -103,3 +103,22 @@
 - import는 대상 DB 연결 전에 `require_trusted()`와 전 파일 사전 검증을 하고, DDL은
   검증된 메모리 manifest(`ManifestTableCreator(manifest=...)`)로만 만든다. 디스크를 다시 읽지 않는다.
 - passphrase는 워커 `configure_archive_security()`로만 받는다. 저장·로그 금지.
+
+## 앱 종료 규약 (감사 M-13)
+구현은 `worker_registry.py`, 배선은 `src/main.py`(`build_shutdown_coordinator`/`finalize_exit`).
+
+- 모든 QThread 워커(`BaseMigrationWorker`·`ScanWorker` 계열)는 `start()`/`run()` 시작에서
+  `register_worker()`로 등록되고 `run()` 끝에서 해제된다. 새 워커 베이스를 만들면 같은 훅을 단다.
+  레지스트리는 약한 참조라 수명을 늘리지 않는다.
+- 트레이 '종료'·(트레이 없는) 창 닫기는 `app.quit()`을 직접 부르지 않고 `ShutdownCoordinator`를 거친다:
+  전체 `stop("app_shutdown")`(+ 조회 워커 `cancel_query()`) → 제한 시간(30초) 대기 → flush(로거 DB 큐 → 로컬 DB)
+  → `app.exit(0)`. 아카이브 manifest는 워커 `finally`의 `save()`가 flush하고 대기가 그것을 기다린다.
+- 제한 시간 초과는 WARNING 후 `forced`. 도는 QThread를 파괴하면 abort하므로 `stuck_workers`로 붙들고
+  `finalize_exit`가 `logging.shutdown()` 뒤 `os._exit`로 끝낸다. 미커밋 배치는 DB가 연결 종료로 롤백한다.
+- 종료 중에 시작한 워커는 등록 즉시 멈춘다.
+- `stop()`은 UI 스레드에서 불린다. 네트워크 호출(cancel·rollback)을 직접 하지 말고 `_on_stop_requested()`에서
+  `_cancel_connections_async()`를 쓴다(아카이브 워커 포함). 연결을 닫기 전에는 `_stop_cancel_retries()`로
+  cancel 반복을 멈춘다(psycopg2 cancel·close 경합). `CopyMigrationWorker`의 finally는 아직 close 뒤에
+  `_work_finished`를 세운다(H-02 리뷰 잔여).
+- 테스트: `tests/core/test_worker_shutdown.py`(단계별 종료·timeout 강제 종료·임시 파일/잠금/스레드 누수),
+  `tests/test_main_shutdown.py`(배선·중첩 모달 루프 종료).
