@@ -275,3 +275,36 @@
 
 남은 항목: H-01(UI 표시), H-02·H-04 잔여, H-03, M-01, M-03, M-11(인증서), M-13, M-14와 위 리뷰 지적.
 재감사 전까지 운영 승인 보류 원칙은 유지한다.
+
+### 8.4 wave2 통합 (main 병합, 2026-09-25)
+
+`audit/w2-copy` → `audit/w2-sql` 순으로 `--no-ff` 병합했다. 두 브랜치 모두 1차 리뷰 major를 TDD로 수리했고
+2차 리뷰가 pass였다.
+
+| ID | 상태 | 요약 | 남은 것(리뷰 지적) |
+|---|---|---|---|
+| H-02 | 해결(연결 수립 단계 제외) | `stop()` → `_on_stop_requested()`: `CopyStreamBuffer` 취소와 원본·대상 `cancel()`을 백그라운드에서 작업 종료까지 반복한다. 중지 뒤에는 새 commit을 시작하지 않는다. 중지는 오류가 아니라 `CopyCancelled`로 처리하고 checkpoint를 `failed`로 바꾸지 않는다. 승인하거나 자동으로 수행한 TRUNCATE는 COPY 전에 따로 커밋한다. 재개 keep은 checkpoint에 `rows_processed>0`이 있을 때만 하고, 기록이 없으면 확인(ask)한다. | 연결 수립 단계는 `connect_timeout`(10초)에만 묶인다. 아카이브 워커 훅이 없다(M-13과 함께 처리). `finally`의 close와 cancel 스레드가 경합한다(`_work_finished.set()`과 join을 close보다 먼저 해야 한다). 대상 준비 commit 앞에 `_raise_if_stopped`가 없다. 커밋 기록 없는 재개에서 checkpoint `last_path_id`를 초기화하지 않는다(COUNT로 fail-closed) |
+| H-03 | 해결(한계 3) | 파티션마다 원본 `REPEATABLE READ, READ ONLY` 트랜잭션 하나에서 배치, Server COPY, 완료 검증 COUNT를 실행한다. | 재개는 새 snapshot이라 이미 복사한 행의 update를 탐지하지 못한다. 일시정지 중에도 원본 xmin을 붙잡는다(UI 안내 없음). PG 9.3에서 동시 쓰기를 검증하지 못했다 |
+| H-04 | 해결 | COPY 워커는 `_relation()`, 그 밖의 코드는 `qualified_name`/`sql.Identifier("public", …)`로 모든 relation을 `"public"`에 한정했다. `information_schema` 조회에는 모두 `table_schema='public'`을 붙였다(아카이브 부모 컬럼 조회 포함). 트리거 본문은 `format('%I.%I','public',…)`을 쓴다. 병합 뒤 `sql.Identifier(partition_name)`는 0건이다. | 운영 bms30의 기존 트리거 함수는 부모를 다시 만들 때만 교체된다. `nextval('seq'::regclass)` DEFAULT는 schema가 없다. schema 상수가 `PUBLIC_SCHEMA`와 `RELATION_SCHEMA`로 중복돼 있다 |
+| M-01 | 해결 | `_estimate_row_count`를 SAVEPOINT로 격리했다. 실패하면 0을 반환하고 탐색을 이어 간다. | — |
+| M-03 | 해결(제거) | OFFSET 기반 legacy `MigrationWorker`(`migration_worker.py`)를 삭제했다. 생성하는 곳이 없었다. | — |
+| M-14 | 해결 | 파티션 생성 DDL과 metadata를 한 트랜잭션으로 묶어 `commit_or_raise`로 커밋하고, 실패하면 rollback한다. 무시해도 되는 인덱스·CLUSTER 오류만 SQLSTATE 허용 목록으로 SAVEPOINT 격리한다. `apply_params`의 SET 실패도 SAVEPOINT로 처리한다. | 부모 잠금 구간이 길어져 여러 인스턴스가 동시에 생성하면 경합할 수 있다(즉시 실패 후 rollback) |
+
+병합 중 처리
+- 텍스트 충돌은 `src/core/CLAUDE.md` 한 곳이었다. 취소 규약·원본 snapshot 절(w2-copy)과 SQL 경계 규칙 절(w2-sql)을 모두
+  살렸다. M-03 삭제로 틀린 설명이 된 'psycopg3(탐색·legacy 워커)'는 'psycopg3(탐색)'로 고쳤다.
+- 코드 충돌은 없었다. w2-sql 리뷰가 남긴 migration_worker.py `information_schema` 필터 누락은 M-03 삭제로 함께 없어졌다.
+
+동작 변경(릴리스 노트)
+- 사용자 중지와 비 skip 모드의 TRUNCATE 거부는 '오류'가 아니라 '중단'으로 끝난다. '이어서 시작'으로 재개할 수 있다.
+- TRUNCATE를 승인(또는 server 모드가 자동 TRUNCATE)한 뒤 이관이 실패하거나 중지돼도 옛 대상 데이터는 되살아나지 않는다.
+- 커밋된 배치 기록이 없는 파티션을 재개할 때 대상에 행이 있으면 TRUNCATE 확인 창이 뜬다.
+
+검증: 단위 1070 passed / 3 skipped / 21 deselected, ruff format(146 files)·check, mypy(60 files) 통과.
+실DB E2E(bms93 PG 9.3 → temp PG 16, `--drop-after`): Python COPY `point_history_260510`(4,702,204행, 32.7s),
+Server COPY `point_history_260511`(4,705,733행, 20.1s), 중단→재개 `point_history_260512`(500,000행에서 중지,
+재개 후 4,708,021행, identity 게이트 확인). 세 경우 모두 원본·대상 집계 5종이 일치했다. 실행 뒤
+temp `partition_table_info`에 남은 세 행도 지웠다.
+
+남은 항목: H-01(UI 표시), M-11(인증서), M-13, 위 리뷰 지적, CI의 PG 통합 테스트 job(9.x 포함).
+재감사 전까지 운영 승인 보류 원칙은 유지한다.

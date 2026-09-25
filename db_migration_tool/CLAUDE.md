@@ -31,8 +31,8 @@
 - 두 컨테이너가 `healthy`인지 검증 전에 먼저 확인한다(외장 볼륨 분리 이력 있음).
 
 ## 3. Code map (`src/`)
-- `core/` — 마이그레이션 엔진. `copy_migration_worker.py`(1259줄, COPY 스트리밍 워커 —
-  §6 이슈 다수의 진원지), `migration_worker.py`(legacy INSERT/OFFSET 워커),
+- `core/` — 마이그레이션 엔진. `copy_migration_worker.py`(1558줄, COPY 스트리밍 워커 — 유일한
+  이관 워커. 취소·원본 snapshot 규칙은 `src/core/CLAUDE.md`. legacy INSERT/OFFSET 워커는 M-03으로 삭제),
   `table_creator.py`(대상 테이블·파티션·트리거 DDL 생성), `partition_discovery.py`
   (날짜별 파티션 탐색), `base_migration_worker.py`(공통 워커 기반), `scan_workers.py`,
   `file_archive_workers.py`(파일 export/import), `archive_manifest.py`(아카이브 manifest),
@@ -103,6 +103,9 @@ installer\build_installer.bat              :: Inno Setup -> dist\installer\DBMig
 **2026-09-25 wave1 병합(main)**: H-05, H-06, H-08, H-09, M-02, M-04~M-10, M-12 해결, H-02·H-04는 연결 단계만,
 M-11은 서명 훅만(인증서 없음). 상세와 남은 리뷰 지적은 감사 문서 §8.1~§8.3. 나머지(H-01 UI, H-03, M-01, M-03,
 M-13, M-14 등)는 미해결.
+
+**2026-09-25 wave2 병합(main)**: H-02(연결 수립 단계는 `connect_timeout` 상한), H-03(한계 3), H-04, M-01, M-03(legacy
+워커 삭제), M-14 해결. 상세·남은 리뷰 지적·동작 변경은 감사 문서 §8.4. 미해결: H-01 UI, M-11 인증서, M-13.
 
 - **C-01** — `CopyStreamBuffer.close()`가 큐 포화 시 취소 상태를 설정하지만 `read()`가 남은 데이터를
   비우지 않고 EOF를 반환한다. 대상에는 앞부분만 반영되는데 checkpoint는 전진할 수 있다
