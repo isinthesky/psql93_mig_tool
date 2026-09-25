@@ -36,7 +36,7 @@ from PySide6.QtCore import QThread, Signal
 from src.core.archive_manifest import ArchiveManifestStore, ScanCancelled
 from src.core.partition_discovery import PartitionDiscovery
 from src.database.connection_params import connect_psycopg
-from src.database.postgres_utils import PostgresOptimizer
+from src.database.postgres_utils import PUBLIC_SCHEMA, PostgresOptimizer
 from src.models.profile import ENDPOINT_KIND_POSTGRES
 from src.utils.validators import ConnectionValidator
 
@@ -245,8 +245,12 @@ class TargetCompletedScanWorker(ScanWorker):
                     try:
                         # '데이터가 있는가'만 알면 되므로 COUNT(*)로 전수를 세지 않는다.
                         # 대용량 파티션에서 확인이 수 분씩 걸리던 원인.
+                        # 위 존재 확인은 public을 봤다. 조회도 public으로 한정해야
+                        # search_path 선행 스키마의 동명 테이블을 읽지 않는다(H-04).
                         cur.execute(
-                            sql.SQL("SELECT 1 FROM {} LIMIT 1").format(sql.Identifier(name))
+                            sql.SQL("SELECT 1 FROM {} LIMIT 1").format(
+                                sql.Identifier(PUBLIC_SCHEMA, name)
+                            )
                         )
                         results[name] = cur.fetchone() is not None
                     except Exception:
@@ -314,7 +318,9 @@ class RowCountVerifyWorker(ScanWorker):
                     if self.should_stop():
                         raise ScanCancelled("검증이 취소되었습니다")
 
-                    query = sql.SQL("SELECT COUNT(*) FROM {}").format(sql.Identifier(name))
+                    query = sql.SQL("SELECT COUNT(*) FROM {}").format(
+                        sql.Identifier(PUBLIC_SCHEMA, name)
+                    )
                     s_cur.execute(query)
                     s_row = s_cur.fetchone()
                     t_cur.execute(query)

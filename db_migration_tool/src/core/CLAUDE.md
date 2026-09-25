@@ -59,7 +59,25 @@
   `REPEATABLE READ, READ ONLY` 트랜잭션에서 읽습니다(`_begin_source_snapshot`, PG 9.1+ → 9.3 지원).
   이 구간에서 원본 연결에 commit/rollback을 끼워 넣지 않습니다.
 - 재개는 새 snapshot입니다. 실행 사이 원본 삽입·삭제는 완료 검증 COUNT가 불일치로 드러냅니다.
-- 모든 relation은 `_relation(name)` = `"public"."name"`으로 한정합니다(H-04).
+- 모든 relation은 `_relation(name)` = `"public"."name"`으로 한정합니다(H-04, 아래 SQL 경계 규칙 참고).
+
+## SQL 경계 규칙 (감사 H-04 / M-01 / M-14)
+헬퍼는 `src/database/postgres_utils.py`에 있다. psycopg2(COPY 워커)·psycopg3(탐색)가
+섞이므로 드라이버 전용 API 대신 이 헬퍼를 쓴다.
+
+- relation은 `qualified_name(name)`(= `"public"."name"`) 또는 `sql.Identifier("public", name)`로
+  schema를 한정한다(COPY 워커는 `RELATION_SCHEMA`/`_relation()`). 이름 문자열을 `regclass`로
+  바꾸는 함수(`pg_table_size('name')`)는 쓰지 않고 카탈로그 oid를 쓴다. 연결의 `search_path=public`은 2차 방어일 뿐이다.
+- `information_schema.columns/tables`는 search_path와 무관하게 모든 스키마를 보여 주므로
+  반드시 `table_schema = 'public'` 조건을 붙인다(search_path 방어가 통하지 않는다).
+- 실패해도 되는 문장은 `isolated_statement()`/`run_optional_statement()`(SAVEPOINT)로 감싼다.
+  예외를 잡기만 하면 트랜잭션이 중단돼 이후 문장이 전부 `25P02`로 거부된다.
+- 무시 여부는 예외 클래스가 아니라 `sqlstate_of()`로 판단한다(허용 목록 밖은 즉시 실패).
+- 커밋은 `commit_or_raise()` — 중단된 트랜잭션의 COMMIT은 오류 없이 ROLLBACK이 된다.
+- `TableCreator.create_partition_table()`: 부모·파티션·인덱스·트리거/RULE·CLUSTER·
+  `partition_table_info`를 한 트랜잭션으로 묶어 마지막에 한 번 커밋, 실패 시 rollback.
+- 테스트: `tests/database/fake_pg.py`(중단 트랜잭션 규칙을 지키는 가짜 연결), 실DB는
+  `tests/integration/test_sql_boundaries_realdb.py`(`DBMIG_REALDB_SQL_TESTS=1`, temp DB만 씀).
 
 ## 동작 시나리오
 1. UI 또는 서비스가 요청을 보내면 `partition_discovery.py`가 대상 파티션을 반환합니다.

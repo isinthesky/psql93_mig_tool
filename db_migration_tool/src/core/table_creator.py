@@ -10,7 +10,13 @@ import re
 from datetime import datetime
 from typing import Any
 
-import psycopg
+from src.database.postgres_utils import (
+    commit_or_raise,
+    qualified_name,
+    quote_ident,
+    rollback_quietly,
+    run_optional_statement,
+)
 
 from .table_types import (
     TABLE_TYPE_CONFIG,
@@ -22,6 +28,15 @@ from .table_types import (
 )
 
 logger = logging.getLogger(__name__)
+
+# ── 선택 DDL에서 무시해도 되는 SQLSTATE (감사 M-14) ──────────────────────
+# 목록 밖의 오류(취소 57014, 연결 오류, 디스크 부족 등)는 필수 DDL과 똑같이 즉시 실패한다.
+# 인덱스: 9.3은 CREATE INDEX IF NOT EXISTS가 없다. 같은 이름이 이미 있으면(42P07,
+# 드물게 42710) 건너뛴다. 권한 부족(42501)도 데이터 정합성과 무관한 성능 인덱스라 경고만 한다.
+IGNORABLE_INDEX_SQLSTATES = frozenset({"42P07", "42710", "42501"})
+# CLUSTER: 물리 정렬만 바꾸는 최적화다. PK 인덱스 없음(42704)·권한 부족(42501)·
+# 대상 종류가 맞지 않음(42809)·전제 상태 불충족(55000)·미지원(0A000)은 건너뛴다.
+IGNORABLE_CLUSTER_SQLSTATES = frozenset({"42704", "42501", "42809", "55000", "0A000"})
 
 # 안전한 식별자 패턴: 영문자, 숫자, 언더스코어만 허용
 _SAFE_IDENTIFIER_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
@@ -79,7 +94,7 @@ def _build_column_definition(column: dict[str, Any]) -> str:
 
     _validate_identifier(col_name)
 
-    col_def = f"    {col_name} {data_type}"
+    col_def = f"    {quote_ident(col_name)} {data_type}"
     if max_length:
         col_def += f"({int(max_length)})"
     if is_nullable == "NO":
@@ -93,7 +108,19 @@ def _build_column_definition(column: dict[str, Any]) -> str:
 
 
 class TableCreator:
-    """대상 테이블 생성 클래스"""
+    """대상 테이블 생성 클래스
+
+    SQL 경계 규칙(감사 H-04 / M-14)
+    - relation은 모두 `"public"."이름"`으로 한정하고 식별자는 quote한다. 연결의
+      search_path가 바뀌어도(선행 스키마의 동명 객체) public 객체만 건드린다.
+    - 부모 테이블·파티션·인덱스·트리거/RULE·CLUSTER·`partition_table_info` 기록은
+      **한 트랜잭션**이다. `create_partition_table()`이 끝에 한 번 커밋하고, 실패하면
+      rollback해 일부만 남지 않는다(테이블 없는 metadata, metadata 없는 테이블 모두 금지).
+    - 실패해도 되는 DDL(중복 인덱스, CLUSTER 실패)은 SAVEPOINT로 격리해 트랜잭션을
+      중단시키지 않는다. 그 밖의 오류는 즉시 실패한다.
+    - psycopg2(COPY 워커)·psycopg3(legacy 워커) 연결이 모두 들어오므로 예외는 드라이버
+      클래스가 아니라 SQLSTATE로 분류한다(`postgres_utils.sqlstate_of`).
+    """
 
     def __init__(self, source_conn: Any, target_conn: Any):
         """
@@ -134,6 +161,7 @@ class TableCreator:
             print(f"  - 테이블 타입: {table_type_name} ({partition_info['table_data']})")
             print(f"  - 파티셔닝: {'TRIGGER' if table_type.uses_trigger else 'RULE'}")
 
+            # 여기서부터 대상 쪽 DDL과 metadata는 한 트랜잭션이다(끝에서 한 번 커밋).
             # 대상에 부모 테이블 존재 확인
             if not self._check_parent_table_exists(parent_table):
                 print(f"부모 테이블 {parent_table}이 없어 생성합니다")
@@ -144,17 +172,20 @@ class TableCreator:
             print(f"파티션 테이블 {partition_name} 생성 중...")
             self._create_partition(partition_name, parent_table, partition_info)
 
-            # partition_table_info에 추가
-            self._add_partition_info(partition_name, partition_info)
+            # partition_table_info에 추가 (같은 트랜잭션)
+            self._add_partition_info(partition_name, partition_info, commit=False)
+
+            # DDL과 metadata를 함께 확정한다. 트랜잭션이 중단 상태면 커밋하지 않고 실패한다.
+            commit_or_raise(self.target_conn)
 
             print(f"[OK] 파티션 테이블 생성 완료: {partition_name}")
             return True
 
         except Exception as e:
-            import traceback
-
-            traceback.print_exc()
-            raise Exception(f"테이블 생성 오류: {str(e)}")
+            # 일부 DDL이나 metadata만 남지 않게 되돌리고, 연결을 중단 상태로 남기지 않는다.
+            rollback_quietly(self.target_conn)
+            logger.exception("테이블 생성 실패: %s", partition_name)
+            raise Exception(f"테이블 생성 오류: {str(e)}") from e
 
     def _get_partition_info(self, partition_name: str, parent_table: str) -> dict[str, Any]:
         """
@@ -168,7 +199,7 @@ class TableCreator:
             cur.execute(
                 """
                 SELECT table_data, from_date, to_date
-                FROM partition_table_info
+                FROM public.partition_table_info
                 WHERE table_name = %s
             """,
                 (partition_name,),
@@ -247,8 +278,6 @@ class TableCreator:
             except ValueError:
                 raise Exception(f"알 수 없는 테이블 타입: {parent_table}")
 
-        config = TABLE_TYPE_CONFIG[table_type]
-
         with self.source_conn.cursor() as source_cur:
             # 소스에서 테이블 구조 가져오기
             source_cur.execute(
@@ -260,7 +289,8 @@ class TableCreator:
                     is_nullable,
                     column_default
                 FROM information_schema.columns
-                WHERE table_name = %s
+                WHERE table_schema = 'public'
+                AND table_name = %s
                 ORDER BY ordinal_position
             """,
                 (parent_table,),
@@ -287,7 +317,18 @@ class TableCreator:
                 )
             )
 
-        create_sql = f"CREATE TABLE IF NOT EXISTS {parent_table} (\n"
+        self._execute_parent_ddl(parent_table, table_type, column_defs)
+
+    def _execute_parent_ddl(
+        self, parent_table: str, table_type: TableType, column_defs: list[str]
+    ) -> None:
+        """부모 테이블 DDL(+트리거/인덱스)을 실행한다. 커밋하지 않는다(호출 트랜잭션에 포함).
+
+        ManifestTableCreator도 컬럼 정의만 다르게 만들어 이 경로를 쓴다.
+        """
+        _validate_identifier(parent_table)
+        config = TABLE_TYPE_CONFIG[table_type]
+        create_sql = f"CREATE TABLE IF NOT EXISTS {qualified_name(parent_table)} (\n"
         create_sql += ",\n".join(column_defs) + "\n)"
 
         # 대상에 테이블 생성
@@ -302,8 +343,6 @@ class TableCreator:
                 # RULE 기반 파티셔닝은 파티션별로 생성되므로 여기서는 스킵
                 # 인덱스만 생성
                 self._create_parent_indexes(parent_table, table_type, target_cur)
-
-            self.target_conn.commit()
 
     def _create_partition(
         self, partition_name: str, parent_table: str, partition_info: dict[str, Any]
@@ -333,6 +372,9 @@ class TableCreator:
         _validate_identifier(partition_name)
         _validate_identifier(parent_table)
         _validate_identifier(config.date_column)
+        partition_rel = qualified_name(partition_name)
+        parent_rel = qualified_name(parent_table)
+        date_col = quote_ident(config.date_column)
 
         with self.target_conn.cursor() as cur:
             # CHECK constraint 생성
@@ -344,14 +386,10 @@ class TableCreator:
                 if config.date_is_timestamp:
                     from_ts = f"to_timestamp({from_date_val}::double precision / 1000)"
                     to_ts = f"to_timestamp({to_date_val}::double precision / 1000)"
-                    date_check = (
-                        f"CHECK({config.date_column} >= {from_ts} "
-                        f"AND {config.date_column} <= {to_ts})"
-                    )
+                    date_check = f"CHECK({date_col} >= {from_ts} AND {date_col} <= {to_ts})"
                 else:
                     date_check = (
-                        f"CHECK({config.date_column} >= {from_date_val} "
-                        f"AND {config.date_column} <= {to_date_val})"
+                        f"CHECK({date_col} >= {from_date_val} AND {date_col} <= {to_date_val})"
                     )
 
             # 테이블 타입별 constraint 추가
@@ -360,24 +398,27 @@ class TableCreator:
             if pk_columns:
                 for pk_col in pk_columns:
                     _validate_identifier(pk_col)
+                pk_list = ", ".join(quote_ident(c) for c in pk_columns)
                 constraints.append(
-                    f"CONSTRAINT {partition_name}_pkey PRIMARY KEY({', '.join(pk_columns)})"
+                    f"CONSTRAINT {quote_ident(partition_name + '_pkey')} PRIMARY KEY({pk_list})"
                 )
             if date_check:
-                constraints.append(f"CONSTRAINT {partition_name}_issued_date_check {date_check}")
+                constraints.append(
+                    f"CONSTRAINT {quote_ident(partition_name + '_issued_date_check')} {date_check}"
+                )
 
-            # CREATE TABLE 문 생성
+            # CREATE TABLE 문 생성 (필수 DDL — 실패하면 즉시 예외)
             if constraints:
                 constraint_str = ",\n        ".join(constraints)
                 create_sql = f"""
-                    CREATE TABLE IF NOT EXISTS {partition_name} (
+                    CREATE TABLE IF NOT EXISTS {partition_rel} (
                         {constraint_str}
-                    ) INHERITS ({parent_table})
+                    ) INHERITS ({parent_rel})
                 """
             else:
                 create_sql = f"""
-                    CREATE TABLE IF NOT EXISTS {partition_name}
-                    INHERITS ({parent_table})
+                    CREATE TABLE IF NOT EXISTS {partition_rel}
+                    INHERITS ({parent_rel})
                 """
 
             cur.execute(create_sql)
@@ -393,31 +434,33 @@ class TableCreator:
                 self._create_indexes(
                     cur,
                     [
-                        f"CREATE INDEX {partition_name}_idx ON {partition_name} USING btree (path_id, issued_date)",
+                        f"CREATE INDEX {quote_ident(partition_name + '_idx')} ON {partition_rel} "
+                        f"USING btree (path_id, issued_date)",
                     ],
                 )
 
-            # historical DDL 관례상 일부 타입은 partition PK로 CLUSTER
+            # historical DDL 관례상 일부 타입은 partition PK로 CLUSTER.
+            # 선택 DDL: 실패해도 SAVEPOINT로 격리해 트랜잭션을 중단시키지 않는다(M-14).
             if should_cluster_partition_by_pkey(table_type):
-                try:
-                    cur.execute(f"""
-                        CLUSTER {partition_name} USING {partition_name}_pkey
-                    """)
+                clustered = run_optional_statement(
+                    self.target_conn,
+                    cur,
+                    f"CLUSTER {partition_rel} USING {quote_ident(partition_name + '_pkey')}",
+                    ignorable=IGNORABLE_CLUSTER_SQLSTATES,
+                    label=f"CLUSTER {partition_name}",
+                )
+                if clustered:
                     print(f"  [OK] 클러스터링 완료: {partition_name}")
-                except psycopg.errors.UndefinedObject:
-                    print(f"  [WARN] 클러스터링 스킵: {partition_name} - PRIMARY KEY 인덱스가 없음")
-                except psycopg.errors.InsufficientPrivilege:
-                    print(f"  [WARN] 클러스터링 실패: {partition_name} - 권한 부족")
-                except Exception as e:
-                    print(f"  [WARN] 클러스터링 실패: {partition_name} - {type(e).__name__}: {e}")
-
-            self.target_conn.commit()
+                else:
+                    print(f"  [WARN] 클러스터링 스킵: {partition_name}")
+            # 커밋하지 않는다 — create_partition_table()이 metadata까지 묶어 커밋한다.
 
     def _sync_partition_info(self, partition_name: str):
         """소스 DB의 partition_table_info를 대상 DB에 동기화"""
         with self.source_conn.cursor() as cur:
             cur.execute(
-                "SELECT table_data, from_date, to_date FROM partition_table_info WHERE table_name = %s",
+                "SELECT table_data, from_date, to_date FROM public.partition_table_info "
+                "WHERE table_name = %s",
                 (partition_name,),
             )
             row = cur.fetchone()
@@ -431,8 +474,25 @@ class TableCreator:
                 },
             )
 
-    def _add_partition_info(self, partition_name: str, partition_info: dict[str, Any]):
-        """partition_table_info에 정보 추가 또는 갱신 (upsert)"""
+    def _add_partition_info(
+        self, partition_name: str, partition_info: dict[str, Any], *, commit: bool = True
+    ):
+        """partition_table_info에 정보 추가 또는 갱신 (upsert)
+
+        Args:
+            commit: False면 호출자 트랜잭션에 남긴다(테이블 생성과 함께 커밋하기 위해).
+                True(기존 동작)면 여기서 커밋하고, 실패하면 rollback한다.
+        """
+        try:
+            self._upsert_partition_info(partition_name, partition_info)
+            if commit:
+                commit_or_raise(self.target_conn)
+        except Exception:
+            if commit:
+                rollback_quietly(self.target_conn)
+            raise
+
+    def _upsert_partition_info(self, partition_name: str, partition_info: dict[str, Any]):
         with self.target_conn.cursor() as cur:
             # partition_table_info 테이블 존재 확인
             cur.execute("""
@@ -447,7 +507,7 @@ class TableCreator:
             if not (row and row[0]):
                 # 테이블 생성
                 cur.execute("""
-                    CREATE TABLE partition_table_info (
+                    CREATE TABLE public.partition_table_info (
                         table_name varchar(100) NOT NULL,
                         table_data varchar(10) NOT NULL,
                         from_date bigint NOT NULL,
@@ -460,7 +520,7 @@ class TableCreator:
 
             # 기존 레코드 확인
             cur.execute(
-                "SELECT 1 FROM partition_table_info WHERE table_name = %s",
+                "SELECT 1 FROM public.partition_table_info WHERE table_name = %s",
                 (partition_name,),
             )
 
@@ -469,7 +529,7 @@ class TableCreator:
                 # 기존 레코드 갱신
                 cur.execute(
                     """
-                    UPDATE partition_table_info
+                    UPDATE public.partition_table_info
                     SET table_data = %s, from_date = %s, to_date = %s,
                         use_flag = %s, save_date = %s, cluster_index = %s
                     WHERE table_name = %s
@@ -488,7 +548,7 @@ class TableCreator:
                 # 새 레코드 추가
                 cur.execute(
                     """
-                    INSERT INTO partition_table_info
+                    INSERT INTO public.partition_table_info
                     (table_name, table_data, from_date, to_date, use_flag, save_date, cluster_index)
                     VALUES (%s, %s, %s, %s, %s, %s, %s)
                 """,
@@ -502,8 +562,6 @@ class TableCreator:
                         True,
                     ),
                 )
-
-            self.target_conn.commit()
 
     def ensure_partition_ready(
         self, partition_name: str, truncate_mode: str = "auto", confirm_callback=None
@@ -552,10 +610,12 @@ class TableCreator:
             # 테이블이 이미 존재해도 partition_table_info 동기화
             self._sync_partition_info(partition_name)
 
-            # 기존 데이터 확인 (식별자는 _validate_identifier로 검증 → 안전한 문자열 보간)
-            # NOTE: psycopg2/psycopg3 혼용을 피하기 위해 psql.SQL 대신 검증된 문자열 사용
+            # 기존 데이터 확인. 식별자는 검증 후 드라이버 무관 quote + public 한정(H-04).
+            # NOTE: psycopg2/psycopg3 연결이 섞여 들어오므로 드라이버의 sql.Identifier 대신
+            #       postgres_utils.qualified_name을 쓴다.
             _validate_identifier(partition_name)
-            cursor.execute(f"SELECT COUNT(*) FROM {partition_name}")
+            partition_rel = qualified_name(partition_name)
+            cursor.execute(f"SELECT COUNT(*) FROM {partition_rel}")
             row_count = cursor.fetchone()[0]
 
             if row_count > 0:
@@ -574,7 +634,7 @@ class TableCreator:
                     raise ValueError(f"Invalid truncate_mode: {truncate_mode}")
 
                 if should_truncate:
-                    cursor.execute(f"TRUNCATE TABLE {partition_name} RESTART IDENTITY")
+                    cursor.execute(f"TRUNCATE TABLE {partition_rel} RESTART IDENTITY")
                     # TRUNCATE는 커밋하지 않음 — 호출자의 COPY/INSERT와 같은
                     # 트랜잭션에서 처리되어야 migration 실패 시 롤백 가능
                 else:
@@ -594,13 +654,16 @@ class TableCreator:
             cursor: 데이터베이스 커서
         """
         _validate_identifier(parent_table)
+        parent_rel = qualified_name(parent_table)
 
-        # 인덱스 생성 (9.3 호환: IF NOT EXISTS 미지원 → 중복은 예외 무시)
+        # 인덱스 생성 (9.3 호환: IF NOT EXISTS 미지원 → 중복은 SAVEPOINT로 격리해 건너뜀)
         self._create_indexes(
             cursor,
             [
-                f"CREATE INDEX {parent_table}_path_id_date ON {parent_table} USING btree (path_id, issued_date)",
-                f"CREATE INDEX {parent_table}_path_id_idx ON {parent_table} USING btree (path_id)",
+                f"CREATE INDEX {quote_ident(parent_table + '_path_id_date')} ON {parent_rel} "
+                f"USING btree (path_id, issued_date)",
+                f"CREATE INDEX {quote_ident(parent_table + '_path_id_idx')} ON {parent_rel} "
+                f"USING btree (path_id)",
             ],
         )
 
@@ -608,10 +671,13 @@ class TableCreator:
         trigger_name = f"insert_{parent_table}_trigger"
         _validate_identifier(func_name)
         _validate_identifier(trigger_name)
+        func_rel = qualified_name(func_name)
 
-        # 트리거 함수 생성 (parent_table은 이미 검증됨)
+        # 트리거 함수 생성 (필수 DDL, parent_table은 이미 검증됨).
+        # 동적 INSERT 대상도 public으로 한정한다 — 이름만 쓰면 트리거가 실행되는 세션의
+        # search_path에 따라 다른 스키마의 동명 파티션에 행이 들어간다(H-04).
         cursor.execute(f"""
-            CREATE OR REPLACE FUNCTION {func_name}()
+            CREATE OR REPLACE FUNCTION {func_rel}()
             RETURNS trigger
             LANGUAGE plpgsql
             AS $function$
@@ -623,20 +689,19 @@ class TableCreator:
                 _insert_time := (NEW.issued_date/1000)::bigint;
                 _insert_date := to_char(to_timestamp(_insert_time), 'YYMMDD');
 
-                EXECUTE 'INSERT INTO {parent_table}_'||_insert_date||' VALUES ($1.*);' USING NEW;
+                EXECUTE format('INSERT INTO %I.%I VALUES ($1.*)', 'public', '{parent_table}_' || _insert_date) USING NEW;
 
                 RETURN NULL;
             END;
             $function$
         """)
 
-        # 트리거 생성
+        # 트리거 생성 (필수 DDL)
+        cursor.execute(f"DROP TRIGGER IF EXISTS {quote_ident(trigger_name)} ON {parent_rel}")
         cursor.execute(f"""
-            DROP TRIGGER IF EXISTS {trigger_name} ON {parent_table};
-
-            CREATE TRIGGER {trigger_name}
-            BEFORE INSERT ON {parent_table}
-            FOR EACH ROW EXECUTE PROCEDURE {func_name}();
+            CREATE TRIGGER {quote_ident(trigger_name)}
+            BEFORE INSERT ON {parent_rel}
+            FOR EACH ROW EXECUTE PROCEDURE {func_rel}()
         """)
 
     def _create_parent_indexes(self, parent_table: str, table_type: TableType, cursor):
@@ -649,7 +714,15 @@ class TableCreator:
             cursor: 데이터베이스 커서
         """
         _validate_identifier(parent_table)
-        # 테이블 타입별 인덱스 (9.3 호환: IF NOT EXISTS 미지원 → 중복은 예외 무시)
+        parent_rel = qualified_name(parent_table)
+
+        def index(suffix: str, columns: str) -> str:
+            return (
+                f"CREATE INDEX {quote_ident(parent_table + suffix)} ON {parent_rel} "
+                f"USING btree ({columns})"
+            )
+
+        # 테이블 타입별 인덱스 (9.3 호환: IF NOT EXISTS 미지원 → 중복은 SAVEPOINT로 격리해 건너뜀)
         if table_type in (
             TableType.POINT_HISTORY,
             TableType.POINT_SEC_HISTORY,
@@ -659,8 +732,8 @@ class TableCreator:
             self._create_indexes(
                 cursor,
                 [
-                    f"CREATE INDEX {parent_table}_path_id_date ON {parent_table} USING btree (path_id, issued_date)",
-                    f"CREATE INDEX {parent_table}_path_id_idx ON {parent_table} USING btree (path_id)",
+                    index("_path_id_date", "path_id, issued_date"),
+                    index("_path_id_idx", "path_id"),
                 ],
             )
 
@@ -669,8 +742,8 @@ class TableCreator:
             self._create_indexes(
                 cursor,
                 [
-                    f"CREATE INDEX {parent_table}_sensor_id_date ON {parent_table} USING btree (sensor_id, issued_date)",
-                    f"CREATE INDEX {parent_table}_station_id_idx ON {parent_table} USING btree (station_id)",
+                    index("_sensor_id_date", "sensor_id, issued_date"),
+                    index("_station_id_idx", "station_id"),
                 ],
             )
 
@@ -679,8 +752,8 @@ class TableCreator:
             self._create_indexes(
                 cursor,
                 [
-                    f"CREATE INDEX {parent_table}_path_id_date ON {parent_table} USING btree (path_id, issued_date)",
-                    f"CREATE INDEX {parent_table}_path_id_idx ON {parent_table} USING btree (path_id)",
+                    index("_path_id_date", "path_id, issued_date"),
+                    index("_path_id_idx", "path_id"),
                 ],
             )
 
@@ -712,6 +785,7 @@ class TableCreator:
         _validate_identifier(config.date_column)
         for col in config.columns:
             _validate_identifier(col)
+        date_col = quote_ident(config.date_column)
 
         # 날짜 조건 생성 (타입에 따라 다름)
         date_condition = None
@@ -723,15 +797,17 @@ class TableCreator:
                 from_dt = datetime.fromtimestamp(from_date_val / 1000)
                 to_dt = datetime.fromtimestamp(to_date_val / 1000)
 
-                date_condition = f"""(new.{config.date_column} >= '{from_dt.strftime("%Y-%m-%d %H:%M:%S")}'::timestamp without time zone)
-                AND (new.{config.date_column} <= '{to_dt.strftime("%Y-%m-%d %H:%M:%S")}'::timestamp without time zone)"""
+                date_condition = f"""(new.{date_col} >= '{from_dt.strftime("%Y-%m-%d %H:%M:%S")}'::timestamp without time zone)
+                AND (new.{date_col} <= '{to_dt.strftime("%Y-%m-%d %H:%M:%S")}'::timestamp without time zone)"""
             else:
-                date_condition = f"""(new.{config.date_column} >= '{from_date_val}'::bigint)
-                AND (new.{config.date_column} <= '{to_date_val}'::bigint)"""
+                date_condition = f"""(new.{date_col} >= '{from_date_val}'::bigint)
+                AND (new.{date_col} <= '{to_date_val}'::bigint)"""
 
         # 컬럼 리스트 생성
-        columns = ", ".join(config.columns)
-        values = ", ".join([f"new.{col}" for col in config.columns])
+        columns = ", ".join(quote_ident(col) for col in config.columns)
+        values = ", ".join([f"new.{quote_ident(col)}" for col in config.columns])
+        parent_rel = qualified_name(parent_table)
+        partition_rel = qualified_name(partition_name)
 
         # RULE 생성 SQL (날짜 범위가 없으면 RULE 생성을 건너뜀)
         if date_condition:
@@ -739,17 +815,15 @@ class TableCreator:
             _validate_identifier(rule_name)
 
             # 기존 RULE 제거 (있다면)
-            cursor.execute(f"""
-                DROP RULE IF EXISTS {rule_name} ON {parent_table};
-            """)
+            cursor.execute(f"DROP RULE IF EXISTS {quote_ident(rule_name)} ON {parent_rel}")
             print(f"  - RULE 재생성: {rule_name} (기존 RULE 삭제 후 생성)")
 
             rule_sql = f"""
-                CREATE RULE {rule_name} AS
-                ON INSERT TO {parent_table}
+                CREATE RULE {quote_ident(rule_name)} AS
+                ON INSERT TO {parent_rel}
                 WHERE {date_condition}
-                DO INSTEAD INSERT INTO {partition_name} ({columns})
-                VALUES ({values});
+                DO INSTEAD INSERT INTO {partition_rel} ({columns})
+                VALUES ({values})
             """
 
             cursor.execute(rule_sql)
@@ -757,14 +831,19 @@ class TableCreator:
             print(f"  [WARN] RULE 생성을 건너뜀(날짜 범위 없음): {partition_name}")
 
     def _create_indexes(self, cursor, statements: list[str]):
-        """IF NOT EXISTS가 없는 환경(9.3)에서도 안전하게 인덱스 생성"""
+        """IF NOT EXISTS가 없는 환경(9.3)에서도 안전하게 인덱스 생성.
+
+        각 문장을 SAVEPOINT로 격리한다. 중복·권한 부족(IGNORABLE_INDEX_SQLSTATES)은 그 문장만
+        되돌리고 계속하며, 그 밖의 오류는 즉시 올린다(감사 M-14). 예전에는 예외를 잡기만 해서
+        트랜잭션이 중단된 채로 다음 DDL을 보냈고, psycopg3 예외 클래스로만 분기해 psycopg2
+        연결에서는 분기 자체가 타지 않았다.
+        """
         for stmt in statements:
-            try:
-                cursor.execute(stmt)
-            except psycopg.errors.DuplicateObject:
-                # 이미 존재하는 경우 무시
-                print(f"  [WARN] 인덱스 생성 스킵(이미 존재): {stmt.split()[2]}")
-            except psycopg.errors.InsufficientPrivilege:
-                print(f"  [WARN] 인덱스 생성 실패(권한 부족): {stmt}")
-            except Exception as exc:
-                print(f"  [WARN] 인덱스 생성 실패: {stmt} - {type(exc).__name__}: {exc}")
+            if not run_optional_statement(
+                self.target_conn,
+                cursor,
+                stmt,
+                ignorable=IGNORABLE_INDEX_SQLSTATES,
+                label=stmt.split()[2],
+            ):
+                print(f"  [WARN] 인덱스 생성 스킵: {stmt.split()[2]}")
