@@ -14,7 +14,12 @@ import psycopg2.extensions
 from psycopg2 import sql
 from PySide6.QtCore import Signal
 
-from src.core.archive_manifest import ArchiveManifestStore, ArchivePartitionEntry
+from src.core.archive_manifest import (
+    ArchiveManifest,
+    ArchiveManifestStore,
+    ArchivePartitionEntry,
+    ScanCancelled,
+)
 from src.core.base_migration_worker import BaseMigrationWorker
 from src.core.performance_metrics import PerformanceMetrics
 from src.core.table_creator import TableCreator, _build_column_definition, _validate_identifier
@@ -33,11 +38,39 @@ class MigrationInterruptedError(RuntimeError):
 
 
 class ManifestTableCreator(TableCreator):
-    """Manifest metadata를 사용해 대상 테이블을 준비합니다."""
+    """Manifest metadata를 사용해 대상 테이블을 준비합니다.
 
-    def __init__(self, manifest_store: ArchiveManifestStore, target_conn):
+    ``manifest``를 주면 그 (검증된) 메모리 사본만 쓴다. 주지 않으면 매번 디스크에서
+    다시 읽는데, 그러면 인증 검증 뒤에 바꿔치기된 DDL 메타데이터를 쓸 수 있다(TOCTOU).
+    가져오기 워커는 항상 검증된 manifest를 넘긴다.
+    """
+
+    def __init__(
+        self,
+        manifest_store: ArchiveManifestStore,
+        target_conn,
+        *,
+        manifest: ArchiveManifest | None = None,
+    ):
         super().__init__(source_conn=None, target_conn=target_conn)
         self.manifest_store = manifest_store
+        self.manifest = manifest
+
+    def _manifest_partition_entry(self, partition_name: str) -> ArchivePartitionEntry | None:
+        if self.manifest is None:
+            return self.manifest_store.get_partition_entry(partition_name)
+        for item in self.manifest.partitions:
+            if item.get("partition_name") == partition_name:
+                return ArchivePartitionEntry.from_dict(item)
+        return None
+
+    def _manifest_parent_metadata(self, parent_table: str) -> dict[str, Any]:
+        if self.manifest is None:
+            return self.manifest_store.get_parent_table_metadata(parent_table)
+        metadata = self.manifest.parent_tables.get(parent_table)
+        if not metadata:
+            raise KeyError(f"parent_table metadata not found: {parent_table}")
+        return metadata
 
     @staticmethod
     def _resolve_table_type(parent_table: str, *codes: str | None) -> TableType:
@@ -53,11 +86,11 @@ class ManifestTableCreator(TableCreator):
         _validate_identifier(partition_name)
         _validate_identifier(parent_table)
 
-        entry = self.manifest_store.get_partition_entry(partition_name)
+        entry = self._manifest_partition_entry(partition_name)
         if not entry:
             raise Exception(f"manifest에 파티션 정보가 없습니다: {partition_name}")
 
-        metadata = self.manifest_store.get_parent_table_metadata(parent_table)
+        metadata = self._manifest_parent_metadata(parent_table)
         table_type = self._resolve_table_type(
             parent_table,
             entry.table_type,
@@ -84,7 +117,7 @@ class ManifestTableCreator(TableCreator):
         self._add_partition_info(partition_name, partition_info)
 
     def _create_parent_table(self, parent_table: str, table_type: TableType | None = None):
-        metadata = self.manifest_store.get_parent_table_metadata(parent_table)
+        metadata = self._manifest_parent_metadata(parent_table)
         resolved_type = self._resolve_table_type(parent_table, metadata.get("table_type"))
         if table_type is None:
             table_type = resolved_type
@@ -117,6 +150,8 @@ class ArchiveMigrationWorkerBase(BaseMigrationWorker):
     performance = Signal(dict)
     truncate_requested = Signal(str, int)
 
+    archive_store: ArchiveManifestStore
+
     def __init__(
         self,
         profile: ConnectionProfile,
@@ -131,6 +166,20 @@ class ArchiveMigrationWorkerBase(BaseMigrationWorker):
         self.truncate_permission = None
         self.skip_on_error = False
         self.partition_failures: list[dict[str, str]] = []
+        # 인증/체크섬 없는 아카이브를 쓰겠다는 사용자의 명시적 확인(docs/base/archive-trust-boundary.md).
+        self.allow_legacy_unverified = False
+
+    def configure_archive_security(
+        self, *, passphrase: str | None = None, allow_legacy_unverified: bool = False
+    ) -> None:
+        """아카이브 passphrase와 legacy 허용 여부. passphrase는 저장·로그하지 않는다."""
+        self.allow_legacy_unverified = bool(allow_legacy_unverified)
+        self.archive_store.configure_security(
+            passphrase=passphrase, allow_legacy_unverified=allow_legacy_unverified
+        )
+
+    def _bind_archive_store_warnings(self) -> None:
+        self.archive_store.set_warning_handler(lambda message: self._log(message, "WARNING"))
 
     def get_stats(self) -> dict[str, Any]:
         return self.performance_metrics.get_stats()
@@ -433,6 +482,7 @@ class PostgresToFileArchiveWorker(ArchiveMigrationWorkerBase):
         # psycopg2 연결. 스텁이 없어 Any로 둔다.
         self.source_conn: Any = None
         self.archive_store = ArchiveManifestStore(self.profile.target_config["archive_path"])
+        self._bind_archive_store_warnings()
 
     def _execute_migration(self):
         checkpoints = {
@@ -440,6 +490,7 @@ class PostgresToFileArchiveWorker(ArchiveMigrationWorkerBase):
         }
         self.performance_metrics.total_partitions = len(self.partitions)
         manifest = None
+        failure: BaseException | None = None
 
         try:
             self.source_conn = self._create_psycopg2_connection(self.profile.source_config)
@@ -447,6 +498,13 @@ class PostgresToFileArchiveWorker(ArchiveMigrationWorkerBase):
                 source=self.profile.source_config,
                 target=self.profile.target_config,
             )
+            if not self.archive_store.has_passphrase:
+                self._log(
+                    "passphrase 없이 내보냅니다 — manifest가 인증되지 않으므로 가져올 때 "
+                    "'인증 없는 아카이브' 확인이 필요합니다. 신뢰할 수 없는 매체로 옮길 "
+                    "아카이브라면 passphrase를 지정하세요.",
+                    "WARNING",
+                )
 
             for idx, partition_name in enumerate(self.partitions):
                 if not self.is_running:
@@ -481,9 +539,18 @@ class PostgresToFileArchiveWorker(ArchiveMigrationWorkerBase):
             if self.is_running:
                 self._emit_performance_metrics(force=True)
                 self._log_final_summary("File Archive 내보내기 완료")
+        except BaseException as exc:
+            failure = exc
+            raise
         finally:
             if manifest is not None:
-                self.archive_store.save(manifest)
+                try:
+                    self.archive_store.save(manifest)
+                except Exception as save_exc:
+                    # 원래 예외를 가리지 않는다. 원래 예외가 없을 때만 저장 실패를 올린다.
+                    if failure is None:
+                        raise
+                    self._log(f"manifest 최종 저장 실패: {save_exc}", "ERROR")
             if self.source_conn is not None:
                 try:
                     self.source_conn.close()
@@ -591,9 +658,9 @@ class PostgresToFileArchiveWorker(ArchiveMigrationWorkerBase):
                 file_path=relative_file_path,
             )
 
-            self.archive_store.compute_file_metadata(actual_temp)
-            self.archive_store.replace_file_atomically(actual_temp, file_path)
-            integrity = self.archive_store.compute_file_metadata(file_path)
+            # checksum은 임시 파일에서 구한다. 최종 경로로의 교체는 manifest 기록과 함께
+            # 잠금 안에서 한다(commit_partition) — 경쟁 writer와 파일·항목이 섞이지 않게.
+            integrity = self.archive_store.compute_file_metadata(actual_temp)
 
             entry = ArchivePartitionEntry(
                 partition_name=partition_name,
@@ -629,8 +696,9 @@ class PostgresToFileArchiveWorker(ArchiveMigrationWorkerBase):
                 file_path=relative_file_path,
                 extra={"checksum_sha256": integrity["checksum_sha256"]},
             )
-            self.archive_store.upsert_partition(manifest, entry)
-            self.archive_store.save(manifest)
+            self.archive_store.commit_partition(
+                manifest, entry, temp_path=actual_temp, final_path=file_path
+            )
 
             self.performance_metrics.update(total_rows, int(integrity["bytes_written"]))
             self.performance_metrics.complete_partition()
@@ -723,6 +791,7 @@ class FileToPostgresArchiveWorker(ArchiveMigrationWorkerBase):
     ):
         super().__init__(profile, partitions, history_id, resume)
         self.archive_store = ArchiveManifestStore(self.profile.source_config["archive_path"])
+        self._bind_archive_store_warnings()
         # psycopg2 연결. 스텁이 없어 Any로 둔다.
         self.target_conn: Any = None
 
@@ -730,12 +799,19 @@ class FileToPostgresArchiveWorker(ArchiveMigrationWorkerBase):
         checkpoints = {
             cp.partition_name: cp for cp in self.checkpoint_manager.get_checkpoints(self.history_id)
         }
+        # 대상 DB에 붙기 전에 manifest를 인증하고 신뢰 정책을 판정한다.
         manifest = self.archive_store.load()
+        for warning in self.archive_store.require_trusted(manifest):
+            self._log(warning, "WARNING")
+        if manifest.is_authenticated:
+            self._log("manifest 인증(HMAC-SHA256) 확인 완료", "INFO")
+        if not self._preflight_verify_archive(manifest):
+            return
         self.performance_metrics.total_partitions = len(self.partitions)
 
         try:
             self.target_conn = self._create_psycopg2_connection(self.profile.target_config)
-            creator = ManifestTableCreator(self.archive_store, self.target_conn)
+            creator = ManifestTableCreator(self.archive_store, self.target_conn, manifest=manifest)
 
             for idx, partition_name in enumerate(self.partitions):
                 if not self.is_running:
@@ -777,6 +853,53 @@ class FileToPostgresArchiveWorker(ArchiveMigrationWorkerBase):
                 except Exception:
                     pass
 
+    def _preflight_verify_archive(self, manifest: ArchiveManifest) -> bool:
+        """대상 DB를 건드리기 전에 선택한 파티션의 **모든 파일**을 manifest와 대조한다.
+
+        손상·변조된 아카이브를 첫 TRUNCATE 전에 통째로 거부하기 위한 단계다. 적재 직전
+        같은 파일 핸들로 한 번 더 검증하므로(TOCTOU 방어) 이 단계만으로 끝나지 않는다.
+        skip_on_error면 실패 목록을 경고로 남기고, 해당 파티션은 개별 검증에서 실패로
+        기록된다.
+
+        Returns:
+            계속 진행하면 True, 사용자가 중단했으면 False.
+        """
+        by_name = {item.get("partition_name"): item for item in manifest.partitions}
+        failures: list[str] = []
+        self._log(f"아카이브 사전 검증 시작: 파일 {len(self.partitions)}개 sha256 확인", "INFO")
+        for partition_name in self.partitions:
+            if not self.is_running:
+                return False
+            item = by_name.get(partition_name)
+            if item is None:
+                failures.append(f"{partition_name}: manifest에 없음")
+                continue
+            try:
+                self.archive_store.verify_partition_file(
+                    ArchivePartitionEntry.from_dict(item),
+                    should_stop=lambda: not self.is_running,
+                    allow_missing_checksum=self.allow_legacy_unverified,
+                )
+            except ScanCancelled:
+                self._log("아카이브 사전 검증이 중단되었습니다.", "WARNING")
+                return False
+            except Exception as exc:
+                failures.append(f"{partition_name}: {exc}")
+
+        if not failures:
+            self._log("아카이브 사전 검증 통과", "INFO")
+            return True
+        summary = "; ".join(failures[:10]) + (" …" if len(failures) > 10 else "")
+        if self.skip_on_error:
+            self._log(
+                f"아카이브 사전 검증 실패 {len(failures)}건 — 해당 파티션은 건너뜁니다: {summary}",
+                "WARNING",
+            )
+            return True
+        raise ValueError(
+            f"아카이브 사전 검증 실패 {len(failures)}건 — 대상 DB는 변경하지 않았습니다: {summary}"
+        )
+
     def _import_partition(
         self, partition_name: str, checkpoint: Any, creator: ManifestTableCreator, manifest
     ):
@@ -809,13 +932,24 @@ class FileToPostgresArchiveWorker(ArchiveMigrationWorkerBase):
             )
 
             # 파일을 한 번 열어 검증 후 같은 핸들로 COPY (TOCTOU 방어)
+            # checksum이 없으면 명시적 확인이 있을 때만 크기·행 수 검증으로 진행한다.
             archive_fp = file_path.open("rb")
             try:
-                integrity = self.archive_store.verify_open_file(entry, archive_fp)
+                integrity = self.archive_store.verify_open_file(
+                    entry,
+                    archive_fp,
+                    allow_missing_checksum=self.allow_legacy_unverified,
+                )
                 archive_fp.seek(0)
             except Exception:
                 archive_fp.close()
                 raise
+            if not (entry.checksum_sha256 or "").strip():
+                self._log(
+                    f"{partition_name}: checksum이 없어 파일 무결성을 검증하지 못했습니다 "
+                    "(사용자 확인에 따라 크기·행 수만 확인하고 진행).",
+                    "WARNING",
+                )
 
             expected_rows = int(entry.row_count or 0)
             self.performance_metrics.start_partition(partition_name, expected_rows)

@@ -50,3 +50,15 @@
 ## 확장 가이드
 - 새로운 마이그레이션 전략을 추가하려면 QThread를 상속한 워커를 작성하고 UI와 동일한 시그널 프로토콜을 준수하세요.
 - 성능 데이터가 필요한 경우 `PerformanceMetrics`를 주입하거나 확장하여 추가 지표를 계산할 수 있습니다.
+
+## 파일 아카이브 manifest 규칙
+상세·신뢰 경계는 `docs/base/archive-trust-boundary.md`.
+
+- manifest 저장은 `ArchiveManifestStore.save()`/`commit_partition()`만 쓴다. 잠금 안에서 디스크를
+  다시 읽어 항목별 `entry_version` CAS로 병합한다. 충돌은 `ManifestConflictError` — 삼키지 않는다.
+- 파티션 파일을 최종 경로로 옮기는 일은 `commit_partition()` 안에서 manifest 기록과 함께 한다.
+- 새 파티션 항목은 `checksum_sha256` 필수. import는 checksum·인증 없는 아카이브를
+  `allow_legacy_unverified`(사용자 명시 확인) 없이는 거부하고, 허용하면 WARNING을 남긴다.
+- import는 대상 DB 연결 전에 `require_trusted()`와 전 파일 사전 검증을 하고, DDL은
+  검증된 메모리 manifest(`ManifestTableCreator(manifest=...)`)로만 만든다. 디스크를 다시 읽지 않는다.
+- passphrase는 워커 `configure_archive_security()`로만 받는다. 저장·로그 금지.

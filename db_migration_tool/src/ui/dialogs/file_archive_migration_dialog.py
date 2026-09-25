@@ -45,6 +45,7 @@ from src.core.scan_workers import (
 from src.core.table_types import TABLE_TYPE_CONFIG, TableType, get_all_table_types
 from src.models.history import CheckpointManager, HistoryManager, MigrationHistoryItem
 from src.models.profile import ENDPOINT_KIND_POSTGRES, ConnectionProfile
+from src.ui.dialogs.archive_security_prompt import prompt_archive_security
 from src.ui.dialogs.scan_host import (
     PARTITION_DISPLAY_LIMIT,
     ScanHostMixin,
@@ -1289,6 +1290,18 @@ class FileArchiveMigrationDialog(ScanHostMixin, QDialog):
             QMessageBox.warning(self, "파티션 없음", "실행할 파티션이 없습니다.")
             return
 
+        # M-04: passphrase·인증 없는 아카이브 확인. 취소하면 이력도 만들지 않는다.
+        is_export = self.profile.migration_mode == "postgres_to_file"
+        archive_config = self.profile.target_config if is_export else self.profile.source_config
+        security = prompt_archive_security(
+            self,
+            mode=self.profile.migration_mode,
+            archive_path=str(archive_config.get("archive_path", "")),
+        )
+        if security is None:
+            self.add_log("아카이브 보안 확인이 취소되어 시작하지 않았습니다.", "WARNING")
+            return
+
         if not self.resume_mode:
             if self.profile.id is None:
                 QMessageBox.warning(
@@ -1333,6 +1346,10 @@ class FileArchiveMigrationDialog(ScanHostMixin, QDialog):
             )
 
         self._worker_had_error = False
+        self.worker.configure_archive_security(
+            passphrase=security.passphrase,
+            allow_legacy_unverified=security.allow_legacy_unverified,
+        )
         self.worker.skip_on_error = self.error_strategy == "skip"
         self.worker.progress.connect(self.on_progress)
         self.worker.log.connect(self.add_log)
