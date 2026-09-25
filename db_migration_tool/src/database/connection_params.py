@@ -10,8 +10,10 @@
 - ssl (bool): 기존 'SSL 연결 사용' 체크박스. 꺼져 있으면 sslmode를 주지 않는다
   (기존 동작 유지 — libpq 기본값).
 - sslmode: "verify-full"(기본) | "verify-ca" | "require"(검증 없음, 위험 승인 필요).
-- sslrootcert: CA(루트 인증서) 파일 경로. 비우면 verify-full에서 libpq 16+의
-  `sslrootcert=system`(OS/OpenSSL 신뢰 저장소)을 쓴다.
+- sslrootcert: CA(루트 인증서) 파일 경로. 비우면(또는 'system') verify-full에서
+  OS 신뢰 저장소를 담은 실제 PEM 파일을 쓴다(`system_ca`). libpq의 `sslrootcert=system`
+  키워드는 넘기지 않는다 — 바이너리 휠 libpq는 번들 OpenSSL의 빈 빌드 경로를 신뢰 저장소로
+  삼아 공인 CA 서버까지 거부한다.
 - ssl_allow_insecure (bool): `require`(서버 인증서·hostname 미검증)를 쓰겠다는 명시적 위험 승인.
 - connect_timeout (int, 초): 없으면 호출 지점 기본값, 그것도 없으면 10초.
 
@@ -23,9 +25,9 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any
 
-Driver = Literal["psycopg", "psycopg2"]
+from src.database import system_ca
 
 DEFAULT_CONNECT_TIMEOUT_SECONDS = 10
 SEARCH_PATH_OPTIONS = "-c search_path=public"
@@ -43,9 +45,8 @@ SSLMODE_REQUIRE = "require"
 SUPPORTED_SSLMODES = (SSLMODE_VERIFY_FULL, SSLMODE_VERIFY_CA, SSLMODE_REQUIRE)
 DEFAULT_SSLMODE = SSLMODE_VERIFY_FULL
 
+# CA 칸에 적으면 '비움'과 같다(OS 신뢰 저장소). libpq 키워드로는 넘기지 않는다.
 SSLROOTCERT_SYSTEM = "system"
-# libpq 16부터 sslrootcert=system을 지원한다.
-LIBPQ_SSLROOTCERT_SYSTEM_MIN_VERSION = 160000
 
 AUDIT_LOGGER_NAME = "dbmig.security.audit"
 _audit_logger = logging.getLogger(AUDIT_LOGGER_NAME)
@@ -53,26 +54,6 @@ _audit_logger = logging.getLogger(AUDIT_LOGGER_NAME)
 
 class ConnectionConfigError(ValueError):
     """연결 설정이 안전하게 연결할 수 없는 상태일 때 (네트워크 접속 전에 발생)."""
-
-
-def libpq_version(driver: Driver = "psycopg") -> int:
-    """연결에 쓸 드라이버가 실제로 로드한 libpq 버전 (예: 170002).
-
-    psycopg와 psycopg2 바이너리 휠은 서로 다른 libpq를 번들하므로 드라이버별로 본다.
-    """
-    if driver == "psycopg2":
-        import psycopg2.extensions
-
-        return int(psycopg2.extensions.libpq_version())
-    import psycopg
-
-    return int(psycopg.pq.version())
-
-
-def _format_libpq_version(version: int) -> str:
-    major = version // 10000
-    minor = version % 10000
-    return f"{major}.{minor}"
 
 
 def _resolve_connect_timeout(config: dict[str, Any], default: int | None) -> int:
@@ -107,12 +88,7 @@ def _default_audit(message: str) -> None:
     _emit_app_log("WARNING", message)
 
 
-def _resolve_tls(
-    config: dict[str, Any],
-    *,
-    driver: Driver,
-    libpq_version_value: int | None,
-) -> tuple[dict[str, str], str | None]:
+def _resolve_tls(config: dict[str, Any]) -> tuple[dict[str, str], str | None]:
     """(libpq TLS 파라미터, 감사 메시지 또는 None)."""
     if not config.get(PROFILE_KEY_SSL):
         return {}, None
@@ -150,38 +126,33 @@ def _resolve_tls(
     if "sslrootcert" in params:
         return params, None
 
-    # CA 파일이 없다: verify-full이면 OS 신뢰 저장소(system)를 쓴다.
+    # CA 파일이 없다: verify-full이면 OS 신뢰 저장소 번들 파일을 쓴다.
     if mode != SSLMODE_VERIFY_FULL:
         raise ConnectionConfigError(
             f"SSL 모드 '{mode}'는 CA 인증서 파일이 필요합니다. "
             "CA 파일 경로를 지정하거나 verify-full을 사용하세요."
         )
-    version = libpq_version_value if libpq_version_value is not None else libpq_version(driver)
-    if version < LIBPQ_SSLROOTCERT_SYSTEM_MIN_VERSION:
+    bundle = system_ca.resolve_system_ca_bundle()
+    if bundle is None:
         raise ConnectionConfigError(
-            f"설치된 libpq {_format_libpq_version(version)}({driver})는 시스템 CA 저장소"
-            "(sslrootcert=system)를 지원하지 않습니다(16 이상 필요). "
-            "연결 설정에서 CA 인증서 파일 경로를 지정하세요."
+            "OS 신뢰 CA 저장소를 찾을 수 없어 서버 인증서를 검증할 수 없습니다. "
+            "연결 설정에서 서버 인증서를 서명한 CA 인증서 파일 경로를 지정하세요."
         )
-    params["sslrootcert"] = SSLROOTCERT_SYSTEM
+    params["sslrootcert"] = str(bundle)
     return params, None
 
 
 def build_libpq_params(
     config: dict[str, Any],
     *,
-    driver: Driver = "psycopg",
     connect_timeout: int | None = None,
-    libpq_version: int | None = None,
     audit: Any = None,
 ) -> dict[str, Any]:
     """프로필 config → psycopg/psycopg2 `connect(**params)`용 libpq 키워드.
 
     Args:
         config: 엔드포인트 config (모듈 docstring의 키).
-        driver: 연결할 드라이버. TLS 분기에 쓸 libpq 버전을 이 드라이버에서 읽는다.
         connect_timeout: 이 호출 지점의 기본 타임아웃(초). 프로필 값이 있으면 프로필이 우선.
-        libpq_version: 테스트용 주입. None이면 설치된 드라이버에서 읽는다.
         audit: 검증 없는 TLS 사용 시 호출할 감사 콜백(str 한 개). 기본은 감사 로거 + 앱 로그.
 
     Raises:
@@ -197,7 +168,7 @@ def build_libpq_params(
         "options": SEARCH_PATH_OPTIONS,
     }
 
-    tls, audit_message = _resolve_tls(config, driver=driver, libpq_version_value=libpq_version)
+    tls, audit_message = _resolve_tls(config)
     params.update(tls)
 
     if audit_message:
@@ -206,15 +177,10 @@ def build_libpq_params(
     return params
 
 
-def validate_tls_settings(
-    config: dict[str, Any],
-    *,
-    driver: Driver = "psycopg",
-    libpq_version: int | None = None,
-) -> str | None:
+def validate_tls_settings(config: dict[str, Any]) -> str | None:
     """연결 없이 설정만 검사한다(저장 전 UI 검증용). 문제가 없으면 None."""
     try:
-        _resolve_tls(config, driver=driver, libpq_version_value=libpq_version)
+        _resolve_tls(config)
         _resolve_connect_timeout(config, None)
     except ConnectionConfigError as exc:
         return str(exc)
@@ -225,7 +191,7 @@ def connect_psycopg(config: dict[str, Any], *, connect_timeout: int | None = Non
     """psycopg(3) 연결. 설정 오류는 접속 전에 ConnectionConfigError로 난다."""
     import psycopg
 
-    params = build_libpq_params(config, driver="psycopg", connect_timeout=connect_timeout)
+    params = build_libpq_params(config, connect_timeout=connect_timeout)
     return psycopg.connect(**params)
 
 
@@ -233,5 +199,5 @@ def connect_psycopg2(config: dict[str, Any], *, connect_timeout: int | None = No
     """psycopg2 연결(COPY 경로). 설정 오류는 접속 전에 ConnectionConfigError로 난다."""
     import psycopg2
 
-    params = build_libpq_params(config, driver="psycopg2", connect_timeout=connect_timeout)
+    params = build_libpq_params(config, connect_timeout=connect_timeout)
     return psycopg2.connect(**params)

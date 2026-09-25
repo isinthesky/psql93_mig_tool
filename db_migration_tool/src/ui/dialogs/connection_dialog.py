@@ -203,11 +203,11 @@ class ConnectionDialog(QDialog):
 
         ca_row = QHBoxLayout()
         sslrootcert_edit = QLineEdit()
-        sslrootcert_edit.setPlaceholderText("비우면 시스템 CA 저장소 사용 (libpq 16 이상)")
+        sslrootcert_edit.setPlaceholderText("비우면 OS 신뢰 인증서 저장소(공인 CA) 사용")
         sslrootcert_edit.setToolTip(
             "서버 인증서를 서명한 CA(루트) 인증서 파일(.crt/.pem)입니다.\n"
-            "사설 CA·자체 서명 인증서라면 반드시 지정하세요. Windows에서는 시스템 저장소를\n"
-            "libpq가 읽지 못할 수 있으므로 CA 파일 지정을 권장합니다."
+            "비우면 OS 신뢰 저장소(Windows 인증서 저장소, macOS /etc/ssl/cert.pem)로 검증합니다.\n"
+            "사설 CA·자체 서명 인증서(또는 macOS 키체인에만 넣은 사내 CA)라면 반드시 지정하세요."
         )
         sslrootcert_browse = QPushButton("찾아보기")
         sslrootcert_browse.setAutoDefault(False)

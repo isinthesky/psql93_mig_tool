@@ -26,9 +26,6 @@ from src.database.connection_params import (
 
 SRC_ROOT = Path(__file__).resolve().parents[2] / "src"
 
-MODERN_LIBPQ = 170000  # sslrootcert=system 지원(16+)
-OLD_LIBPQ = 150000
-
 
 def _base(**overrides):
     config = {
@@ -51,13 +48,24 @@ def ca_file(tmp_path):
     return path
 
 
+@pytest.fixture
+def system_bundle(monkeypatch, tmp_path):
+    """OS 신뢰 저장소 번들 해석을 고정한다(실제 저장소·앱 데이터 디렉터리를 건드리지 않는다)."""
+    from src.database import system_ca
+
+    bundle = tmp_path / "system-ca.pem"
+    bundle.write_text("-----BEGIN CERTIFICATE-----\n")
+    monkeypatch.setattr(system_ca, "resolve_system_ca_bundle", lambda: bundle)
+    return bundle
+
+
 # ── 기본(SSL 미사용) ─────────────────────────────────────────
 
 
 class TestPlainConnection:
     def test_ssl_off_does_not_set_sslmode(self):
         """SSL을 쓰지 않는 기존 프로필은 동작이 바뀌면 안 된다(libpq 기본값 유지)."""
-        params = build_libpq_params(_base(), libpq_version=MODERN_LIBPQ)
+        params = build_libpq_params(_base())
 
         assert "sslmode" not in params
         assert "sslrootcert" not in params
@@ -69,7 +77,7 @@ class TestPlainConnection:
 
     def test_missing_keys_fall_back_to_defaults(self):
         """키가 빠져 None이 넘어가면 libpq 기본값으로 엉뚱한 DB에 붙을 수 있다."""
-        params = build_libpq_params({}, libpq_version=MODERN_LIBPQ)
+        params = build_libpq_params({})
 
         assert params["host"] == "localhost"
         assert params["port"] == 5432
@@ -81,7 +89,6 @@ class TestPlainConnection:
         """SSL 체크가 꺼져 있으면 남아 있는 세부 설정이 연결을 바꾸지 않는다."""
         params = build_libpq_params(
             _base(ssl=False, sslmode="require", sslrootcert=str(ca_file)),
-            libpq_version=MODERN_LIBPQ,
         )
         assert "sslmode" not in params
         assert "sslrootcert" not in params
@@ -92,25 +99,23 @@ class TestPlainConnection:
 
 class TestConnectTimeout:
     def test_default_timeout_is_ten_seconds(self):
-        params = build_libpq_params(_base(), libpq_version=MODERN_LIBPQ)
+        params = build_libpq_params(_base())
         assert DEFAULT_CONNECT_TIMEOUT_SECONDS == 10
         assert params["connect_timeout"] == 10
 
     def test_call_site_default_is_used(self):
-        params = build_libpq_params(_base(), connect_timeout=5, libpq_version=MODERN_LIBPQ)
+        params = build_libpq_params(_base(), connect_timeout=5)
         assert params["connect_timeout"] == 5
 
     def test_profile_setting_overrides_call_site_default(self):
-        params = build_libpq_params(
-            _base(connect_timeout=30), connect_timeout=5, libpq_version=MODERN_LIBPQ
-        )
+        params = build_libpq_params(_base(connect_timeout=30), connect_timeout=5)
         assert params["connect_timeout"] == 30
 
     @pytest.mark.parametrize("bad", [0, -1, "abc", 1.5, True])
     def test_invalid_timeout_is_rejected(self, bad):
         """0은 libpq에서 '무한 대기'다. 잘못된 값이 조용히 무한 대기가 되면 안 된다."""
         with pytest.raises(ConnectionConfigError):
-            build_libpq_params(_base(connect_timeout=bad), libpq_version=MODERN_LIBPQ)
+            build_libpq_params(_base(connect_timeout=bad))
 
 
 # ── search_path (H-04 연결 단계) ─────────────────────────────
@@ -118,14 +123,12 @@ class TestConnectTimeout:
 
 class TestSearchPath:
     def test_search_path_restricted_to_public(self):
-        params = build_libpq_params(_base(), libpq_version=MODERN_LIBPQ)
+        params = build_libpq_params(_base())
         assert params["options"] == "-c search_path=public"
         assert SEARCH_PATH_OPTIONS == "-c search_path=public"
 
     def test_search_path_applied_with_ssl_too(self, ca_file):
-        params = build_libpq_params(
-            _base(ssl=True, sslrootcert=str(ca_file)), libpq_version=MODERN_LIBPQ
-        )
+        params = build_libpq_params(_base(ssl=True, sslrootcert=str(ca_file)))
         assert params["options"] == "-c search_path=public"
 
 
@@ -133,48 +136,70 @@ class TestSearchPath:
 
 
 class TestTlsVerification:
-    def test_legacy_ssl_profile_defaults_to_verify_full_with_system_ca(self):
-        """기존 'SSL 사용' 체크 프로필은 require가 아니라 verify-full로 연결해야 한다."""
-        params = build_libpq_params(_base(ssl=True), libpq_version=MODERN_LIBPQ)
+    def test_legacy_ssl_profile_defaults_to_verify_full_with_system_ca(self, system_bundle):
+        """기존 'SSL 사용' 체크 프로필은 require가 아니라 verify-full로 연결해야 한다.
+
+        CA는 libpq의 `sslrootcert=system`(바이너리 휠에서는 빈 빌드 경로)이 아니라
+        OS 신뢰 저장소를 담은 실제 PEM 파일이다.
+        """
+        params = build_libpq_params(_base(ssl=True))
 
         assert params["sslmode"] == "verify-full"
-        assert params["sslrootcert"] == "system"
+        assert params["sslrootcert"] == str(system_bundle)
 
     def test_explicit_ca_file_is_used(self, ca_file):
-        params = build_libpq_params(
-            _base(ssl=True, sslrootcert=str(ca_file)), libpq_version=OLD_LIBPQ
-        )
+        params = build_libpq_params(_base(ssl=True, sslrootcert=str(ca_file)))
         assert params["sslmode"] == "verify-full"
         assert params["sslrootcert"] == str(ca_file)
 
-    def test_blank_ca_path_means_not_set(self):
-        params = build_libpq_params(_base(ssl=True, sslrootcert="   "), libpq_version=MODERN_LIBPQ)
-        assert params["sslrootcert"] == "system"
+    def test_blank_ca_path_means_not_set(self, system_bundle):
+        params = build_libpq_params(_base(ssl=True, sslrootcert="   "))
+        assert params["sslrootcert"] == str(system_bundle)
+
+    def test_system_keyword_in_ca_field_uses_os_bundle(self, system_bundle):
+        """CA 칸에 'system'을 적어도 libpq 키워드로 넘기지 않는다(번들 libpq에서 무력)."""
+        params = build_libpq_params(_base(ssl=True, sslrootcert="system"))
+        assert params["sslrootcert"] == str(system_bundle)
 
     def test_missing_ca_file_is_clear_error(self, tmp_path):
         with pytest.raises(ConnectionConfigError, match="CA"):
             build_libpq_params(
                 _base(ssl=True, sslrootcert=str(tmp_path / "nope.crt")),
-                libpq_version=MODERN_LIBPQ,
             )
 
-    def test_old_libpq_without_ca_is_clear_error(self):
-        """libpq 16 미만은 sslrootcert=system을 모른다. 조용히 require로 낮추면 안 된다."""
-        with pytest.raises(ConnectionConfigError) as exc:
-            build_libpq_params(_base(ssl=True), libpq_version=OLD_LIBPQ)
-        message = str(exc.value)
-        assert "CA" in message
-        assert "15" in message  # 설치된 libpq 버전을 알려 준다
+    def test_no_usable_system_store_is_clear_error(self, monkeypatch):
+        """OS 저장소를 찾지 못하면 조용히 require로 낮추지 않고 CA 파일 지정을 안내한다."""
+        from src.database import system_ca
+
+        monkeypatch.setattr(system_ca, "resolve_system_ca_bundle", lambda: None)
+        with pytest.raises(ConnectionConfigError, match="CA 인증서 파일"):
+            build_libpq_params(_base(ssl=True))
+
+    @pytest.mark.parametrize("driver", ["psycopg", "psycopg2"])
+    def test_os_bundle_works_regardless_of_libpq_version(self, system_bundle, monkeypatch, driver):
+        """CA를 파일 경로로 넘기므로 libpq 16 미만(sslrootcert=system 미지원)에서도 검증한다."""
+        import psycopg
+        import psycopg2
+        import psycopg2.extensions
+
+        monkeypatch.setattr(psycopg.pq, "version", lambda: 150000)
+        monkeypatch.setattr(psycopg2.extensions, "libpq_version", lambda: 140000)
+        connect = MagicMock()
+        monkeypatch.setattr(psycopg if driver == "psycopg" else psycopg2, "connect", connect)
+
+        (cp.connect_psycopg if driver == "psycopg" else cp.connect_psycopg2)(_base(ssl=True))
+
+        assert connect.call_args.kwargs["sslmode"] == "verify-full"
+        assert connect.call_args.kwargs["sslrootcert"] == str(system_bundle)
 
     def test_verify_ca_requires_ca_file(self):
         """libpq는 sslrootcert=system을 verify-full에서만 허용한다."""
         with pytest.raises(ConnectionConfigError, match="CA"):
-            build_libpq_params(_base(ssl=True, sslmode="verify-ca"), libpq_version=MODERN_LIBPQ)
+            build_libpq_params(_base(ssl=True, sslmode="verify-ca"))
 
     def test_verify_ca_with_ca_file(self, ca_file):
         params = build_libpq_params(
             _base(ssl=True, sslmode="verify-ca", sslrootcert=str(ca_file)),
-            libpq_version=MODERN_LIBPQ,
         )
         assert params["sslmode"] == "verify-ca"
         assert params["sslrootcert"] == str(ca_file)
@@ -182,17 +207,16 @@ class TestTlsVerification:
     @pytest.mark.parametrize("mode", ["disable", "allow", "prefer", "bogus"])
     def test_unknown_or_weak_modes_are_rejected(self, mode):
         with pytest.raises(ConnectionConfigError):
-            build_libpq_params(_base(ssl=True, sslmode=mode), libpq_version=MODERN_LIBPQ)
+            build_libpq_params(_base(ssl=True, sslmode=mode))
 
     def test_require_without_risk_ack_is_rejected(self):
         with pytest.raises(ConnectionConfigError, match="위험"):
-            build_libpq_params(_base(ssl=True, sslmode="require"), libpq_version=MODERN_LIBPQ)
+            build_libpq_params(_base(ssl=True, sslmode="require"))
 
     def test_require_with_risk_ack_is_allowed_and_audited(self):
         audit = MagicMock()
         params = build_libpq_params(
             _base(ssl=True, sslmode="require", ssl_allow_insecure=True),
-            libpq_version=MODERN_LIBPQ,
             audit=audit,
         )
 
@@ -209,7 +233,6 @@ class TestTlsVerification:
         with caplog.at_level(logging.WARNING, logger=cp.AUDIT_LOGGER_NAME):
             build_libpq_params(
                 _base(ssl=True, sslmode="require", ssl_allow_insecure=True),
-                libpq_version=MODERN_LIBPQ,
             )
         records = [r for r in caplog.records if r.name == cp.AUDIT_LOGGER_NAME]
         assert records and records[0].levelno == logging.WARNING
@@ -217,46 +240,38 @@ class TestTlsVerification:
 
     def test_secure_mode_is_not_audited(self, ca_file):
         audit = MagicMock()
-        build_libpq_params(
-            _base(ssl=True, sslrootcert=str(ca_file)), libpq_version=MODERN_LIBPQ, audit=audit
-        )
+        build_libpq_params(_base(ssl=True, sslrootcert=str(ca_file)), audit=audit)
         audit.assert_not_called()
 
     def test_validate_tls_settings_reports_problem_without_raising(self):
-        assert cp.validate_tls_settings(_base(), libpq_version=MODERN_LIBPQ) is None
-        message = cp.validate_tls_settings(
-            _base(ssl=True, sslmode="require"), libpq_version=MODERN_LIBPQ
-        )
+        assert cp.validate_tls_settings(_base()) is None
+        message = cp.validate_tls_settings(_base(ssl=True, sslmode="require"))
         assert message and "위험" in message
 
 
-# ── 설치된 드라이버의 libpq 버전 분기 ─────────────────────────
+# ── 기본 신뢰 저장소가 실제로 쓸 수 있는가 (리뷰 지적 회귀) ─────
 
 
-class TestLibpqVersion:
-    def test_reads_psycopg_runtime_libpq(self, monkeypatch):
-        import psycopg
+class TestDefaultTrustStoreIsUsable:
+    def test_legacy_ssl_profile_gets_real_ca_bundle(self, tmp_path):
+        """바이너리 휠 libpq의 `sslrootcert=system`은 빈 빌드 경로(OPENSSLDIR)를 가리켜
+        공인 CA 서버도 거부한다. 기본 경로는 실제 CA 인증서가 든 PEM 파일이어야 한다."""
+        import ssl
 
-        monkeypatch.setattr(psycopg.pq, "version", lambda: 150004)
-        assert cp.libpq_version("psycopg") == 150004
+        from src.utils.app_paths import AppPaths
 
-    def test_reads_psycopg2_runtime_libpq(self, monkeypatch):
-        import psycopg2.extensions
+        AppPaths.set_custom_root(tmp_path)  # Windows 저장소 내보내기가 실제 앱 데이터에 쓰지 않게
+        try:
+            params = build_libpq_params(_base(ssl=True))
+        finally:
+            AppPaths.set_custom_root(None)
 
-        monkeypatch.setattr(psycopg2.extensions, "libpq_version", lambda: 140010)
-        assert cp.libpq_version("psycopg2") == 140010
-
-    def test_builder_branches_on_the_driver_that_will_connect(self, monkeypatch):
-        """psycopg와 psycopg2는 각자 다른 libpq를 번들한다. 연결할 드라이버 기준으로 판단한다."""
-        import psycopg
-        import psycopg2.extensions
-
-        monkeypatch.setattr(psycopg.pq, "version", lambda: 170000)
-        monkeypatch.setattr(psycopg2.extensions, "libpq_version", lambda: 150000)
-
-        assert build_libpq_params(_base(ssl=True), driver="psycopg")["sslrootcert"] == "system"
-        with pytest.raises(ConnectionConfigError):
-            build_libpq_params(_base(ssl=True), driver="psycopg2")
+        assert params["sslrootcert"] != "system"
+        bundle = Path(params["sslrootcert"])
+        assert bundle.is_file()
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.load_verify_locations(cafile=str(bundle))
+        assert ctx.cert_store_stats()["x509_ca"] > 10
 
 
 # ── 연결 헬퍼 ────────────────────────────────────────────────
@@ -415,18 +430,9 @@ def _legacy_ssl_config():
     return _base(ssl=True)  # 기존 'SSL 사용' 체크 프로필
 
 
-@pytest.fixture
-def modern_libpq(monkeypatch):
-    import psycopg
-    import psycopg2.extensions
-
-    monkeypatch.setattr(psycopg.pq, "version", lambda: MODERN_LIBPQ)
-    monkeypatch.setattr(psycopg2.extensions, "libpq_version", lambda: MODERN_LIBPQ)
-
-
 def _assert_secure(kwargs):
     assert kwargs["sslmode"] == "verify-full"
-    assert kwargs["sslrootcert"] == "system"
+    assert kwargs["sslrootcert"].endswith("system-ca.pem")  # system_bundle 픽스처의 OS 번들
     assert kwargs["options"] == "-c search_path=public"
     assert kwargs["connect_timeout"] > 0
 
@@ -449,7 +455,7 @@ def psycopg2_connect(monkeypatch):
     return connect
 
 
-@pytest.mark.usefixtures("modern_libpq")
+@pytest.mark.usefixtures("system_bundle")
 class TestConnectionSites:
     def test_copy_migration_worker(self, psycopg2_connect):
         from src.core.copy_migration_worker import CopyMigrationWorker
@@ -553,6 +559,9 @@ class TestConnectionDialogTls:
         assert w["sslmode"].currentData() == "verify-full"
         assert w["sslrootcert"].text() == ""
         assert not w["ssl_allow_insecure"].isChecked()
+        # 빈 CA는 libpq 'system' 키워드가 아니라 OS 저장소 번들로 검증한다(안내 문구 일치)
+        assert "libpq" not in w["sslrootcert"].placeholderText()
+        assert "OS" in w["sslrootcert"].placeholderText()
 
     def test_tls_widgets_follow_ssl_checkbox(self, conn_dialog):
         w = conn_dialog.endpoint_widgets["source"]
@@ -588,7 +597,7 @@ class TestConnectionDialogTls:
         assert config["sslmode"] == "verify-full"
         assert config["sslrootcert"] == str(ca_file)
         assert config["ssl_allow_insecure"] is False
-        params = build_libpq_params(config, libpq_version=MODERN_LIBPQ)
+        params = build_libpq_params(config)
         assert params["sslrootcert"] == str(ca_file)
 
     def test_legacy_ssl_profile_loads_as_verify_full(self, qapp):
@@ -644,7 +653,7 @@ class TestConnectionDialogTls:
             change()
             assert w["result_lamp"].state == "idle"
 
-    def test_connection_test_uses_builder(self, conn_dialog, modern_libpq, psycopg_connect):
+    def test_connection_test_uses_builder(self, conn_dialog, system_bundle, psycopg_connect):
         w = conn_dialog.endpoint_widgets["source"]
         _fill_basic(w)
         w["ssl"].setChecked(True)
@@ -907,10 +916,61 @@ class TestRealTlsServer:
         )
         conn.close()
 
-    def test_private_ca_not_trusted_by_system_store(self, tls_server):
-        """CA를 지정하지 않으면 시스템 저장소로 검증하므로 사설 CA 인증서는 거부된다."""
+    @pytest.mark.parametrize("connect", [cp.connect_psycopg, cp.connect_psycopg2])
+    def test_private_ca_not_trusted_by_system_store(self, tls_server, connect):
+        """CA를 지정하지 않으면 OS 신뢰 저장소(비어 있지 않음)로 검증하므로 사설 CA는 거부된다."""
+        from src.database import system_ca
+
+        bundle = system_ca.resolve_system_ca_bundle()
+        assert bundle is not None and bundle.stat().st_size > 0  # 빈 저장소로 통과하는 것이 아님
         with pytest.raises(Exception, match="certificate verify failed"):
-            cp.connect_psycopg(_tls_config(tls_server))
+            connect(_tls_config(tls_server))
+
+    @pytest.mark.parametrize("connect", [cp.connect_psycopg, cp.connect_psycopg2])
+    def test_ca_in_os_store_is_trusted_without_ca_field(self, tls_server, connect, monkeypatch):
+        """CA 칸을 비워도, 서버 CA가 OS 저장소(SSL_CERT_FILE로 주입)에 있으면 연결된다."""
+        from src.database import system_ca
+
+        monkeypatch.setenv("SSL_CERT_FILE", str(tls_server["ca"]))
+        system_ca.clear_cache()
+        try:
+            conn = connect(_tls_config(tls_server))
+            try:
+                assert _ssl_in_use(conn)
+            finally:
+                conn.close()
+        finally:
+            monkeypatch.delenv("SSL_CERT_FILE")
+            system_ca.clear_cache()
+
+    @pytest.mark.parametrize("driver", ["psycopg", "psycopg2"])
+    def test_public_ca_server_passes_verification_by_default(self, driver):
+        """공인 CA 서버(github.com:443)의 인증서가 기본 설정(CA 칸 비움)으로 검증을 통과한다.
+
+        HTTPS 서버라 PostgreSQL 대화는 실패하지만, 직접 TLS(sslnegotiation=direct)로
+        인증서 검증 단계를 지난 뒤의 오류(ALPN)여야 한다. 'certificate verify failed'면 회귀다.
+        """
+        import importlib
+        import socket
+
+        module = importlib.import_module(driver)
+        version = module.pq.version() if driver == "psycopg" else module.extensions.libpq_version()
+        if version < 170000:
+            pytest.skip("sslnegotiation=direct는 libpq 17 이상")
+        try:
+            socket.create_connection(("github.com", 443), timeout=5).close()
+        except OSError:
+            pytest.skip("외부 네트워크 없음")
+
+        params = build_libpq_params(
+            {"host": "github.com", "port": 443, "database": "x", "username": "x", "ssl": True}
+        )
+        params["sslnegotiation"] = "direct"
+        with pytest.raises(Exception) as exc:
+            module.connect(**params)
+        message = str(exc.value)
+        assert "certificate verify failed" not in message
+        assert "ALPN" in message
 
     def test_require_connects_only_with_ack_and_is_audited(self, tls_server):
         with pytest.raises(ConnectionConfigError):
