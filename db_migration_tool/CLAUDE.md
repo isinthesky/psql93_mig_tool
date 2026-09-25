@@ -24,8 +24,10 @@
 - Windows가 앞서 있을 수 있으니(원격 설치 산출물이 최종 산출물) 수정 전 최신화 여부를 확인한다.
 
 ### Test DBs — `macmini-sub` (검증용)
-- `bms93`: `facreport.iptime.org:5446` (PG 9.3, source, 대체본 없는 유일한 9.3 원본). fac-report 운영도 이 DB를 읽으므로 **읽기만 한다(쓰기·DDL 금지)**.
-- `bms30`: `facreport.iptime.org:5445` (PG 16, target). `temp` DB는 이관 중간/비교용 scratch target.
+- 접속 주소(2026-09-26 공유기 5445/5446 포워딩 제거로 `facreport.iptime.org` 사용 불가): LAN(Mac·Windows)은
+  `192.168.0.48:5445/5446`, macmini 컨테이너 안에서는 `host.docker.internal:5445/5446`.
+- `bms93`: 포트 `5446` (PG 9.3, source, 대체본 없는 유일한 9.3 원본). fac-report 운영도 이 DB를 읽으므로 **읽기만 한다(쓰기·DDL 금지)**.
+- `bms30`: 포트 `5445` (PG 16, target). `temp` DB는 이관 중간/비교용 scratch target.
 - 역할 계정 `migtool`(비 superuser)로 검증한다. **`bms30`의 기존 파티션은 사용자 확인 없이
   덮어쓰거나 지우지 않는다** — 테스트 이관 대상은 `temp` DB나 새 날짜 파티션으로 한정.
 - 두 컨테이너가 `healthy`인지 검증 전에 먼저 확인한다(외장 볼륨 분리 이력 있음).
@@ -60,7 +62,7 @@ make test    # pytest tests/ -v --tb=short (test-unit / test-integration / test-
 ### Windows (`my-wsl-01`, `db_migration_tool\`)
 ```bat
 uv run ruff format --check src tests && uv run ruff check src tests && uv run mypy src
-uv run pytest -m "not integration" -v      :: 단위 테스트 — Windows 1108 passed / 6 skipped, Mac 1111 passed / 3 skipped (1.2.8)
+uv run pytest -m "not integration" -v      :: 단위 테스트 — Windows 1108 passed / 6 skipped, Mac 1111 passed / 3 skipped (1.2.8), Mac 1161 passed / 3 skipped (main `b340b42`)
 set DBMIG_RUN_REAL_PROFILE_TESTS=1&& .venv\Scripts\python.exe -m pytest -m integration -k saved_profiles -q
                                             :: 실DB 연결 검증(APPDATA 프로필의 source=bms93, target=bms30) — 1 passed
 build.bat                                  :: PyInstaller -> dist\DBMigrationTool.exe
@@ -111,11 +113,18 @@ M-13, M-14 등)는 미해결.
 **2026-09-25 wave3 병합(main `b6dd474`)**: M-13(트레이·앱 종료 graceful stop·30초 제한 대기·flush, `src/core/worker_registry.py`),
 H-02 잔여(아카이브 워커 비동기 반복 cancel, close 전 cancel 정지) 해결. 감사 문서 §8.5.
 
+**2026-09-26 리뷰 major 통합(main `b340b42`)**: `fix/secrets-divergence`(H-06 같은 프로세스 복수 매니저 키 갈림 — 프로세스 공유
+키 핸들·쓰기 직전 키 파일 대조)와 `fix/legacy-adoption`(H-08 다중 유형 legacy 뒤 유형 결정 강제·기본값 없는 선택 창, H-09 채택 때
+기록한 보충 이름만 아카이브 원본 부재 시 0건 완료, 로컬 DB에 `legacy_supplemented` 컬럼 추가) 병합. 감사 문서 §8.7.
+
 **현재 집계(감사 문서 §8 종합 상태표)**: 해결 22 · 부분 2 · 보류 1.
 - 부분 **H-01**: 워커·이력 상태는 고쳐졌으나 마법사 UI 경로 자동 테스트가 없고 `partial` 대신 `failed`로 표시.
 - 부분 **H-03**: 파티션 단위 snapshot은 적용. PG 9.3 원본 동시 쓰기 미검증, 재개는 새 snapshot.
 - 보류 **M-11**: 코드서명 인증서가 없어 서명 훅만 있다(산출물 UNSIGNED).
-- 리뷰 잔여(major): H-06 같은 프로세스 복수 매니저 키 갈림, H-08 다중 유형 legacy 이력 뒤 유형 누락, H-09 아카이브 legacy 보충 파티션.
+- 리뷰 잔여(major): 없음 — H-06 키 갈림, H-08 다중 유형 legacy, H-09 아카이브 보충분은 §8.7에서 해결.
+- 리뷰 잔여(minor): H-06 키 기록 뒤 되읽기 실패 시 세션 쓰기 거부·첫 생성 일시 오류 캐시·Windows 경로 핸들 식별자 미검증,
+  H-08 `started_at` 시계 역방향 모순 미검출·선택 창 기본값 정책 사용자 확인 대기, H-09 v1.2.8에서 채택한 아카이브 이력은
+  보충분 부재도 실패(폐기로 복구), copy 워커 원본 부재 판정(`information_schema`, 전 파티션 0건 완료) 별도 검토.
 - §6 종료 조건(독립 재감사, clean VM 서명 릴리스·설치 smoke, PG 9.3 실DB matrix)은 미충족 — 운영 승인 보류 유지.
 
 아래 원문 설명은 수정 전 상태 기록이다(해결된 항목 포함).

@@ -196,16 +196,16 @@
 
 각 작업 단위는 문제 재현 테스트, 최소 수정, 회귀 테스트, 운영 복구 절차를 함께 제출해야 한다.
 
-## 8. 진행 현황 (2026-09-25)
+## 8. 진행 현황 (2026-09-26)
 
-### 종합 상태표 (main `b6dd474`, D2 릴리스 직전)
+### 종합 상태표 (main `b340b42`, 1.2.8 이후 리뷰 major 통합 — §8.7)
 
 상태 구분
 - **해결**: 코드 수정과 회귀 테스트가 main에 들어갔다. 괄호 안은 알려진 한계다.
 - **부분**: §3 완료 판정 중 일부를 아직 충족하지 못했다.
 - **보류**: 외부 조건 때문에 착수할 수 없다. 사유를 적는다.
 
-집계: 해결 22 · 부분 2(H-01, H-03) · 보류 1(M-11). §6 종료 조건(재감사, clean VM 서명 릴리스, PG 9.3 실DB matrix)은 아직 충족하지 못했다.
+집계: 해결 22 · 부분 2(H-01, H-03) · 보류 1(M-11). 이전 리뷰가 남긴 major(H-06 키 갈림, H-08 다중 유형 legacy, H-09 아카이브 보충분)는 §8.7에서 모두 해소했고, 남은 리뷰 지적은 minor뿐이다. §6 종료 조건(재감사, clean VM 서명 릴리스, PG 9.3 실DB matrix)은 아직 충족하지 못했다.
 
 | ID | 상태 | 검증 근거 | 잔여·검증 대기 |
 |---|---|---|---|
@@ -216,10 +216,10 @@
 | H-03 | 부분 | 파티션마다 원본 `REPEATABLE READ, READ ONLY` 트랜잭션 하나(`test_copy_cancel_and_snapshot.py`). scratch PostgreSQL 동시 쓰기 통합 5건(`tests/core/test_copy_snapshot_integration.py`, 환경변수 필요) | PG 9.3 원본 동시 쓰기를 검증하지 못했다(운영 원본에 쓰기 금지). 재개는 새 snapshot이라 이미 복사한 행의 update를 탐지하지 못한다. 일시정지 중 xmin 유지(UI 안내 없음) |
 | H-04 | 해결 | `tests/database/test_schema_qualification.py`, `test_sql_safety.py`, 실DB shadow 스키마 테스트 `tests/integration/test_sql_boundaries_realdb.py`(temp DB) | 운영 bms30 기존 트리거 함수는 부모 재생성 때만 교체. `nextval('seq'::regclass)` DEFAULT에 schema 없음 |
 | H-05 | 해결 | `tests/database/test_connection_params.py`, `test_system_ca.py`, TLS 통합 13 passed(§8.3) | Windows 실제 TLS PostgreSQL 연결. 기존 `require` 프로필이 `verify-full`로 바뀜(릴리스 노트) |
-| H-06 | 해결 | 리뷰 회귀 16건·`tests/utils/test_secret_store.py`·뮤테이션 8종 포착(`d50d209`). 실데이터 적용은 D2 릴리스 5단계(§8.6) | 2차 리뷰 major: 같은 프로세스에서 fallback으로 끝난 매니저와 마이그레이션에 성공한 매니저의 키가 갈라질 수 있음. 다운그레이드 불가 |
+| H-06 | 해결 | 리뷰 회귀 16건·`tests/utils/test_secret_store.py`·뮤테이션 8종 포착(`d50d209`). 실데이터 적용은 D2 릴리스 5단계(§8.6). 2차 리뷰 major(같은 프로세스 복수 매니저 키 갈림)는 프로세스 공유 키 핸들·쓰기 직전 키 파일 대조로 해결(`b207738`, §8.7) | 다운그레이드 불가. 리뷰 minor: 키 기록 성공 뒤 되읽기 실패 시 그 세션 쓰기 거부(재시작으로 복구), 첫 생성의 일시 오류가 프로세스 동안 캐시됨. Windows 경로 핸들 식별자 검증 대기 |
 | H-07 | 해결 | `tests/licensing/test_check.py::TestFailClosed` | — |
-| H-08 | 해결(legacy 한계) | 이력 identity·재개 게이트 테스트, 실DB 중단→재개에서 identity 게이트 확인(§8.3, §8.4) | 리뷰 major: legacy 채택이 뒤 유형이 통째로 빠진 다중 유형 이력을 잡지 못함 |
-| H-09 | 해결(legacy 한계) | 이력·checkpoint 단일 트랜잭션, N번째 실패 rollback, legacy 누락 보충 14건(`fb27614`) | 아카이브 경로의 legacy 보충 파티션은 워커가 완료하지 못함 |
+| H-08 | 해결(legacy 한계) | 이력 identity·재개 게이트 테스트, 실DB 중단→재개에서 identity 게이트 확인(§8.3, §8.4, §8.7). 리뷰 major(다중 유형 뒤 유형 누락)는 뒤 유형 결정 강제·기본값 없는 선택 창으로 해결(`b44596b`, `3fdae64`, §8.7) | 리뷰 minor: `started_at`이 checkpoint와 모순돼도 도입일 기준 제외를 믿음(시계 역방향). 선택 창 기본값 정책(기본값 없음) 사용자 확인 대기 |
+| H-09 | 해결(legacy 한계) | 이력·checkpoint 단일 트랜잭션, N번째 실패 rollback, legacy 누락 보충 14건(`fb27614`). 아카이브 보충분은 채택 때 기록한 `legacy_supplemented` 이름만 원본 부재 시 0건 완료(`3fdae64`, §8.7) | v1.2.8에서 이미 채택한 아카이브 이력은 기록이 NULL이라 보충분 부재도 실패(폐기로만 복구). copy 워커의 원본 부재 판정은 `information_schema` 기반·전 파티션 적용(별도 검토) |
 | M-01 | 해결 | `tests/core/test_partition_discovery_recovery.py`, 실DB M-01 통합(temp) | — |
 | M-02 | 해결 | `tests/core/test_archive_manifest_cas.py`(스레드 4·프로세스 3 경쟁, 수정 전 lost update 재현) | — |
 | M-03 | 해결(제거) | OFFSET 기반 `migration_worker.py` 삭제, 생성 경로 0건 | — |
@@ -235,7 +235,7 @@
 | M-13 | 해결 | `tests/core/test_worker_shutdown.py`(단계별 종료·timeout 강제 종료·임시 파일/잠금/스레드 누수), `tests/test_main_shutdown.py`, `tests/test_tray_icon.py`, `tests/utils/test_logger_mixins.py`(§8.5) | 실제 Windows 트레이 종료 수동 확인 |
 | M-14 | 해결 | `tests/core/test_table_creator_transactions.py`(`FakePgConnection` 중단 트랜잭션 규칙), 실DB M-14 통합(temp) | 부모 잠금 구간이 길어져 동시 생성 시 경합 가능(즉시 실패 후 rollback) |
 
-자동 게이트(Mac, `b6dd474`): 단위 1111 passed / 3 skipped / 21 deselected, ruff format(149 files)·check, mypy(61 files) 통과.
+자동 게이트(Mac, `b340b42`): 단위 1161 passed / 3 skipped / 21 deselected, ruff format(150 files)·check, mypy(61 files) 통과.
 
 ### 1차 수정 — v1.2.7
 
@@ -301,8 +301,8 @@
 |---|---|---|---|
 | H-05 | 해결 | 공용 빌더 `src/database/connection_params.py`로 PostgreSQL 연결 지점을 모두 모았다. SSL 기본값은 `verify-full`, CA 칸이 비면 `src/database/system_ca.py`가 OS 신뢰 저장소 PEM을 찾아 넘긴다. `require`는 위험 승인과 감사 로그가 있어야 한다. | 기존 SSL 프로필이 `require`에서 `verify-full`로 바뀐다(릴리스 노트). Windows 실제 TLS PostgreSQL 연결은 릴리스 게이트 |
 | H-02 / H-04 | 부분(연결 단계) | 모든 연결에 `connect_timeout`(기본 10초)과 `search_path=public`을 적용했다. | COPY·commit 취소, relation schema 한정 |
-| H-06 / M-05 | 해결 | 읽기 경로의 legacy fallback을 없애고 1회 마이그레이션(키 교체·재암호화·백업 정리·완료 표식)으로 대체했다. 키는 DPAPI로 감싼다(비Windows는 0600 평문). 복호화하지 못한 행은 잠긴 프로필로 보인다. | 2차 리뷰 major: 첫 매니저 생성이 fallback 키로 끝난 뒤 같은 프로세스의 다른 매니저가 마이그레이션에 성공하면 키가 갈라져 새 자격 증명이 재시작 후 잠길 수 있다. 다운그레이드 불가(릴리스 노트) |
-| H-08 / H-09 / M-12 | 해결(legacy 한계) | 이력과 checkpoint를 한 트랜잭션으로 만들고 endpoint 지문·불변 계획으로 재개를 검증한다. 미완료 이력이 있는 프로필은 명시적 폐기 후에만 삭제된다. | 2차 리뷰 major: legacy 채택이 뒤 유형이 통째로 빠진 다중 유형 이력을 잡지 못한다. 아카이브 경로의 legacy 보충 파티션은 워커가 완료하지 못한다 |
+| H-06 / M-05 | 해결 | 읽기 경로의 legacy fallback을 없애고 1회 마이그레이션(키 교체·재암호화·백업 정리·완료 표식)으로 대체했다. 키는 DPAPI로 감싼다(비Windows는 0600 평문). 복호화하지 못한 행은 잠긴 프로필로 보인다. | ~~2차 리뷰 major: 같은 프로세스 복수 매니저 키 갈림~~ → §8.7에서 해결. 다운그레이드 불가(릴리스 노트) |
+| H-08 / H-09 / M-12 | 해결(legacy 한계) | 이력과 checkpoint를 한 트랜잭션으로 만들고 endpoint 지문·불변 계획으로 재개를 검증한다. 미완료 이력이 있는 프로필은 명시적 폐기 후에만 삭제된다. | ~~2차 리뷰 major: 다중 유형 legacy 뒤 유형 누락, 아카이브 보충 파티션 미완료~~ → §8.7에서 해결 |
 
 병합 중 처리
 - 텍스트 충돌: `file_archive_migration_dialog.py` import 인접 줄(둘 다 유지), 이 문서 끝 절(§8.1·§8.2로 분리).
@@ -390,3 +390,39 @@ main `b678338`에서 Windows 빌드. 릴리스 커밋 `c1b17cf`, 태그 `v1.2.8`
 - `%APPDATA%\Python\`(개발 실행)과 `pytest-qt-qapp\`에는 아직 평문 키가 있다. 그 경로로 앱을 실행하면 같은 1회 마이그레이션이 적용된다.
 - 미서명이라 배포용 릴리스가 아니다(M-11). 설치·업그레이드·제거 smoke와 Windows 실제 TLS 연결은 하지 않았다.
 
+
+### 8.7 리뷰 major 통합 (main 병합, 2026-09-26)
+
+`fix/secrets-divergence` → `fix/legacy-adoption` 순으로 `--no-ff` 병합했다(`3f570b6`, `b340b42`). 두 브랜치 모두
+최종 리뷰가 pass였고 남은 지적은 minor뿐이다. 이 병합으로 §8.3에서 넘어온 리뷰 major 3건이 모두 해소됐다.
+
+| ID | 커밋 | 요약 |
+|---|---|---|
+| H-06 / M-05 (키 갈림) | `b207738` | `shared_profile_key()`·`ProfileKeyHandle`: (DB realpath, 키 파일 realpath)를 키로 쓰는 모듈 레지스트리에서 키 준비·마이그레이션을 프로세스당 1회만 한다. fallback·진행 중·실패 결과도 같은 프로세스에서 재시도하지 않는다. 키 재설정도 핸들을 거쳐 모든 매니저에 반영된다. `create_profile`·`update_profile`·`save_connection`은 쓰기 직전 키 파일을 다시 읽어 대조(`for_write`)하고, 달라졌거나 지워졌거나 읽을 수 없으면 `ProfileKeyUnavailableError`로 아무것도 쓰지 않는다. |
+| H-08 (다중 유형 legacy) | `b44596b`, `3fdae64` | 구버전 checkpoint 생성 순서(유형 코드 ED→PH→PS→RT→TH)로 checkpoint 없는 유형을 앞(원래 선택 안 함)과 뒤(끊겨 빠졌을 수 있음)로 나눈다. 뒤 유형은 '원래 작업의 항목 확인' 창에서 유형마다 있었음/없었음을 골라야 하고(기본값 없음, 모두 정하기 전 확인 버튼 비활성), 정하지 않은 채택은 `LegacyTypeDecisionError`로 거부된다. 이력 시작일에 도구에 없던 유형(`LEGACY_TYPE_INTRODUCED`: ED·RT·TH 2025-11-19, PS 2026-03-30)은 묻지 않는다. import 경로는 대상 덮어쓰기 경고를 띄운다. |
+| H-09 (아카이브 보충분) | `b44596b`, `3fdae64` | 채택 때 보충한 이름만 `migration_history.legacy_supplemented`(JSON, 계획 기록과 같은 트랜잭션)에 기록한다. 아카이브 워커는 이 집합(`absent_ok_partitions`)에 든 이름만 원본에 없으면 0건 완료로 처리한다. export는 `pg_catalog`로 존재를 확인하고(조회 전후 rollback — 건너뛰기 모드의 중단 트랜잭션 대응), import는 manifest 항목과 파일이 모두 없을 때만 부재로 본다. 원래 checkpoint·새 계획 파티션의 부재는 전처럼 실패한다. |
+
+병합 중 처리
+- 텍스트·의미 충돌 없음(변경 파일이 겹치지 않음). 두 브랜치가 미뤄 둔 문서 갱신(이 절, 종합 상태표, `CLAUDE.md` §6)을 병합 뒤 반영했다.
+- 스키마 변경: `local_db.py`에 `legacy_supplemented TEXT` 컬럼(`_ADDED_COLUMNS`로 기존 DB에 추가, NULL은 빈 집합).
+
+검증
+- 단위 **1161 passed / 3 skipped / 21 deselected**(1.2.8 기준 1111 + secrets 14 + legacy 36), ruff format(150 files)·check,
+  mypy(61 files) 통과. 각 브랜치에서 새 테스트가 수정 전 코드로 실패하는 것(RED)과 뮤테이션 포착을 확인했다.
+- 실DB E2E(bms93 PG 9.3 → temp PG 16, **LAN 호스트 `192.168.0.48`** — 2026-09-26부터 iptime 5445/5446 포워딩 제거,
+  `--drop-after`): Python COPY `point_history_260521`(4,714,327행, 33.4s), Server COPY `point_history_260522`
+  (4,714,858행, 20.8s), 중단→재개 `point_history_260523`(500,000행에서 중지, 재개 후 4,711,294행, identity 게이트 확인)
+  모두 원본·대상 집계 5종 MATCH. 실행 뒤 temp `partition_table_info`에 남은 세 행을 지웠다. 로그의 비밀번호 문자열 0건.
+- legacy-adoption 브랜치는 별도로 아카이브 export(bms93 `point_history_260518` 4,715,608행)·import(temp, 부재 파티션만) 실DB 확인을 했다.
+
+남은 리뷰 지적(minor, 운영 차단 아님)
+- H-06: 새 키 기록 성공 뒤 되읽기 실패 시 핸들은 fallback k0, 디스크는 K1이라 그 세션 쓰기가 거부되고 안내 문구가 원인과 맞지 않는다(재시작으로 복구).
+  첫 생성의 일시 오류(DPAPI 읽기 실패 등)가 프로세스 동안 캐시돼 뒤에 연 다이얼로그도 복구하지 못한다.
+  핸들 식별자 `normcase(realpath)`의 Windows 경로 동작은 my-wsl-01에서 확인해야 한다.
+- H-08: `started_at`이 도입일보다 이른데 그 유형의 checkpoint가 있으면(시계 역방향 모순) 뒤 유형을 조용히 제외한다.
+  represented ∩ unavailable이 비어 있지 않으면 `started_at`을 믿지 않도록 고치는 것을 권한다. 선택 창 기본값 정책(기본값 없음)은 사용자 확인 대기.
+- H-09: v1.2.8에서 이미 채택한 아카이브 legacy 이력은 `legacy_supplemented`가 NULL이라 보충분 부재도 실패한다(폐기로만 복구).
+  Windows 실데이터에 해당 이력이 있는지 읽기 전용으로 세 볼 것. export 쪽 회귀 테스트 1건은 수정 전 코드에서도 통과한다(dialog→worker 통합 테스트 권장).
+- 별도 이슈: copy 워커(`PostgresOptimizer.estimate_table_size`)는 원본 존재 확인에 `information_schema.tables`를 써서 권한 문제를 '없음'으로 오판할 수 있고, 모든 파티션에서 부재를 0건 완료로 처리한다.
+
+재감사 전까지 운영 승인 보류 원칙은 유지한다. 릴리스(버전 올림·빌드·push)는 별도 단계에서 한다.
