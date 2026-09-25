@@ -1,0 +1,8 @@
+# 줄바꿈 정규화: 저장소에는 LF로 저장하고, Windows 스크립트만 작업 트리에서 CRLF로 체크아웃한다.
+# (Windows/WSL에서 CRLF 차이만으로 파일이 수정된 것처럼 보이는 문제 방지)
+* text=auto
+*.py text eol=lf
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+*.iss text eol=crlf
