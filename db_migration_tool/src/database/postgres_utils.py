@@ -115,24 +115,12 @@ class PostgresOptimizer:
         """
         import psycopg
 
-        # 연결 파라미터 준비
-        conn_params = {
-            "host": config.get("host", "localhost"),
-            "port": config.get("port", 5432),
-            "dbname": config.get("database", ""),
-            "user": config.get("username", ""),
-            "password": config.get("password", ""),
-            "connect_timeout": 5,  # 5초 타임아웃
-        }
-
-        # SSL 설정
-        if config.get("ssl"):
-            conn_params["sslmode"] = "require"
+        from src.database.connection_params import ConnectionConfigError, connect_psycopg
 
         conn = None
         try:
-            # psycopg3를 사용하여 연결 시도
-            conn = psycopg.connect(**conn_params)
+            # 공용 빌더: TLS 검증·search_path 적용. 빠른 확인이므로 기본 5초 타임아웃.
+            conn = connect_psycopg(config, connect_timeout=5)
 
             # 간단한 쿼리로 연결 확인
             with conn.cursor() as cursor:
@@ -141,6 +129,8 @@ class PostgresOptimizer:
 
             return True, "연결 성공"
 
+        except ConnectionConfigError as e:
+            return False, f"연결 설정 오류: {e}"
         except psycopg.OperationalError as e:
             error_str = str(e)
 

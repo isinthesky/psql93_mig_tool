@@ -25,6 +25,7 @@ from src.core.table_types import (
     get_table_type,
     infer_partition_range,
 )
+from src.database.connection_params import connect_psycopg2
 from src.models.profile import ConnectionProfile
 
 
@@ -157,16 +158,8 @@ class ArchiveMigrationWorkerBase(BaseMigrationWorker):
 
     @staticmethod
     def _create_psycopg2_connection(config: dict[str, Any]):
-        params = {
-            "host": config.get("host", "localhost"),
-            "port": config.get("port", 5432),
-            "database": config.get("database", ""),
-            "user": config.get("username", ""),
-            "password": config.get("password", ""),
-        }
-        if config.get("ssl"):
-            params["sslmode"] = "require"
-        conn = psycopg2.connect(**params)
+        # 공용 빌더: TLS 서버 신원 검증, connect_timeout, search_path=public
+        conn = connect_psycopg2(config)
         conn.autocommit = False
         return conn
 
