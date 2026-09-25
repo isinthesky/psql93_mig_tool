@@ -17,6 +17,9 @@
   계획으로 한 번 기록하고, 그 뒤로는 엄격 모드로 검사한다. 체크포인트가 있는 유형 안의
   누락을 보충하지 않으면 채택하지 않는다(`LegacyPlanGapError`) — 남은 일부만으로 계획을
   고정하면 구버전 H-09 누락이 '정상'이 되어 subset만 처리하고 completed로 닫힌다.
+  구버전은 checkpoint를 유형 코드 순서(ED→PH→PS→RT→TH)로 만들었으므로, checkpoint가
+  없는 **뒤 유형**은 끊겨서 통째로 빠졌을 수 있다. 그 유형들은 원래 작업에 포함됐는지
+  호출자가 명시적으로 정해야 채택된다(`LegacyTypeDecisionError`).
 """
 
 from __future__ import annotations
@@ -50,6 +53,7 @@ __all__ = [
     "HistoryManager",
     "LegacyCoverage",
     "LegacyPlanGapError",
+    "LegacyTypeDecisionError",
     "MigrationHistoryItem",
     "MigrationPlan",
     "ResumeCheck",
@@ -208,7 +212,8 @@ def legacy_range_candidates(start: date, end: date) -> dict[str, list[str]]:
 
     daily: `<table>_YYMMDD`(범위의 모든 날), monthly: `<table>_YYMM`(범위와 겹치는 모든 달).
     탐색(`PartitionDiscovery`)의 겹침 규칙과 같다. 원본에 실제로 있는지는 모른다 —
-    원본에 없는 파티션은 워커가 0건 완료로 건너뛴다.
+    채택한 legacy 이력에서 원본(DB·아카이브 manifest)에 없는 파티션은 워커가 0건 완료로
+    닫는다(copy·아카이브 워커 공통).
     """
     # 지연 import: src.core 패키지가 워커를 거쳐 이 모듈을 다시 import한다(순환).
     from src.core.table_types import TABLE_TYPE_CONFIG
@@ -228,6 +233,27 @@ def legacy_range_candidates(start: date, end: date) -> dict[str, list[str]]:
                 year, month = (year + 1, 1) if month == 12 else (year, month + 1)
         result[config.table_name] = sorted(names)
     return result
+
+
+def legacy_creation_order() -> list[str]:
+    """구버전이 checkpoint를 만든 유형 순서(테이블 이름).
+
+    구버전 두 다이얼로그는 탐색 결과를 `(table_type_code, from_timestamp)`로 정렬한 목록을
+    그대로 checkpoint로 만들었다(`PartitionDiscovery`, `ArchiveManifestStore`의 정렬).
+    그래서 중간에 끊기면 남은 checkpoint는 이 순서의 **앞부분**이다.
+    """
+    from src.core.table_types import TABLE_TYPE_CONFIG
+
+    return [
+        config.table_name
+        for _code, config in sorted(TABLE_TYPE_CONFIG.items(), key=lambda kv: kv[0].value)
+    ]
+
+
+def _type_codes() -> dict[str, str]:
+    from src.core.table_types import TABLE_TYPE_CONFIG
+
+    return {config.table_name: code.value for code, config in TABLE_TYPE_CONFIG.items()}
 
 
 def _partition_table(name: str) -> str | None:
@@ -253,11 +279,21 @@ def _shown(names: list[str], limit: int = 10) -> str:
 class LegacyCoverage:
     """legacy 이력의 남은 checkpoint가 기록된 범위를 얼마나 덮는지.
 
-    - 유형 판정: checkpoint가 하나라도 있는 테이블 유형을 '원래 선택된 유형'으로 본다.
-    - `gaps`: 그 유형들의 범위 내 기대 파티션 중 checkpoint가 없는 것 — 구버전 H-09 누락
-      (또는 당시 사용자가 뺀 파티션). 채택하려면 반드시 보충해야 한다.
-    - `absent_types`: checkpoint가 전혀 없는 유형의 범위 내 후보. 원래 선택하지 않았을 수
-      있으므로 알리기만 하고, 명시적으로 넘길 때만 보충한다.
+    구버전은 선택한 파티션을 유형 코드 순서(`legacy_creation_order`, ED→PH→PS→RT→TH)로
+    checkpoint로 만들었다. 중간에 끊기면 남은 checkpoint는 그 순서의 앞부분이다.
+
+    - `represented_types`: checkpoint가 하나라도 있는 유형 — 원래 선택된 것이 확실하다.
+    - `excluded_types`: checkpoint가 없고 순서상 마지막 represented 유형보다 **앞**인 유형 —
+      원래 선택했다면 checkpoint가 먼저 생겼어야 하므로 선택하지 않은 것이 확실하다. 경고하지
+      않는다(선언에 넣으면 포함한다).
+    - `trailing_types`: checkpoint가 없고 순서상 **뒤**인 유형의 범위 내 후보. 선택하지 않았을
+      수도, 끊겨서 통째로 빠졌을 수도 있다 — 로컬 데이터로는 구분할 수 없다.
+    - `declared_types`: 호출자(사용자)가 원래 작업에 포함됐다고 확인한 유형. None이면 아직
+      정하지 않았다(`undecided_types`가 뒤 유형 전체). 선언된 checkpoint 없는 유형은
+      `included_types`가 되어 기대 집합에 들어간다.
+    - `gaps`: 기대 집합(represented ∪ included의 범위 내 후보) 중 checkpoint가 없는 것 —
+      구버전 H-09 누락(또는 당시 사용자가 뺀 파티션). 채택하려면 반드시 보충해야 한다.
+    - `absent_types`: 계획에 넣지 않는 뒤 유형의 후보(미결정이거나 사용자가 제외).
     - `outside`: 범위 밖이거나 명명 규칙에 맞지 않는 checkpoint. 계획에 그대로 둔다.
     """
 
@@ -272,11 +308,27 @@ class LegacyCoverage:
     gaps: list[str] = field(default_factory=list)
     absent_types: dict[str, list[str]] = field(default_factory=dict)
     outside: list[str] = field(default_factory=list)
+    trailing_types: dict[str, list[str]] = field(default_factory=dict)
+    excluded_types: list[str] = field(default_factory=list)
+    declared_types: list[str] | None = None
+    included_types: list[str] = field(default_factory=list)
 
     @classmethod
     def compute(
-        cls, start_date: str | None, end_date: str | None, states: list[tuple[str, str | None]]
+        cls,
+        start_date: str | None,
+        end_date: str | None,
+        states: list[tuple[str, str | None]],
+        original_types: Iterable[str] | None = None,
     ) -> LegacyCoverage:
+        order = legacy_creation_order()
+        declared: list[str] | None = None
+        if original_types is not None:
+            declared = sorted({str(t) for t in original_types})
+            unknown = [t for t in declared if t not in order]
+            if unknown:
+                raise ValueError(f"알 수 없는 테이블 유형입니다: {', '.join(unknown)}")
+
         present = sorted({name for name, _ in states})
         completed = len({name for name, status in states if status == "completed"})
         start, end = _parse_day(start_date), _parse_day(end_date)
@@ -286,6 +338,7 @@ class LegacyCoverage:
             range_ok=False,
             present=present,
             completed_count=completed,
+            declared_types=declared,
         )
         if start is None or end is None or start > end:
             base.outside = present
@@ -296,16 +349,32 @@ class LegacyCoverage:
         represented = sorted(
             {t for n in present if (t := _partition_table(n)) is not None and t in candidates}
         )
-        expected = {n for t in represented for n in candidates[t]}
+        # 순서상 마지막으로 checkpoint가 생긴 유형. 그보다 앞의 빈 유형은 선택되지 않았다.
+        last = max((order.index(t) for t in represented), default=-1)
+        absent = [t for t in order if t not in represented]
+        included = [t for t in absent if declared is not None and t in declared]
+        expected = {n for t in [*represented, *included] for n in candidates[t]}
         all_candidates = {n for names in candidates.values() for n in names}
+        trailing = [t for t in absent if order.index(t) > last]
+
         base.range_ok = True
         base.range_days = (end - start).days + 1
         base.represented_types = represented
+        base.included_types = included
         base.expected_count = len(expected)
         base.gaps = sorted(expected - present_set)
-        base.absent_types = {t: names for t, names in candidates.items() if t not in represented}
+        base.trailing_types = {t: candidates[t] for t in trailing}
+        base.excluded_types = [t for t in absent if order.index(t) < last and t not in included]
+        base.absent_types = {t: candidates[t] for t in trailing if t not in included}
         base.outside = sorted(present_set - all_candidates)
         return base
+
+    @property
+    def undecided_types(self) -> dict[str, list[str]]:
+        """원래 작업에 포함됐는지 아직 정하지 않은 뒤 유형(유형 → 범위 내 후보)."""
+        if self.declared_types is not None:
+            return {}
+        return dict(self.trailing_types)
 
     @property
     def candidates(self) -> set[str]:
@@ -315,7 +384,7 @@ class LegacyCoverage:
             return set()
         return {n for names in legacy_range_candidates(start, end).values() for n in names}
 
-    def summary_lines(self) -> list[str]:
+    def summary_lines(self, migration_mode: str | None = None) -> list[str]:
         if not self.range_ok:
             return [
                 f"기록된 범위({self.start_date or '없음'} ~ {self.end_date or '없음'})를 해석할 수 "
@@ -325,20 +394,28 @@ class LegacyCoverage:
         lines = [
             f"기록된 범위 {self.start_date} ~ {self.end_date} ({self.range_days:,}일), "
             f"체크포인트가 있는 유형: {types}",
-            f"범위에서 기대되는 파티션 {self.expected_count:,}개, 남아 있는 체크포인트 "
-            f"{len(self.present):,}개(완료 {self.completed_count:,}개), 누락 {len(self.gaps):,}개",
         ]
+        if self.included_types:
+            lines.append(
+                "원래 작업에 포함했다고 확인한 유형(체크포인트 없음): "
+                + ", ".join(self.included_types)
+            )
+        lines.append(
+            f"범위에서 기대되는 파티션 {self.expected_count:,}개, 남아 있는 체크포인트 "
+            f"{len(self.present):,}개(완료 {self.completed_count:,}개), 누락 {len(self.gaps):,}개"
+        )
         if self.gaps:
             lines.append(
-                f"누락된 파티션: {_shown(self.gaps)} — 이어서 진행하면 계획에 보충합니다"
-                "(원본에 없는 파티션은 0건으로 건너뛰고, 대상에 이미 데이터가 있으면 "
-                "삭제 여부를 묻습니다)."
+                f"누락된 파티션: {_shown(self.gaps)} — 이어서 진행하면 계획에 보충합니다. "
+                + _supplement_note(migration_mode)
             )
-        absent = [f"{t} {len(n):,}개" for t, n in self.absent_types.items() if n]
-        if absent:
+        undecided = [f"{t} {len(n):,}개" for t, n in self.undecided_types.items() if n]
+        if undecided:
+            order = "→".join(_type_codes()[t] for t in legacy_creation_order())
             lines.append(
-                f"체크포인트가 없는 유형(계획에 넣지 않음): {', '.join(absent)} — 원래 작업에 "
-                "포함됐었다면 이어서 진행하지 말고 새 작업으로 진행하세요."
+                f"체크포인트가 없는 뒤 유형: {', '.join(undecided)} — 이전 버전은 유형 순서"
+                f"({order})로 체크포인트를 만들어, 중간에 끊기면 뒤 유형이 통째로 빠집니다. "
+                "원래 작업에 포함됐는지 정해야 이어서 진행할 수 있습니다."
             )
         if self.outside:
             lines.append(
@@ -346,6 +423,24 @@ class LegacyCoverage:
                 f"{_shown(self.outside, 5)}"
             )
         return lines
+
+
+def _supplement_note(migration_mode: str | None) -> str:
+    """보충한 파티션을 워커가 어떻게 처리하는지 — 경로별로 다르다."""
+    if migration_mode == "postgres_to_file":
+        return (
+            "원본 DB에 없는 파티션은 0건 완료로 처리하고 파일을 만들지 않습니다. 아카이브에 "
+            "같은 파티션이 이미 있으면 새로 내보낸 내용으로 교체합니다."
+        )
+    if migration_mode == "file_to_postgres":
+        return (
+            "아카이브에 항목과 파일이 모두 없는 파티션은 0건 완료로 처리합니다(항목이나 파일 "
+            "중 하나만 있으면 실패). 대상에 이미 데이터가 있으면 묻지 않고 비운 뒤 아카이브 "
+            "내용으로 다시 적재합니다."
+        )
+    return (
+        "원본 DB에 없는 파티션은 0건 완료로 처리하고, 대상에 이미 데이터가 있으면 비울지 묻습니다."
+    )
 
 
 class LegacyPlanGapError(ValueError):
@@ -356,6 +451,17 @@ class LegacyPlanGapError(ValueError):
         super().__init__(
             f"기록된 범위에서 체크포인트가 빠진 파티션 {len(self.gaps):,}개를 보충하지 않으면 "
             f"이 작업을 이어서 진행할 수 없습니다: {_shown(self.gaps)}"
+        )
+
+
+class LegacyTypeDecisionError(ValueError):
+    """checkpoint가 없는 뒤 유형의 포함 여부를 정하지 않은 채 legacy 이력을 채택하려 했다."""
+
+    def __init__(self, types: Iterable[str]):
+        self.types = sorted(types)
+        super().__init__(
+            f"체크포인트가 없는 뒤 유형 {', '.join(self.types)}이(가) 원래 작업에 포함됐는지 "
+            "정하지 않으면 이 작업을 이어서 진행할 수 없습니다(끊겨서 통째로 빠졌을 수 있음)."
         )
 
 
@@ -596,12 +702,16 @@ class HistoryManager:
         profile: ConnectionProfile,
         *,
         schema: str = DEFAULT_SCHEMA,
+        original_types: Iterable[str] | None = None,
     ) -> ResumeCheck:
         """재개 전에 계획 무결성·identity·checkpoint 완전성을 검증한다.
 
         순서: 저장된 계획의 무결성(count/hash/plan 지문) → 현재 프로필과 identity
         비교 → 계획 밖 checkpoint 차단 → 누락 checkpoint 보충. 보충 외에는 아무것도
         쓰지 않는다. 차단 판정에서는 checkpoint를 건드리지 않는다.
+
+        `original_types`는 legacy 이력에만 쓴다: 사용자가 원래 작업에 포함됐다고 확인한
+        테이블 유형. 주면 checkpoint 없는 뒤 유형의 누락까지 `legacy.gaps`에 넣어 보여 준다.
         """
         row = self.repo.get_by_id(history_id)
         if row is None:
@@ -614,7 +724,7 @@ class HistoryManager:
         completed = {name for name, status in states if status == "completed"}
 
         if row.plan_version is None:
-            coverage = LegacyCoverage.compute(row.start_date, row.end_date, states)
+            coverage = LegacyCoverage.compute(row.start_date, row.end_date, states, original_types)
             return ResumeCheck(
                 ResumeVerdict.LEGACY,
                 history_id,
@@ -623,7 +733,7 @@ class HistoryManager:
                     "이 작업은 연결 지문과 계획을 기록하기 전 버전에서 만들어졌습니다.",
                     "원래 작업과 같은 원본·대상인지 자동으로 확인할 수 없습니다.",
                     # 구버전은 checkpoint를 하나씩 commit했으므로(H-09) 일부가 빠져 있을 수 있다.
-                    *coverage.summary_lines(),
+                    *coverage.summary_lines(profile.migration_mode),
                 ],
                 legacy=coverage,
             )
@@ -713,14 +823,20 @@ class HistoryManager:
         *,
         schema: str = DEFAULT_SCHEMA,
         supplement: Iterable[str] = (),
+        original_types: Iterable[str] | None = None,
     ) -> ResumeCheck:
         """사용자가 확인한 legacy 이력을 현재 identity와 계획에 묶는다.
 
         계획 = 남아 있는 checkpoint ∪ `supplement`. `supplement`는 기록된 범위의 기대
-        파티션(`LegacyCoverage.candidates`)이어야 하고, checkpoint가 있는 유형 안의 누락
-        (`LegacyCoverage.gaps`)은 전부 들어 있어야 한다 — 아니면 `LegacyPlanGapError`.
-        남은 일부만으로 계획을 고정하면 구버전 H-09 누락이 정상이 되어 subset만 처리하고
-        completed로 닫히기 때문이다. 범위를 해석할 수 없거나 checkpoint가 없으면 거부한다.
+        파티션(`LegacyCoverage.candidates`)이어야 하고, 누락(`LegacyCoverage.gaps`: checkpoint가
+        있는 유형과 `original_types`로 포함한 유형의 누락)은 전부 들어 있어야 한다 — 아니면
+        `LegacyPlanGapError`. 남은 일부만으로 계획을 고정하면 구버전 H-09 누락이 정상이 되어
+        subset만 처리하고 completed로 닫히기 때문이다.
+
+        checkpoint가 없는 뒤 유형(`LegacyCoverage.trailing_types`)이 있으면 `original_types`로
+        원래 작업에 포함됐는지 정해야 한다(None이면 `LegacyTypeDecisionError`) — 유형 경계에서
+        끊긴 이력은 누락이 gaps로 드러나지 않는다. 범위를 해석할 수 없거나 checkpoint가 없으면
+        거부한다.
 
         보충 checkpoint 생성과 계획 기록은 한 트랜잭션이다. 한 번만 기록된다(이미 계획이
         있으면 ValueError). 이후 재개는 엄격 모드로 검사한다.
@@ -731,7 +847,7 @@ class HistoryManager:
         if row.plan_version is not None:
             raise ValueError("이미 계획이 기록된 이력입니다")
         states = self.repo.get_checkpoint_states(history_id)
-        coverage = LegacyCoverage.compute(row.start_date, row.end_date, states)
+        coverage = LegacyCoverage.compute(row.start_date, row.end_date, states, original_types)
         if not coverage.present:
             raise ValueError("체크포인트가 없어 계획을 복원할 수 없습니다. 작업을 폐기하세요.")
         if not coverage.range_ok:
@@ -747,6 +863,8 @@ class HistoryManager:
         unfilled = sorted(set(coverage.gaps) - extra)
         if unfilled:
             raise LegacyPlanGapError(unfilled)
+        if coverage.undecided_types:
+            raise LegacyTypeDecisionError(coverage.undecided_types)
 
         names = sorted(set(coverage.present) | extra)
         plan = MigrationPlan.from_profile(profile, names, schema)

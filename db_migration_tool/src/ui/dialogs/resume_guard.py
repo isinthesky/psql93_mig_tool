@@ -8,9 +8,24 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from PySide6.QtWidgets import QMessageBox, QWidget
+from PySide6.QtWidgets import (
+    QCheckBox,
+    QDialog,
+    QDialogButtonBox,
+    QLabel,
+    QMessageBox,
+    QVBoxLayout,
+    QWidget,
+)
 
-from src.models.history import ResumeCheck, ResumeVerdict, endpoint_label
+from src.core.table_types import TABLE_TYPE_CONFIG, get_table_type
+from src.models.history import (
+    LegacyCoverage,
+    ResumeCheck,
+    ResumeVerdict,
+    endpoint_label,
+    legacy_creation_order,
+)
 
 if TYPE_CHECKING:
     from src.models.history import HistoryManager
@@ -38,6 +53,69 @@ def _offer_abandon(
         history_manager.abandon_history(history_id)
 
 
+def _type_label(table_name: str) -> str:
+    table_type = get_table_type(table_name)
+    return f"{TABLE_TYPE_CONFIG[table_type].display_name} ({table_type.value}, {table_name})"
+
+
+class LegacyTypeChooser(QDialog):
+    """legacy 이력의 원래 작업에 어떤 항목(테이블 유형)이 있었는지 고른다(H-08 리뷰).
+
+    구버전은 checkpoint를 유형 코드 순서로 만들었으므로, checkpoint가 없는 **뒤 유형**은
+    원래 선택하지 않았을 수도, 끊겨서 통째로 빠졌을 수도 있다. 로컬 기록으로는 구분할 수
+    없어 사용자가 정한다. 기본값은 **포함**이다 — 모르고 '확인'만 눌러도 빠진 유형을 버리지
+    않는다(원본에 없는 파티션은 0건 완료로 처리된다).
+    checkpoint가 있는 유형은 항상 포함, 순서상 앞의 빈 유형은 선택하지 않은 것이 확실해
+    보여 주지 않는다.
+    """
+
+    def __init__(self, parent: QWidget | None, coverage: LegacyCoverage):
+        super().__init__(parent)
+        self.setWindowTitle("원래 작업의 항목 확인")
+        self._represented = list(coverage.represented_types)
+        order = "→".join(get_table_type(t).value for t in legacy_creation_order())
+        present = ", ".join(_type_label(t) for t in self._represented) or "(없음)"
+
+        layout = QVBoxLayout(self)
+        intro = QLabel(
+            "이 작업은 이전 버전에서 만들어져 어떤 항목을 골랐는지 기록이 없습니다.\n"
+            f"체크포인트가 남은 항목(항상 포함): {present}\n\n"
+            f"이전 버전은 항목 순서({order})로 체크포인트를 만들었기 때문에, 중간에 끊겼다면\n"
+            "아래 항목이 통째로 빠졌을 수 있습니다. 원래 작업에 없던 항목만 체크를 해제하세요.\n"
+            "체크된 항목은 기록된 날짜 범위 전체를 계획에 보충합니다(원본에 없는 파티션은 "
+            "0건 완료로 처리)."
+        )
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+
+        self.boxes: dict[str, QCheckBox] = {}
+        for table_name, names in coverage.trailing_types.items():
+            box = QCheckBox(f"{_type_label(table_name)} — 범위 후보 {len(names):,}개")
+            box.setChecked(True)
+            self.boxes[table_name] = box
+            layout.addWidget(box)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def chosen_types(self) -> list[str]:
+        """원래 작업에 포함된 유형: checkpoint가 있는 유형 + 체크된 뒤 유형."""
+        checked = [t for t, box in self.boxes.items() if box.isChecked()]
+        return sorted({*self._represented, *checked})
+
+
+def choose_original_types(parent: QWidget | None, coverage: LegacyCoverage) -> list[str] | None:
+    """원래 작업의 유형을 고르게 한다. 취소하면 None."""
+    chooser = LegacyTypeChooser(parent, coverage)
+    if chooser.exec() != QDialog.DialogCode.Accepted:
+        return None
+    return chooser.chosen_types()
+
+
 def resolve_resume(
     parent: QWidget | None,
     history_manager: HistoryManager,
@@ -62,6 +140,26 @@ def resolve_resume(
             QMessageBox.warning(parent, "재개할 수 없습니다", check.message)
             _offer_abandon(parent, history_manager, history_id)
             return None
+        original_types: list[str] | None = None
+        if coverage.undecided_types:
+            # 유형 경계에서 끊긴 다중 유형 작업은 누락이 gaps로 드러나지 않는다(H-08 리뷰).
+            # 뒤 유형을 원래 작업에 넣을지 먼저 정하고, 그 결정으로 누락을 다시 계산한다.
+            original_types = choose_original_types(parent, coverage)
+            if original_types is None:
+                return None
+            try:
+                check = history_manager.prepare_resume(
+                    history_id, profile, original_types=original_types
+                )
+            except Exception as exc:
+                QMessageBox.critical(
+                    parent, "재개 확인 실패", f"재개 전 검증에 실패했습니다.\n\n{exc}"
+                )
+                return None
+            coverage = check.legacy
+            if check.verdict is not ResumeVerdict.LEGACY or coverage is None:
+                # 확인하는 사이 다른 창이 채택했거나 이력이 사라졌다 — 일반 판정으로 넘긴다.
+                return _finish(parent, history_manager, history_id, check)
         gaps = list(coverage.gaps)
         total = len(check.pending) + len(gaps)
         supplement_note = f"(누락 보충 {len(gaps):,}개 포함)" if gaps else ""
@@ -81,13 +179,22 @@ def resolve_resume(
         if reply != QMessageBox.StandardButton.Yes:
             return None
         try:
-            # 체크포인트가 있는 유형 안의 누락은 반드시 보충한다(H-09 subset 완료 방지).
-            check = history_manager.adopt_legacy_history(history_id, profile, supplement=gaps)
+            # 누락(checkpoint가 있는 유형 + 포함하기로 한 뒤 유형)은 반드시 보충한다
+            # (H-09 subset 완료 방지).
+            check = history_manager.adopt_legacy_history(
+                history_id, profile, supplement=gaps, original_types=original_types
+            )
         except ValueError as exc:
             QMessageBox.warning(parent, "재개할 수 없습니다", str(exc))
             _offer_abandon(parent, history_manager, history_id)
             return None
 
+    return _finish(parent, history_manager, history_id, check)
+
+
+def _finish(
+    parent: QWidget | None, history_manager: HistoryManager, history_id: int, check: ResumeCheck
+) -> ResumeCheck | None:
     if check.allowed:
         return check
 

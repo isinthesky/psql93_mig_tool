@@ -1375,6 +1375,8 @@ class FileArchiveMigrationDialog(ScanHostMixin, QDialog):
             allow_legacy_unverified=security.allow_legacy_unverified,
         )
         self.worker.skip_on_error = self.error_strategy == "skip"
+        # legacy에서 채택한 이력만: 보충한 '있을 수 있는 이름'이 원본에 없으면 0건 완료(H-09 리뷰).
+        self.worker.tolerate_absent_source = self._is_adopted_legacy(self.history_id)
         self.worker.progress.connect(self.on_progress)
         self.worker.log.connect(self.add_log)
         self.worker.error.connect(self.on_error)
@@ -1384,6 +1386,14 @@ class FileArchiveMigrationDialog(ScanHostMixin, QDialog):
         self._set_run_state("running", f"파티션 {len(partitions):,}개")
         self.add_log(f"마이그레이션 시작 - 파티션 {len(partitions)}개", "INFO")
         self.worker.start()
+
+    def _is_adopted_legacy(self, history_id: int) -> bool:
+        """이력이 이전 버전 작업을 채택한 것인가. 모르면 False(엄격)."""
+        try:
+            history = self.history_manager.get_history(history_id)
+        except Exception:
+            return False
+        return bool(history is not None and history.legacy_adopted_at is not None)
 
     def cancel_migration(self):
         """진행 중인 작업만 멈춘다. 창을 닫는 일은 '닫기'가 한다."""

@@ -18,9 +18,13 @@ from src.models.history import (
     CheckpointManager,
     HistoryManager,
     LegacyPlanGapError,
+    LegacyTypeDecisionError,
     ResumeVerdict,
 )
 from src.models.profile import ConnectionProfile
+
+# 뒤 유형(PS·RT·TH)이 원래 작업에 없었다는 명시적 결정(PH 단일 유형 작업).
+PH_ONLY = ["point_history"]
 
 
 def _profile() -> ConnectionProfile:
@@ -108,7 +112,10 @@ class TestReviewerReproduction:
         hid = self._truncated()
         hm = HistoryManager()
 
-        adopted = hm.adopt_legacy_history(hid, _profile(), supplement=["point_history_260103"])
+        # 뒤 유형(PS·RT·TH)은 원래 작업에 없었다고 명시한다(PH 단일 유형 작업).
+        adopted = hm.adopt_legacy_history(
+            hid, _profile(), supplement=["point_history_260103"], original_types=PH_ONLY
+        )
 
         assert adopted.verdict is ResumeVerdict.OK
         assert adopted.pending == [
@@ -137,7 +144,7 @@ class TestCoverage:
         assert check.legacy is not None
         assert check.legacy.gaps == []
 
-        adopted = hm.adopt_legacy_history(hid, _profile())
+        adopted = hm.adopt_legacy_history(hid, _profile(), original_types=PH_ONLY)
         assert adopted.verdict is ResumeVerdict.OK
         assert adopted.pending == names[1:]
 
@@ -163,7 +170,9 @@ class TestCoverage:
         hid = _legacy("2026-01-01", "2026-01-02", names)
         extra = ["point_sec_history_260101", "point_sec_history_260102"]
 
-        adopted = HistoryManager().adopt_legacy_history(hid, _profile(), supplement=extra)
+        adopted = HistoryManager().adopt_legacy_history(
+            hid, _profile(), supplement=extra, original_types=["point_history", "point_sec_history"]
+        )
 
         assert adopted.verdict is ResumeVerdict.OK
         assert adopted.pending == sorted(names + extra)
@@ -190,7 +199,7 @@ class TestCoverage:
         assert check.legacy.gaps == []
         assert check.legacy.outside == ["point_history_251231"]
 
-        adopted = hm.adopt_legacy_history(hid, _profile())
+        adopted = hm.adopt_legacy_history(hid, _profile(), original_types=PH_ONLY)
         assert adopted.pending == names
 
     def test_supplement_outside_expected_candidates_is_rejected(self, history_db):
@@ -238,9 +247,137 @@ class TestAtomicAdoption:
                 hid,
                 _profile(),
                 supplement=["point_history_260102", "point_history_260103"],
+                original_types=PH_ONLY,
             )
 
         # 보충 checkpoint 일부와 계획 기록이 함께 rollback되어야 한다.
         item = hm.get_history(hid)
         assert item is not None and item.plan_version is None
         assert _checkpoint_names(history_db, hid) == ["point_history_260101"]
+
+
+class TestMultiTypeInterruption:
+    """리뷰 major(H-08): 여러 유형을 고른 legacy 이력이 비마지막 유형에서 끊긴 경우.
+
+    구버전 루프는 선택한 파티션을 유형 코드 순서(ED→PH→PS→RT→TH)로 하나씩 commit했다.
+    비마지막 유형에서 끊기면 **그 뒤 유형은 checkpoint가 통째로 없다**. 'checkpoint가 있는
+    유형'만 기대 집합으로 보면 뒤 유형이 빠진 계획이 고정되어 subset만 처리하고 닫힌다.
+    """
+
+    RANGE = ("2026-01-01", "2026-01-02")
+    PH = ["point_history_260101", "point_history_260102"]
+    PS = ["point_sec_history_260101", "point_sec_history_260102"]
+
+    def _cut_after_point_history(self) -> int:
+        # 원래 선택 PH·PS·TH. PH를 다 만들고 PS 첫 INSERT 전에 끊겼다(유형 경계).
+        return _legacy(*self.RANGE, self.PH)
+
+    def test_trailing_types_need_a_decision_and_leading_absent_types_are_not_warned(
+        self, history_db
+    ):
+        hid = self._cut_after_point_history()
+
+        check = HistoryManager().prepare_resume(hid, _profile())
+
+        cov = check.legacy
+        assert cov is not None
+        assert cov.represented_types == ["point_history"]
+        # 끊겼다면 빠졌을 수 있는 뒤 유형: 원래 선택 여부를 로컬 데이터로는 알 수 없다.
+        assert sorted(cov.undecided_types) == [
+            "point_sec_history",
+            "running_time_history",
+            "trend_history",
+        ]
+        # 앞 유형(ED)은 생성 순서상 원래 선택하지 않았다 — 경고에 넣지 않는다.
+        assert cov.excluded_types == ["energy_display"]
+        assert "energy_display" not in check.message
+        assert "point_sec_history" in check.message
+
+    def test_adoption_without_deciding_trailing_types_is_refused(self, history_db):
+        hid = self._cut_after_point_history()
+        hm = HistoryManager()
+
+        with pytest.raises(LegacyTypeDecisionError) as exc:
+            hm.adopt_legacy_history(hid, _profile())
+
+        assert sorted(exc.value.types) == [
+            "point_sec_history",
+            "running_time_history",
+            "trend_history",
+        ]
+        item = hm.get_history(hid)
+        assert item is not None and item.plan_version is None
+        assert _checkpoint_names(history_db, hid) == self.PH
+
+    def test_declared_trailing_types_are_supplemented(self, history_db):
+        hid = self._cut_after_point_history()
+        hm = HistoryManager()
+        original = ["point_history", "point_sec_history", "trend_history"]
+
+        check = hm.prepare_resume(hid, _profile(), original_types=original)
+
+        cov = check.legacy
+        assert cov is not None
+        assert cov.gaps == [*self.PS, "trend_history_2601"]
+        assert cov.undecided_types == {}
+        # 선택하지 않은 유형(RT: 사용자가 제외, ED: 생성 순서상 제외)은 경고에 없다.
+        assert "running_time_history" not in check.message
+        assert "energy_display" not in check.message
+        assert "누락 3개" in check.message
+
+        # 뒤 유형의 누락도 보충하지 않으면 채택하지 않는다.
+        with pytest.raises(LegacyPlanGapError):
+            hm.adopt_legacy_history(hid, _profile(), original_types=original)
+
+        adopted = hm.adopt_legacy_history(
+            hid, _profile(), original_types=original, supplement=cov.gaps
+        )
+        assert adopted.verdict is ResumeVerdict.OK
+        assert adopted.pending == sorted([*self.PH, *self.PS, "trend_history_2601"])
+        item = hm.get_history(hid)
+        assert item is not None and item.planned_count == 5
+
+    def test_mid_type_cut_supplements_rest_of_type_and_trailing_types(self, history_db):
+        # 원래 선택 ED·PH·PS. ED 1개, PH 1개까지 만들고 끊겼다.
+        hid = _legacy(*self.RANGE, ["energy_display_2601", "point_history_260101"])
+        hm = HistoryManager()
+        original = ["energy_display", "point_history", "point_sec_history"]
+
+        cov = hm.prepare_resume(hid, _profile(), original_types=original).legacy
+
+        assert cov is not None
+        assert cov.gaps == ["point_history_260102", *self.PS]
+        adopted = hm.adopt_legacy_history(
+            hid, _profile(), original_types=original, supplement=cov.gaps
+        )
+        assert adopted.pending == sorted(["energy_display_2601", *self.PH, *self.PS])
+
+    def test_declining_every_trailing_type_keeps_the_single_type_plan(self, history_db):
+        hid = self._cut_after_point_history()
+
+        adopted = HistoryManager().adopt_legacy_history(
+            hid, _profile(), original_types=["point_history"]
+        )
+
+        assert adopted.verdict is ResumeVerdict.OK
+        assert adopted.pending == self.PH
+
+    def test_type_with_checkpoints_cannot_be_declined(self, history_db):
+        """checkpoint가 있는 유형은 원래 선택된 것이 확실하다 — 선언에서 빠져도 계획에 남는다."""
+        hid = self._cut_after_point_history()
+
+        adopted = HistoryManager().adopt_legacy_history(
+            hid, _profile(), original_types=["point_sec_history"], supplement=self.PS
+        )
+
+        assert adopted.pending == sorted([*self.PH, *self.PS])
+
+    def test_unknown_type_in_declaration_is_rejected(self, history_db):
+        hid = self._cut_after_point_history()
+        hm = HistoryManager()
+
+        with pytest.raises(ValueError, match="유형"):
+            hm.adopt_legacy_history(hid, _profile(), original_types=["point_history", "nope"])
+
+        item = hm.get_history(hid)
+        assert item is not None and item.plan_version is None
