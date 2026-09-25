@@ -159,3 +159,66 @@ class TestTrayIconManager:
         assert os.path.exists(f"{icon_base_path}/app_running.ico") or os.path.exists(
             f"{icon_base_path}/app_running.png"
         ), "실행 중 아이콘 파일이 존재하지 않습니다"
+
+
+class TestTrayQuitGracefulShutdown:
+    """감사 M-13: 트레이 '종료'는 앱을 바로 끝내지 않고 종료 조정자에게 맡긴다."""
+
+    def test_quit_requests_shutdown_instead_of_quitting_directly(self, tray_manager, qapp):
+        qapp.quit = MagicMock()
+        qapp.exit = MagicMock()
+        requested = MagicMock()
+        tray_manager.quit_requested.connect(requested)
+        tray_icon = tray_manager.tray_icon
+
+        tray_manager._quit_app()
+
+        requested.assert_called_once()
+        qapp.quit.assert_not_called()
+        qapp.exit.assert_not_called()
+        # 트레이는 워커가 멈추고 flush가 끝날 때까지 남아 '종료 중'을 보여 준다.
+        assert tray_manager.tray_icon is tray_icon
+        tray_icon.hide.assert_not_called()
+
+    def test_quit_while_running_declined_does_nothing(self, tray_manager):
+        from PySide6.QtWidgets import QMessageBox
+
+        requested = MagicMock()
+        tray_manager.quit_requested.connect(requested)
+        tray_manager.is_migration_running = True
+        with patch(
+            "PySide6.QtWidgets.QMessageBox.question", return_value=QMessageBox.StandardButton.No
+        ):
+            tray_manager._quit_app()
+
+        requested.assert_not_called()
+
+    def test_quit_while_running_confirm_explains_graceful_stop(self, tray_manager):
+        from PySide6.QtWidgets import QMessageBox
+
+        requested = MagicMock()
+        tray_manager.quit_requested.connect(requested)
+        tray_manager.is_migration_running = True
+        with patch(
+            "PySide6.QtWidgets.QMessageBox.question", return_value=QMessageBox.StandardButton.Yes
+        ) as question:
+            tray_manager._quit_app()
+
+        requested.assert_called_once()
+        text = question.call_args[0][2]
+        assert "이어서" in text and "30" in text, text
+
+    def test_show_shutting_down_updates_tooltip(self, tray_manager):
+        tray_manager.show_shutting_down()
+        tips = [c[0][0] for c in tray_manager.tray_icon.setToolTip.call_args_list if c[0]]
+        assert any("종료 중" in tip for tip in tips)
+
+    def test_run_state_change_during_shutdown_keeps_shutting_down_tooltip(self, tray_manager):
+        """워커가 멈추며 보내는 '실행 끝' 알림이 '종료 중' 표시를 '대기 중'으로 되돌리지 않는다."""
+        tray_manager.show_shutting_down()
+        tray_manager.tray_icon.reset_mock()
+
+        tray_manager.set_migration_running(False)
+
+        tips = [c[0][0] for c in tray_manager.tray_icon.setToolTip.call_args_list if c[0]]
+        assert not any("대기 중" in tip for tip in tips)

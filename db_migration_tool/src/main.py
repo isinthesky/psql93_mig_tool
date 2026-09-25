@@ -4,6 +4,7 @@ DB Migration Tool - Main Entry Point
 PostgreSQL 파티션 테이블 마이그레이션 도구
 """
 
+import logging
 import os
 import sys
 
@@ -17,6 +18,7 @@ from PySide6.QtCore import QSharedMemory, Qt
 from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import QApplication, QMessageBox
 
+from src.core.worker_registry import FlushStep, ShutdownCoordinator
 from src.database.local_db import LocalDatabase
 from src.ui.main_window import MainWindow
 from src.ui.theme import build_stylesheet
@@ -63,6 +65,69 @@ def initialize_database():
     db = LocalDatabase()
     db.initialize()
     return db
+
+
+# ── 앱 종료 (감사 M-13) ─────────────────────────────────────────────
+# 순서: 워커 전체 stop → 실행 중 쿼리 cancel(H-02) → 제한 시간 대기 → flush → 이벤트 루프 종료.
+# 워커·조정자 규약은 src/core/worker_registry.py.
+
+
+def flush_logger() -> None:
+    """DB 로그 큐를 끝까지 쓰고(writer 스레드 종료) 파일 로그 핸들러를 비운다."""
+    from src.utils.enhanced_logger import enhanced_logger
+
+    enhanced_logger.close()
+    for handler in logging.getLogger("DBMigration").handlers:
+        handler.flush()
+
+
+def close_local_db() -> None:
+    """이미 열린 로컬 이력 DB 엔진만 정리한다. 없으면 새로 열지 않는다."""
+    from src.database import local_db
+
+    db = local_db._db_instance
+    if db is not None:
+        db.close()
+
+
+def default_flush_steps() -> list[FlushStep]:
+    # 로거가 먼저다: DB 로그 writer가 로컬 DB에 마지막 batch를 쓴 뒤 엔진을 닫는다.
+    # 아카이브 manifest는 워커의 finally가 save()로 flush하며, 조정자의 대기가 그것을 기다린다.
+    return [("logger", flush_logger), ("local_db", close_local_db)]
+
+
+def build_shutdown_coordinator(app, window, tray_manager) -> ShutdownCoordinator:
+    """트레이 종료·창 닫기를 종료 조정자에 연결한다. `app.quit()`을 직접 부르는 경로를 두지 않는다."""
+    from src.core import worker_registry as registry_module
+
+    coordinator = ShutdownCoordinator(
+        registry_module.worker_registry,
+        # exit()는 창을 닫지 않고 (중첩 포함) 모든 이벤트 루프를 끝낸다. quit()은 창마다 closeEvent를
+        # 돌려 '실행 중에는 닫을 수 없습니다' 같은 확인 창으로 종료를 붙잡을 수 있다.
+        quit_app=lambda forced: app.exit(0),
+        flush_steps=default_flush_steps(),
+    )
+    window.shutdown_coordinator = coordinator
+    if tray_manager is not None:
+        tray_manager.quit_requested.connect(coordinator.request_shutdown)
+        coordinator.shutdown_started.connect(tray_manager.show_shutting_down)
+        coordinator.shutdown_finished.connect(lambda _forced: tray_manager.cleanup())
+    return coordinator
+
+
+def finalize_exit(coordinator, exit_code: int) -> int:
+    """이벤트 루프가 끝난 뒤 호출한다.
+
+    트레이를 거치지 않고 루프가 끝났으면(OS 세션 종료 등) 여기서 막고 기다리며 정리한다.
+    강제 종료(제한 시간 초과)면 아직 도는 QThread가 파이썬 종료 절차에서 파괴돼 abort하지 않도록
+    로그만 닫고 곧바로 프로세스를 끝낸다. DB 서버는 끊긴 연결의 미커밋 배치를 롤백한다.
+    """
+    if not coordinator.is_finished:
+        coordinator.shutdown_blocking()
+    if coordinator.forced:
+        logging.shutdown()
+        os._exit(exit_code)
+    return exit_code
 
 
 def main():
@@ -119,20 +184,23 @@ def main():
     # 트레이 아이콘 설정
     from src.ui.tray_icon import TrayIconManager
 
-    tray_manager = TrayIconManager(app, window)
-    if tray_manager.setup():
-        window.tray_icon = tray_manager
+    tray = TrayIconManager(app, window)
+    tray_manager: TrayIconManager | None = None
+    if tray.setup():
+        window.tray_icon = tray
+        tray_manager = tray
 
-        # 시그널 연결
-        tray_manager.show_window_requested.connect(lambda: window.show())
-        tray_manager.show_history_requested.connect(window.show_history_dialog)
-        tray_manager.quit_requested.connect(app.quit)
+        # 시그널 연결 (종료는 build_shutdown_coordinator가 조정자에 연결한다 — app.quit 직결 금지)
+        tray.show_window_requested.connect(lambda: window.show())
+        tray.show_history_requested.connect(window.show_history_dialog)
+
+    coordinator = build_shutdown_coordinator(app, window, tray_manager)
 
     # 윈도우 표시
     window.show()
 
     # 애플리케이션 실행
-    return app.exec()
+    return finalize_exit(coordinator, app.exec())
 
 
 if __name__ == "__main__":

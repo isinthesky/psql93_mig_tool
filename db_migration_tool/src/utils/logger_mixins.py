@@ -105,7 +105,7 @@ class DatabaseLoggerMixin:
         """
         # 지연 import (순환 의존성 방지)
         try:
-            from ..database.local_db import LogEntry, get_db
+            from ..database.local_db import get_db
         except ImportError:
             # DB 모듈이 없으면 종료
             return
@@ -116,38 +116,54 @@ class DatabaseLoggerMixin:
             try:
                 # 배치 처리를 위해 잠시 대기
                 time.sleep(0.1)
-
-                # 큐에서 로그 가져오기 (최대 100개)
-                logs_to_save: list[dict[str, Any]] = []
-                while not self.db_queue.empty() and len(logs_to_save) < 100:
-                    try:
-                        log_data = self.db_queue.get_nowait()
-                        logs_to_save.append(log_data)
-                    except Exception:
-                        break
-
-                # DB에 저장
-                if logs_to_save:
-                    session = db.get_session()
-                    try:
-                        for log_data in logs_to_save:
-                            log_entry = LogEntry(
-                                timestamp=log_data["timestamp"],
-                                session_id=log_data["session_id"],
-                                level=log_data["level"],
-                                logger_name=log_data["logger_name"],
-                                message=log_data["message"],
-                            )
-                            session.add(log_entry)
-                        session.commit()
-                    except Exception as e:
-                        session.rollback()
-                        print(f"로그 DB 저장 오류: {e}")
-                    finally:
-                        session.close()
-
+                self._write_batch(db)
             except Exception as e:
                 print(f"로그 스레드 오류: {e}")
+
+        # close() 뒤에도 큐에 남은 로그를 끝까지 쓴다. 예전에는 여기서 그냥 끝나 앱 종료 직전의
+        # 마지막 batch(가장 중요한 중지·오류 로그)가 DB에 남지 않았다(감사 M-13).
+        # 종료 시점에 있던 만큼만 쓴다 — 멈추지 않은 스레드가 계속 로그를 넣어도 끝이 있게.
+        pending = self.db_queue.qsize()
+        while pending > 0:
+            try:
+                written = self._write_batch(db)
+            except Exception as e:
+                print(f"로그 스레드 오류: {e}")
+                break
+            if not written:
+                break
+            pending -= written
+
+    def _write_batch(self, db) -> int:
+        """큐에서 최대 100건을 꺼내 한 트랜잭션으로 쓴다. 꺼낸 건수를 돌려준다."""
+        from ..database.local_db import LogEntry
+
+        logs_to_save: list[dict[str, Any]] = []
+        while not self.db_queue.empty() and len(logs_to_save) < 100:
+            try:
+                logs_to_save.append(self.db_queue.get_nowait())
+            except Exception:
+                break
+
+        if logs_to_save:
+            session = db.get_session()
+            try:
+                for log_data in logs_to_save:
+                    log_entry = LogEntry(
+                        timestamp=log_data["timestamp"],
+                        session_id=log_data["session_id"],
+                        level=log_data["level"],
+                        logger_name=log_data["logger_name"],
+                        message=log_data["message"],
+                    )
+                    session.add(log_entry)
+                session.commit()
+            except Exception as e:
+                session.rollback()
+                print(f"로그 DB 저장 오류: {e}")
+            finally:
+                session.close()
+        return len(logs_to_save)
 
     def log_to_db(self, level: str, message: str, logger_name: str = "DBMigration"):
         """DB에 로그 저장 (비동기)
@@ -219,7 +235,7 @@ class DatabaseLoggerMixin:
     def close(self):
         """로거 종료 및 스레드 정리
 
-        DB 큐를 비우고 스레드를 안전하게 종료합니다.
+        writer 스레드가 큐에 남은 로그를 모두 쓴 뒤 끝나기를 기다립니다(최대 5초).
 
         Examples:
             >>> mixin = DatabaseLoggerMixin()
@@ -228,4 +244,4 @@ class DatabaseLoggerMixin:
         """
         self.is_running = False
         if self.db_thread:
-            self.db_thread.join(timeout=2.0)
+            self.db_thread.join(timeout=5.0)

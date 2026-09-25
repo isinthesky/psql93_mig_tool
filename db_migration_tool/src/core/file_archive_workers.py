@@ -556,6 +556,7 @@ class PostgresToFileArchiveWorker(ArchiveMigrationWorkerBase):
                     if failure is None:
                         raise
                     self._log(f"manifest 최종 저장 실패: {save_exc}", "ERROR")
+            self._stop_cancel_retries()  # cancel 반복과 close가 겹치지 않게(M-13)
             if self.source_conn is not None:
                 try:
                     self.source_conn.close()
@@ -757,18 +758,11 @@ class PostgresToFileArchiveWorker(ArchiveMigrationWorkerBase):
                 return table_type
         raise ValueError(f"알 수 없는 파티션 타입: {partition_name}")
 
-    def stop(self, reason: str = "user_stop"):
-        super().stop(reason=reason)
-        try:
-            if self.source_conn is not None:
-                self.source_conn.cancel()
-        except Exception:
-            pass
-        try:
-            if self.source_conn is not None:
-                self.source_conn.rollback()
-        except Exception:
-            pass
+    def _on_stop_requested(self) -> None:
+        # H-02 규약(M-13 종료에서도 쓰임): stop()은 UI 스레드에서 불린다. cancel은 네트워크 호출이라
+        # 백그라운드로, 그리고 작업이 끝날 때까지 반복해 보낸다 — 한 번만 보내면 플래그 확인과 COPY
+        # 시작 사이에 온 중지를 놓친다. 다른 스레드에서 워커 연결을 rollback하지 않는다(워커 finally가 닫는다).
+        self._cancel_connections_async(lambda: [self.source_conn])
 
 
 class FileToPostgresArchiveWorker(ArchiveMigrationWorkerBase):
@@ -839,6 +833,7 @@ class FileToPostgresArchiveWorker(ArchiveMigrationWorkerBase):
                 self._emit_performance_metrics(force=True)
                 self._log_final_summary("File Archive 가져오기 완료")
         finally:
+            self._stop_cancel_retries()  # cancel 반복과 close가 겹치지 않게(M-13)
             if self.target_conn is not None:
                 try:
                     self.target_conn.close()
@@ -1103,15 +1098,8 @@ class FileToPostgresArchiveWorker(ArchiveMigrationWorkerBase):
             truncate_mode="auto",
         )
 
-    def stop(self, reason: str = "user_stop"):
-        super().stop(reason=reason)
-        try:
-            if self.target_conn is not None:
-                self.target_conn.cancel()
-        except Exception:
-            pass
-        try:
-            if self.target_conn is not None:
-                self.target_conn.rollback()
-        except Exception:
-            pass
+    def _on_stop_requested(self) -> None:
+        # H-02 규약(M-13 종료에서도 쓰임): stop()은 UI 스레드에서 불린다. cancel은 네트워크 호출이라
+        # 백그라운드로, 그리고 작업이 끝날 때까지 반복해 보낸다 — 한 번만 보내면 플래그 확인과 COPY
+        # 시작 사이에 온 중지를 놓친다. 다른 스레드에서 워커 연결을 rollback하지 않는다(워커 finally가 닫는다).
+        self._cancel_connections_async(lambda: [self.target_conn])

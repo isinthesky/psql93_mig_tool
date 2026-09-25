@@ -10,6 +10,7 @@ from typing import Any
 
 from PySide6.QtCore import QThread, Signal
 
+from src.core.worker_registry import register_worker, unregister_worker
 from src.models.history import CheckpointManager, HistoryManager
 from src.models.profile import ConnectionProfile
 from src.utils.enhanced_logger import enhanced_logger, log_emitter
@@ -88,6 +89,11 @@ class BaseMigrationWorker(QThread, metaclass=QThreadABCMeta):
         self._work_finished = threading.Event()
         self._cancel_thread: threading.Thread | None = None
 
+    def start(self, priority: QThread.Priority = QThread.Priority.InheritPriority) -> None:
+        """스레드를 띄우고 앱 종료 레지스트리에 등록한다(감사 M-13)."""
+        register_worker(self)
+        super().start(priority)
+
     def run(self):
         """워커 실행 (템플릿 메서드)
 
@@ -96,6 +102,9 @@ class BaseMigrationWorker(QThread, metaclass=QThreadABCMeta):
         """
         self.is_running = True
         self.start_time = time.time()
+        # 앱 종료 레지스트리(M-13). 종료가 이미 시작됐으면 여기서 곧바로 stop()된다 —
+        # 위에서 is_running을 켠 뒤라야 그 중지가 덮어쓰이지 않는다.
+        register_worker(self)
 
         # 세션 ID 초기화
         session_id = enhanced_logger.generate_session_id()
@@ -111,6 +120,7 @@ class BaseMigrationWorker(QThread, metaclass=QThreadABCMeta):
             self.error.emit(error_msg)
         finally:
             self._work_finished.set()
+            unregister_worker(self)
 
         # finished는 직접 발행하지 않는다. 예외를 여기서 모두 삼키므로 run()은 항상
         # 정상 반환하고, 그 시점에 QThread가 finished를 정확히 한 번 발행한다.
@@ -173,10 +183,13 @@ class BaseMigrationWorker(QThread, metaclass=QThreadABCMeta):
         """
         if self._cancel_thread is not None and self._cancel_thread.is_alive():
             return
+        if self._work_finished.is_set():
+            # 작업이 이미 끝나(연결을 닫는 중) — 닫히는 연결에 cancel을 겹쳐 보내지 않는다.
+            return
 
         def run() -> None:
             deadline = time.monotonic() + self.CANCEL_RETRY_SECONDS
-            while True:
+            while not self._work_finished.is_set():
                 for conn in get_connections():
                     _cancel_quietly(conn)
                 if self._work_finished.wait(self.CANCEL_RETRY_INTERVAL):
@@ -186,6 +199,17 @@ class BaseMigrationWorker(QThread, metaclass=QThreadABCMeta):
 
         self._cancel_thread = threading.Thread(target=run, name="db-cancel", daemon=True)
         self._cancel_thread.start()
+
+    def _stop_cancel_retries(self) -> None:
+        """연결을 닫기 직전에 부른다: cancel 반복 스레드를 끝내고 잠깐 기다린다.
+
+        psycopg2의 cancel()과 close()가 다른 스레드에서 겹치면 해제된 cancel 핸들을 쓸 수 있다.
+        앱 종료(M-13)는 모든 워커에 cancel 반복을 거므로 닫기 전에 반드시 멈춘다.
+        """
+        self._work_finished.set()
+        thread = self._cancel_thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(self.CANCEL_RETRY_INTERVAL + 2.0)
 
     def _check_pause(self):
         """일시정지 상태 확인
