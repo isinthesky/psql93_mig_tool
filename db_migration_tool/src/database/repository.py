@@ -4,10 +4,12 @@ CRUD 공통 로직을 제공하는 베이스 리포지토리와
 엔티티별 전용 리포지토리를 정의합니다.
 """
 
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
+from datetime import datetime
+from typing import Any
 
-from sqlalchemy import func
+from sqlalchemy import func, insert
 from sqlalchemy.orm import Session
 
 from .local_db import Checkpoint, MigrationHistory, get_db
@@ -187,6 +189,14 @@ class BaseRepository[T]:
             return query.count()
 
 
+# 재개 대상이 될 수 있는(=끝나지 않은) 이력 상태. 'partial'은 일부 파티션 실패로
+# 끝난 실행을 위한 값이다(H-01 결과 상태). 프로필 삭제 차단(M-12)도 같은 집합을 쓴다.
+INCOMPLETE_STATUSES: tuple[str, ...] = ("running", "failed", "partial")
+
+# 사용자가 명시적으로 폐기한 이력의 상태. 이력 화면이 이미 '취소'로 표시한다.
+ABANDONED_STATUS = "cancelled"
+
+
 class HistoryRepository(BaseRepository[MigrationHistory]):
     """MigrationHistory 전용 리포지토리"""
 
@@ -201,7 +211,7 @@ class HistoryRepository(BaseRepository[MigrationHistory]):
     def get_incomplete_by_profile(self, profile_id: int) -> MigrationHistory | None:
         """프로필의 미완료 이력 조회
 
-        running 또는 failed 상태의 최신 이력을 반환합니다.
+        running/failed/partial 상태의 최신 이력을 반환합니다.
 
         Args:
             profile_id: 프로필 ID
@@ -213,13 +223,172 @@ class HistoryRepository(BaseRepository[MigrationHistory]):
             obj = (
                 session.query(MigrationHistory)
                 .filter_by(profile_id=profile_id)
-                .filter(MigrationHistory.status.in_(["running", "failed"]))
+                .filter(MigrationHistory.status.in_(INCOMPLETE_STATUSES))
                 .order_by(MigrationHistory.started_at.desc())
                 .first()
             )
             if obj:
                 session.expunge(obj)
             return obj
+
+    def create_with_checkpoints(
+        self, partition_names: Iterable[str], **history_fields: Any
+    ) -> MigrationHistory:
+        """이력과 계획된 모든 checkpoint를 **한 트랜잭션**으로 만든다(H-09).
+
+        하나라도 실패하면 이력까지 전부 rollback된다 — 일부 checkpoint만 남은
+        이력이 재개 대상으로 보이는 일이 없어야 한다.
+        """
+        names = list(partition_names)
+        with self._session_scope() as session:
+            history = MigrationHistory(**history_fields)
+            session.add(history)
+            session.flush()  # id 확보
+            if names:
+                session.execute(
+                    insert(Checkpoint),
+                    [
+                        {
+                            "history_id": history.id,
+                            "partition_name": name,
+                            "status": "pending",
+                            "rows_processed": 0,
+                        }
+                        for name in names
+                    ],
+                )
+            session.refresh(history)
+            session.expunge(history)
+            return history
+
+    def add_missing_checkpoints(self, history_id: int, partition_names: Iterable[str]) -> list[str]:
+        """계획에는 있는데 checkpoint가 없는 파티션을 pending으로 채운다.
+
+        존재 여부를 같은 트랜잭션 안에서 다시 확인하므로 두 번 불려도 중복이 생기지 않는다.
+
+        Returns:
+            실제로 새로 만든 파티션 이름(정렬).
+        """
+        wanted = set(partition_names)
+        with self._session_scope() as session:
+            present = {
+                name
+                for (name,) in session.query(Checkpoint.partition_name).filter(
+                    Checkpoint.history_id == history_id
+                )
+            }
+            missing = sorted(wanted - present)
+            if missing:
+                session.execute(
+                    insert(Checkpoint),
+                    [
+                        {
+                            "history_id": history_id,
+                            "partition_name": name,
+                            "status": "pending",
+                            "rows_processed": 0,
+                        }
+                        for name in missing
+                    ],
+                )
+            return missing
+
+    def get_checkpoint_states(self, history_id: int) -> list[tuple[str, str | None]]:
+        """(partition_name, status) 목록. 엔티티를 만들지 않는다."""
+        with self._session_scope() as session:
+            rows = (
+                session.query(Checkpoint.partition_name, Checkpoint.status)
+                .filter(Checkpoint.history_id == history_id)
+                .all()
+            )
+            return [(name, status) for name, status in rows]
+
+    def bind_legacy_plan(
+        self,
+        history_id: int,
+        expected_partitions: Iterable[str],
+        *,
+        add_partitions: Iterable[str] = (),
+        **plan_fields: Any,
+    ) -> bool:
+        """계획이 없는(legacy) 이력에 계획·identity를 한 번만 기록한다.
+
+        같은 트랜잭션에서 (1) 아직 legacy인지, (2) checkpoint 집합이 확인 시점과
+        같은지를 다시 보고 기록한다. 둘 중 하나라도 어긋나면 아무것도 쓰지 않는다.
+        `add_partitions`(범위 대비 누락 보충분)는 계획 기록과 **같은 트랜잭션**에서
+        pending checkpoint로 만든다 — 보충이 실패하면 계획 기록도 rollback된다.
+
+        Returns:
+            기록했으면 True, 이미 계획이 있거나 집합이 바뀌었으면 False.
+        """
+        expected = sorted(set(expected_partitions))
+        extra = sorted(set(add_partitions) - set(expected))
+        with self._session_scope() as session:
+            names = sorted(
+                {
+                    name
+                    for (name,) in session.query(Checkpoint.partition_name).filter(
+                        Checkpoint.history_id == history_id
+                    )
+                }
+            )
+            if names != expected:
+                return False
+            # 조건부 UPDATE를 먼저 한다. 0건이면 아직 아무것도 쓰지 않았다.
+            updated = (
+                session.query(MigrationHistory)
+                .filter(MigrationHistory.id == history_id)
+                .filter(MigrationHistory.plan_version.is_(None))
+                .update(dict[Any, Any](plan_fields), synchronize_session=False)
+            )
+            if updated != 1:
+                return False
+            if extra:
+                session.execute(
+                    insert(Checkpoint),
+                    [
+                        {
+                            "history_id": history_id,
+                            "partition_name": name,
+                            "status": "pending",
+                            "rows_processed": 0,
+                        }
+                        for name in extra
+                    ],
+                )
+            return True
+
+    def count_incomplete_by_profile(self, profile_id: int) -> int:
+        """프로필에 남은 미완료 이력 수(M-12 삭제 차단 판정)."""
+        with self._session_scope() as session:
+            return (
+                session.query(func.count(MigrationHistory.id))
+                .filter(MigrationHistory.profile_id == profile_id)
+                .filter(MigrationHistory.status.in_(INCOMPLETE_STATUSES))
+                .scalar()
+                or 0
+            )
+
+    def abandon(self, *, profile_id: int | None = None, history_id: int | None = None) -> int:
+        """미완료 이력을 명시적으로 폐기(cancelled)한다. 이미 끝난 이력은 건드리지 않는다.
+
+        Returns:
+            폐기한 이력 수.
+        """
+        if profile_id is None and history_id is None:
+            raise ValueError("profile_id 또는 history_id가 필요합니다")
+        with self._session_scope() as session:
+            query = session.query(MigrationHistory).filter(
+                MigrationHistory.status.in_(INCOMPLETE_STATUSES)
+            )
+            if profile_id is not None:
+                query = query.filter(MigrationHistory.profile_id == profile_id)
+            if history_id is not None:
+                query = query.filter(MigrationHistory.id == history_id)
+            return query.update(
+                {"status": ABANDONED_STATUS, "completed_at": datetime.now()},
+                synchronize_session=False,
+            )
 
     def get_all_desc(self) -> list[MigrationHistory]:
         """최신순 전체 조회

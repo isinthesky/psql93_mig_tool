@@ -20,6 +20,7 @@ import pytest
 import src.core.scan_workers as scan_mod
 import src.ui.dialogs.migration_wizard_dialog as wizard_mod
 from src.core.table_types import TableType
+from src.models.history import ResumeCheck, ResumeVerdict
 
 
 @pytest.fixture
@@ -189,7 +190,8 @@ class TestConditionChangesInvalidateResults:
         history.start_date = "2020-01-01"
         history.end_date = "2020-01-03"
         wizard._incomplete_history = history
-        wizard.checkpoint_manager.get_pending_checkpoints.return_value = []
+        # 재개 대상은 불변 계획 기준 검증(prepare_resume)이 돌려준다(H-08/H-09).
+        wizard.history_manager.prepare_resume.return_value = ResumeCheck(ResumeVerdict.OK, 7)
         stale = wizard._scan_gen
 
         wizard._on_resume_clicked()

@@ -55,6 +55,7 @@ from src.core.scan_workers import (
 from src.core.table_types import TABLE_TYPE_CONFIG, TableType, get_all_table_types
 from src.models.history import CheckpointManager, HistoryManager, MigrationHistoryItem
 from src.models.profile import ConnectionProfile
+from src.ui.dialogs.resume_guard import resolve_resume
 from src.ui.dialogs.scan_host import (
     PARTITION_DISPLAY_LIMIT,
     ScanHostMixin,
@@ -1009,6 +1010,16 @@ class MigrationWizardDialog(ScanHostMixin, QDialog):
         if not self._incomplete_history or self._incomplete_history.id is None:
             return
 
+        # 이력이 만들어진 endpoint·계획과 지금 프로필이 같은지 먼저 확인한다(H-08/H-09).
+        # 다르면 남은 파티션이 다른 대상으로 흩어지므로 재개하지 않는다.
+        check = resolve_resume(
+            self, self.history_manager, self._incomplete_history.id, self.profile
+        )
+        if check is None:
+            # 폐기했을 수 있으니 미완료 작업 표시를 다시 읽는다.
+            self._check_incomplete_migration()
+            return
+
         self.resume_mode = True
         self.history_id = self._incomplete_history.id
 
@@ -1026,8 +1037,13 @@ class MigrationWizardDialog(ScanHostMixin, QDialog):
 
         self._force_python_copy_for_resume()
 
-        pending = self.checkpoint_manager.get_pending_checkpoints(self.history_id)
-        pending_names = [cp.partition_name for cp in pending]
+        # 재개 대상은 남아 있는 checkpoint가 아니라 **불변 계획** 기준 미완료다.
+        pending_names = list(check.pending)
+        if check.supplemented:
+            self.add_log(
+                f"계획 대비 누락된 체크포인트 {len(check.supplemented)}개를 보충했습니다",
+                "WARNING",
+            )
 
         # 선택 고정(재개는 pending만)
         self._frozen_selection = pending_names
@@ -1510,13 +1526,16 @@ class MigrationWizardDialog(ScanHostMixin, QDialog):
         # 중단된 작업을 다시 시작하는 경우: 새 이력을 만들지 않고 재개로 넘긴다.
         # (그러지 않으면 이력이 하나 더 생기고 이미 옮긴 파티션을 다시 복사한다.)
         if self.history_id is not None and not self.resume_mode:
-            pending = self.checkpoint_manager.get_pending_checkpoints(self.history_id)
-            if pending:
+            check = resolve_resume(self, self.history_manager, self.history_id, self.profile)
+            if check is None:
+                return
+            if check.pending:
                 self.resume_mode = True
-                self._frozen_selection = [cp.partition_name for cp in pending]
+                self._frozen_selection = list(check.pending)
                 self._force_python_copy_for_resume()
                 self.add_log(
-                    f"중단된 작업을 이어서 진행합니다 - 미완료 파티션 {len(pending)}개", "INFO"
+                    f"중단된 작업을 이어서 진행합니다 - 미완료 파티션 {len(check.pending)}개",
+                    "INFO",
                 )
                 self._refresh_summary()
 
@@ -1543,21 +1562,29 @@ class MigrationWizardDialog(ScanHostMixin, QDialog):
             target_status = "연결 성공" if self.target_connected else self.target_status_message
 
             planned_rows, _ = self._row_total(partitions)
-            history = self.history_manager.create_history(
-                self.profile.id,
-                start_date.strftime("%Y-%m-%d"),
-                end_date.strftime("%Y-%m-%d"),
-                source_status=source_status,
-                target_status=target_status,
-                total_rows=planned_rows,
-            )
+            # 이력 + 전체 checkpoint + 불변 계획을 한 트랜잭션으로 만든다(H-09).
+            # 중간에 실패하면 아무것도 남지 않으므로 일부 파티션만 가진 이력이 생기지 않는다.
+            try:
+                history = self.history_manager.create_planned_history(
+                    self.profile,
+                    partitions,
+                    start_date.strftime("%Y-%m-%d"),
+                    end_date.strftime("%Y-%m-%d"),
+                    source_status=source_status,
+                    target_status=target_status,
+                    total_rows=planned_rows,
+                )
+            except Exception as exc:
+                QMessageBox.critical(
+                    self,
+                    "오류",
+                    f"작업 이력을 만들지 못했습니다. 아무것도 기록되지 않았습니다.\n\n{exc}",
+                )
+                return
             if history.id is None:
                 QMessageBox.critical(self, "오류", "작업 이력을 만들지 못했습니다.")
                 return
             self.history_id = history.id
-
-            for p in partitions:
-                self.checkpoint_manager.create_checkpoint(self.history_id, p)
 
         self.batch_size = int(self.batch_size_spin.value())
 

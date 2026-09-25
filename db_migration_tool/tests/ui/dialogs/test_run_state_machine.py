@@ -11,6 +11,7 @@ import pytest
 
 import src.ui.dialogs.file_archive_migration_dialog as archive_mod
 import src.ui.dialogs.migration_wizard_dialog as wizard_mod
+from src.models.history import ResumeCheck, ResumeVerdict
 
 
 @pytest.fixture
@@ -107,8 +108,10 @@ class TestWizardRunState:
         wizard.target_connected = True
         wizard._frozen_selection = []
 
-        pending = [MagicMock(partition_name="tbl_a"), MagicMock(partition_name="tbl_b")]
-        wizard.checkpoint_manager.get_pending_checkpoints.return_value = pending
+        # 미완료 목록은 불변 계획 기준 재개 검증(prepare_resume)이 돌려준다(H-09).
+        wizard.history_manager.prepare_resume.return_value = ResumeCheck(
+            ResumeVerdict.OK, 42, pending=["tbl_a", "tbl_b"]
+        )
 
         with patch.object(wizard_mod, "CopyMigrationWorker") as worker_cls:
             worker_cls.return_value.isRunning.return_value = False
@@ -116,7 +119,9 @@ class TestWizardRunState:
 
         assert wizard.resume_mode is True
         assert wizard._frozen_selection == ["tbl_a", "tbl_b"]
+        wizard.history_manager.prepare_resume.assert_called_once_with(42, wizard.profile)
         wizard.history_manager.create_history.assert_not_called()
+        wizard.history_manager.create_planned_history.assert_not_called()
         # 재개는 server-side COPY로 할 수 없다
         assert wizard.copy_mode == "python"
 
