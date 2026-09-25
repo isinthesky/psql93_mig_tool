@@ -2,8 +2,10 @@
 마이그레이션 워커 추상 기반 클래스
 """
 
+import threading
 import time
 from abc import ABCMeta, abstractmethod
+from collections.abc import Callable
 from typing import Any
 
 from PySide6.QtCore import QThread, Signal
@@ -25,9 +27,18 @@ class QThreadABCMeta(type(QThread), ABCMeta):  # type: ignore[misc]
 class BaseMigrationWorker(QThread, metaclass=QThreadABCMeta):
     """마이그레이션 워커의 추상 기반 클래스
 
-    MigrationWorker와 CopyMigrationWorker의 공통 로직을 제공합니다.
+    CopyMigrationWorker와 파일 아카이브 워커의 공통 로직을 제공합니다.
     하위 클래스는 _execute_migration() 메서드를 구현해야 합니다.
+
+    취소 규약(감사 H-02): stop()은 플래그만 바꾸지 않고 `_on_stop_requested()`를 불러
+    실행 중인 DB 문장을 끊게 한다. 플래그는 문장 **사이**에서만 읽히기 때문이다.
     """
+
+    # stop() 뒤 연결 cancel()을 다시 보내는 간격·최대 시간(초).
+    # cancel 요청은 그 순간 실행 중인 문장에만 듣는다. 플래그 확인과 다음 문장 시작 사이에
+    # 들어온 stop()도 놓치지 않도록 작업이 끝날 때까지(최대 이 시간) 반복한다.
+    CANCEL_RETRY_INTERVAL = 0.5
+    CANCEL_RETRY_SECONDS = 15.0
 
     # 공통 시그널
     #
@@ -73,6 +84,10 @@ class BaseMigrationWorker(QThread, metaclass=QThreadABCMeta):
         self.history_manager = HistoryManager()
         self.checkpoint_manager = CheckpointManager()
 
+        # 취소 보조: 작업이 끝났음을 cancel 반복 스레드에 알린다.
+        self._work_finished = threading.Event()
+        self._cancel_thread: threading.Thread | None = None
+
     def run(self):
         """워커 실행 (템플릿 메서드)
 
@@ -86,6 +101,7 @@ class BaseMigrationWorker(QThread, metaclass=QThreadABCMeta):
         session_id = enhanced_logger.generate_session_id()
         log_emitter.logger.set_session_id(session_id)
 
+        self._work_finished.clear()
         try:
             # 하위 클래스 구현 실행
             self._execute_migration()
@@ -93,6 +109,8 @@ class BaseMigrationWorker(QThread, metaclass=QThreadABCMeta):
             error_msg = str(e)
             self._log(f"마이그레이션 오류: {error_msg}", "ERROR")
             self.error.emit(error_msg)
+        finally:
+            self._work_finished.set()
 
         # finished는 직접 발행하지 않는다. 예외를 여기서 모두 삼키므로 run()은 항상
         # 정상 반환하고, 그 시점에 QThread가 finished를 정확히 한 번 발행한다.
@@ -103,8 +121,8 @@ class BaseMigrationWorker(QThread, metaclass=QThreadABCMeta):
         """마이그레이션 실행 (하위 클래스에서 구현)
 
         각 워커의 고유한 마이그레이션 로직을 구현합니다.
-        - MigrationWorker: INSERT 기반 마이그레이션
         - CopyMigrationWorker: COPY 기반 마이그레이션
+        - 파일 아카이브 워커: export/import
         """
         pass
 
@@ -132,6 +150,42 @@ class BaseMigrationWorker(QThread, metaclass=QThreadABCMeta):
         self.is_paused = False
         self.stop_reason = reason
         self._log(f"마이그레이션 중지 요청 ({reason})", "WARNING")
+        try:
+            self._on_stop_requested()
+        except Exception as exc:  # noqa: BLE001 — 취소 보조가 실패해도 플래그는 이미 섰다
+            self._log(f"실행 중 작업 취소 요청 실패: {exc}", "WARNING")
+
+    def _on_stop_requested(self) -> None:
+        """실행 중인 DB 작업을 끊는다(하위 클래스 구현). 기본은 아무것도 하지 않는다.
+
+        UI 스레드에서 불리므로 막히면 안 된다. 연결 cancel은 `_cancel_connections_async()`로
+        백그라운드에서 보낸다.
+        """
+
+    def _cancel_connections_async(self, get_connections: Callable[[], list[Any]]) -> None:
+        """열린 연결에 cancel()을 백그라운드로, 작업이 끝날 때까지 반복해 보낸다.
+
+        Args:
+            get_connections: 매번 현재 연결 목록을 돌려주는 함수(연결 참조가 바뀔 수 있다).
+
+        psycopg2/psycopg의 cancel()은 다른 스레드에서 불러도 안전하지만 서버에 새 소켓을
+        여는 네트워크 호출이라 UI 스레드에서 직접 부르지 않는다.
+        """
+        if self._cancel_thread is not None and self._cancel_thread.is_alive():
+            return
+
+        def run() -> None:
+            deadline = time.monotonic() + self.CANCEL_RETRY_SECONDS
+            while True:
+                for conn in get_connections():
+                    _cancel_quietly(conn)
+                if self._work_finished.wait(self.CANCEL_RETRY_INTERVAL):
+                    return
+                if time.monotonic() > deadline:
+                    return
+
+        self._cancel_thread = threading.Thread(target=run, name="db-cancel", daemon=True)
+        self._cancel_thread.start()
 
     def _check_pause(self):
         """일시정지 상태 확인
@@ -180,3 +234,17 @@ class BaseMigrationWorker(QThread, metaclass=QThreadABCMeta):
             "speed": speed,
             "eta_seconds": eta_seconds,
         }
+
+
+def _cancel_quietly(conn: Any) -> None:
+    """열린 연결의 실행 중 문장을 취소한다. 닫혔거나 없거나 실패하면 조용히 넘어간다."""
+    if conn is None:
+        return
+    # psycopg2: closed는 int(0=열림), psycopg(3): bool
+    closed = getattr(conn, "closed", False)
+    if isinstance(closed, (bool, int)) and closed:
+        return
+    try:
+        conn.cancel()
+    except Exception:  # noqa: BLE001 — 이미 끝난 연결 등. 취소는 최선 노력이다
+        pass

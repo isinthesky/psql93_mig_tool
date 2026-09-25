@@ -29,6 +29,27 @@ from src.models.profile import ConnectionProfile
 from src.utils.enhanced_logger import log_emitter
 from src.utils.validators import VersionValidator
 
+# 이 워커가 다루는 모든 relation의 스키마. 연결의 search_path(public)에만 기대지 않고
+# 문장마다 명시한다(감사 H-04: `$user` 등 선행 스키마의 동명 객체를 잡지 않게).
+RELATION_SCHEMA = "public"
+
+# 파티션 하나를 원본의 단일 일관 snapshot으로 읽는다(감사 H-03).
+# REPEATABLE READ는 PostgreSQL 9.1부터 진짜 snapshot 격리이므로 9.3 원본에서도 동작한다.
+# 트랜잭션의 첫 문장이어야 하고, snapshot은 첫 데이터 조회 시점에 잡힌다.
+SOURCE_SNAPSHOT_SQL = "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY"
+
+
+def _relation(partition_name: str) -> sql.Identifier:
+    """schema 한정 relation 식별자 ("public"."<name>")."""
+    return sql.Identifier(RELATION_SCHEMA, partition_name)
+
+
+class CopyCancelled(Exception):
+    """사용자 중지로 작업을 끝냈다(오류 아님).
+
+    checkpoint는 마지막으로 **커밋된** 배치까지만 기록되어 있고, 진행 중이던 배치는 롤백된다.
+    """
+
 
 class _CsvRecordTracker:
     """PostgreSQL COPY ... (FORMAT CSV) 출력의 **레코드 경계**를 청크 단위로 추적한다.
@@ -108,6 +129,8 @@ class CopyStreamBuffer:
 
     # write()/close()가 큐 빈자리를 기다리는 최대 시간(초). 넘으면 교착 대신 오류로 끝낸다.
     _WRITE_TIMEOUT = 30
+    # 큐를 기다리는 동안 취소를 확인하는 간격(초).
+    _POLL_SECONDS = 0.2
 
     def __init__(self, max_queue_size: int = 8, extra_track_indices: list[int] | None = None):
         """
@@ -164,11 +187,17 @@ class CopyStreamBuffer:
 
         self.produced_chars += len(data_str)
         self.total_bytes += len(data_str.encode("utf-8"))
-        try:
-            self.queue.put(data_str, timeout=self._WRITE_TIMEOUT)
-        except Full:
-            if not self._cancel.is_set():
-                self.set_error(TimeoutError("CopyStreamBuffer.write() 큐 대기 시간 초과"))
+        # 큐 빈자리를 짧게 나눠 기다리며 취소를 확인한다. 한 번에 _WRITE_TIMEOUT을 기다리면
+        # 취소 뒤에도 생산자가 그만큼 붙잡혀 원본 COPY가 끝나지 않는다(감사 H-02).
+        deadline = time.monotonic() + self._WRITE_TIMEOUT
+        while not self._cancel.is_set():
+            try:
+                self.queue.put(data_str, timeout=self._POLL_SECONDS)
+                return
+            except Full:
+                if time.monotonic() > deadline:
+                    self.set_error(TimeoutError("CopyStreamBuffer.write() 큐 대기 시간 초과"))
+                    return
 
     def close(self):
         """생산 종료(정상 EOF). 소비자가 큐를 비울 때까지 기다렸다가 종료 표시를 넣는다."""
@@ -178,7 +207,7 @@ class CopyStreamBuffer:
         deadline = time.monotonic() + self._WRITE_TIMEOUT
         while not self._cancel.is_set():
             try:
-                self.queue.put(None, timeout=0.2)
+                self.queue.put(None, timeout=self._POLL_SECONDS)
                 return
             except Full:
                 if time.monotonic() > deadline:
@@ -198,7 +227,7 @@ class CopyStreamBuffer:
         read_chars = 0
         while size < 0 or read_chars < size:
             try:
-                chunk = self.queue.get(timeout=1)
+                chunk = self.queue.get(timeout=self._POLL_SECONDS)
             except Empty:
                 self._raise_if_aborted()
                 continue
@@ -245,7 +274,20 @@ class CopyStreamBuffer:
 
 
 class CopyMigrationWorker(BaseMigrationWorker):
-    """COPY 명령 기반 고성능 마이그레이션 워커"""
+    """COPY 명령 기반 고성능 마이그레이션 워커
+
+    취소(감사 H-02): stop()은 진행 중인 스트림 버퍼를 취소하고 원본·대상 연결 모두에
+    cancel()을 보낸다. 실행 중인 COPY·commit·COUNT가 끊기고, 생산자 스레드는 제한 시간
+    안에서만 기다린다. 중지된 배치는 롤백되며 checkpoint는 커밋된 배치까지만 남는다.
+
+    일관성(감사 H-03): 파티션의 모든 배치와 완료 검증 COUNT를 원본의 단일
+    REPEATABLE READ READ ONLY 트랜잭션에서 읽는다(Python COPY·Server COPY 공통).
+    """
+
+    # 정상 종료 때 생산자(원본 COPY OUT) 스레드를 기다리는 최대 시간(초)
+    PRODUCER_JOIN_TIMEOUT = 30.0
+    # 취소·오류 뒤 생산자를 기다리는 최대 시간(초)
+    CANCEL_JOIN_TIMEOUT = 10.0
 
     # CopyMigrationWorker 전용 시그널
     performance = Signal(dict)  # 성능 지표
@@ -298,6 +340,66 @@ class CopyMigrationWorker(BaseMigrationWorker):
         # (연결 확인 마법사 단계가 워커를 재사용하려고 켜는 플래그)
         self.check_connections_only: bool = False
 
+        # 지금 흐르고 있는 Python COPY 스트림(stop()이 취소한다)
+        self._active_stream: CopyStreamBuffer | None = None
+
+    # ------------------------------------------------------------------
+    # 취소 (감사 H-02)
+    # ------------------------------------------------------------------
+    def _on_stop_requested(self) -> None:
+        stream = self._active_stream
+        if stream is not None:
+            stream.cancel()
+        self._cancel_connections_async(lambda: [self.source_conn, self.target_conn])
+
+    def _raise_if_stopped(self, what: str = "") -> None:
+        if not self.is_running:
+            raise CopyCancelled(f"중지 요청{f' — {what}' if what else ''}")
+
+    def _join_producer(self, producer: threading.Thread, timeout: float) -> bool:
+        """생산자 스레드를 제한 시간 안에서만 기다린다. 끝났으면 True."""
+        producer.join(timeout=timeout)
+        return not producer.is_alive()
+
+    def _abort_producer(self, producer: threading.Thread, stream: CopyStreamBuffer | None) -> None:
+        """오류·취소 뒤 생산자를 멈춘다: 버퍼 취소 → 원본 문장 cancel → 제한 시간 대기."""
+        if stream is not None:
+            stream.cancel()
+        if producer.is_alive():
+            _cancel_source = getattr(self.source_conn, "cancel", None)
+            if _cancel_source is not None:
+                try:
+                    _cancel_source()
+                except Exception:
+                    pass
+        if not self._join_producer(producer, self.CANCEL_JOIN_TIMEOUT):
+            self._log(
+                f"COPY 생산자 스레드가 {self.CANCEL_JOIN_TIMEOUT:.0f}초 안에 끝나지 않았습니다",
+                "ERROR",
+            )
+
+    # ------------------------------------------------------------------
+    # 원본 snapshot (감사 H-03)
+    # ------------------------------------------------------------------
+    def _begin_source_snapshot(self) -> None:
+        """파티션용 원본 트랜잭션을 새로 연다: REPEATABLE READ READ ONLY.
+
+        앞선 추정·테이블 준비 조회가 연 트랜잭션을 먼저 닫아야 SET TRANSACTION이 첫 문장이 된다.
+        이후 이 파티션이 끝날 때까지 원본 연결에서 commit/rollback하지 않는다.
+        """
+        self.source_conn.rollback()
+        with self.source_conn.cursor() as cur:
+            cur.execute(SOURCE_SNAPSHOT_SQL)
+
+    def _end_source_snapshot(self) -> None:
+        conn = self.source_conn
+        if conn is None or conn.closed:
+            return
+        try:
+            conn.rollback()  # 읽기 전용이라 되돌릴 것은 없다. snapshot만 놓는다
+        except Exception:
+            pass
+
     def _execute_migration(self):
         """COPY 기반 마이그레이션 실행"""
         # 연결 확인만 수행하는 경우
@@ -325,8 +427,12 @@ class CopyMigrationWorker(BaseMigrationWorker):
             self.log.emit("PostgreSQL 연결 생성 중...", "INFO")
             log_emitter.emit_log("INFO", "COPY 기반 마이그레이션 시작")
 
+            # 연결 수립 자체는 connect_timeout(공용 빌더)으로 제한된다. 수립 중 들어온
+            # 중지는 연결이 끝나는 즉시 확인해 더 진행하지 않는다(finally가 닫는다).
             self.source_conn = self._create_psycopg2_connection(self.profile.source_config)
+            self._raise_if_stopped("원본 연결 직후")
             self.target_conn = self._create_psycopg2_connection(self.profile.target_config)
+            self._raise_if_stopped("대상 연결 직후")
 
             # 버전 감지 및 파라미터 적용
             self._detect_and_apply_version_optimizations()
@@ -375,6 +481,8 @@ class CopyMigrationWorker(BaseMigrationWorker):
                             try:
                                 self._migrate_partition_server_copy(partition, checkpoint)
                                 self._auto_server_copy_ok = True
+                            except CopyCancelled:
+                                raise  # 중지는 Python COPY로 전환할 실패가 아니다
                             except Exception as e:
                                 self._auto_server_copy_ok = False
                                 self._log(
@@ -395,6 +503,8 @@ class CopyMigrationWorker(BaseMigrationWorker):
                                 self._migrate_partition_with_copy(partition, checkpoint)
                     else:
                         self._migrate_partition_with_copy(partition, checkpoint)
+                except CopyCancelled:
+                    break
                 except Exception as e:
                     if self.skip_on_error and self.is_running:
                         self.log.emit(
@@ -429,6 +539,12 @@ class CopyMigrationWorker(BaseMigrationWorker):
                 )
 
         except Exception as e:
+            if not self.is_running:
+                # 중지 요청 뒤의 예외(취소된 문장 등)는 오류가 아니라 중지 결과다.
+                # checkpoint는 커밋된 배치까지만 기록되어 있다.
+                self._log(f"중지 요청으로 작업을 끝냈습니다 ({e})", "WARNING")
+                log_emitter.emit_log("WARNING", f"COPY 마이그레이션 중지: {e}")
+                return
             # 화면 로그(self.log)는 run()이 공통으로 한 번 남긴다. 여기서 같이 emit하면
             # 다시 던진 예외를 run()이 또 찍어 같은 줄이 두 번 보인다.
             # 영속 로그는 run()이 남기지 않으므로 여기서만 기록한다.
@@ -442,6 +558,7 @@ class CopyMigrationWorker(BaseMigrationWorker):
                         conn.close()
                     except Exception:
                         pass
+            self._work_finished.set()
 
     def _create_psycopg2_connection(self, config: dict[str, Any]) -> psycopg2.extensions.connection:
         """psycopg2 연결 생성 (COPY 명령용)
@@ -580,7 +697,7 @@ class CopyMigrationWorker(BaseMigrationWorker):
             q = sql.SQL("SELECT {k}, {d} FROM {t} ORDER BY {k} DESC, {d} DESC LIMIT 1").format(
                 k=sql.Identifier(key_column),
                 d=sql.Identifier(date_column),
-                t=sql.Identifier(partition_name),
+                t=_relation(partition_name),
             )
             try:
                 cur.execute(q)
@@ -607,7 +724,7 @@ class CopyMigrationWorker(BaseMigrationWorker):
                 sql.SQL("{} DESC").format(sql.Identifier(c)) for c in pk_columns
             )
             q = sql.SQL("SELECT {cols} FROM {t} ORDER BY {order} LIMIT 1").format(
-                cols=cols, t=sql.Identifier(partition_name), order=order
+                cols=cols, t=_relation(partition_name), order=order
             )
             try:
                 cur.execute(q)
@@ -761,7 +878,7 @@ class CopyMigrationWorker(BaseMigrationWorker):
                     self._log("재개 모드: 대상 테이블에 기존 데이터 없음 → 처음부터 진행", "INFO")
             # COPY FROM 쿼리는 루프 밖에서 한 번만 빌드 (식별자 안전 처리)
             cols_idents = sql.SQL(", ").join(sql.Identifier(c) for c in table_config.columns)
-            tbl_ident = sql.Identifier(partition_name)
+            tbl_ident = _relation(partition_name)
             copy_from_query = (
                 sql.SQL(
                     "COPY {tbl} ({cols}) FROM STDIN WITH (FORMAT CSV, HEADER FALSE, NULL 'NULL')"
@@ -779,6 +896,12 @@ class CopyMigrationWorker(BaseMigrationWorker):
                 if pk_columns
                 else sql.SQL("{k}, {d}").format(k=key_ident, d=date_ident)
             )
+
+            # 파티션의 모든 배치와 완료 검증 COUNT를 원본의 단일 snapshot에서 읽는다(H-03).
+            # 재개(다른 실행)는 새 snapshot이다. 그 사이 원본에 생긴 변경은 완료 검증
+            # COUNT가 드러낸다(삽입·삭제). 대상 준비·재개 앵커 조회가 끝난 뒤 시작한다.
+            self._raise_if_stopped("원본 snapshot 시작 전")
+            self._begin_source_snapshot()
 
             # 청크 단위 처리 루프
             while self.is_running:
@@ -844,36 +967,10 @@ class CopyMigrationWorker(BaseMigrationWorker):
                         extra_indices.append(table_config.columns.index(ec))
                 stream_buffer = CopyStreamBuffer(extra_track_indices=extra_indices)
 
-                # 배치마다 재생성되는 값이라 기본 인자로 묶어 이 반복의 것을 확정한다.
-                # (producer 스레드가 join 타임아웃을 넘겨 살아남으면 다음 배치의
-                #  버퍼를 건드릴 수 있다)
-                def copy_out(query=copy_to_query, buffer=stream_buffer):
-                    try:
-                        with self.source_conn.cursor() as source_cursor:
-                            source_cursor.copy_expert(query, buffer)
-                    except Exception as exc:
-                        buffer.set_error(exc)
-                    finally:
-                        buffer.close()
-
-                producer_thread = threading.Thread(target=copy_out, daemon=True)
-                producer_thread.start()
-                with self.target_conn.cursor() as target_cursor:
-                    try:
-                        target_cursor.copy_expert(copy_from_query, stream_buffer)
-                    except Exception as exc:
-                        stream_buffer.set_error(exc)
-                        raise
-                producer_thread.join(timeout=120)
-                if producer_thread.is_alive():
-                    stream_buffer.cancel()
-                    producer_thread.join(timeout=10)
-                    raise Exception(
-                        f"{partition_name} COPY producer 스레드가 시간 내 종료되지 않음"
-                    )
-                # 원본이 보낸 데이터가 전부 대상 COPY로 넘어갔을 때만 커밋한다(감사 C-01).
-                stream_buffer.assert_fully_consumed()
-                self.target_conn.commit()
+                # 스트림·생산자·커밋은 _copy_batch_streaming이 취소 규약(H-02)과 함께 처리한다.
+                self._copy_batch_streaming(
+                    partition_name, copy_to_query, copy_from_query, stream_buffer
+                )
                 # 행 수·마지막 키는 소비자(대상에 넘긴 데이터) 기준, CSV 레코드 경계로 센 값이다.
                 copied_rows = int(stream_buffer.row_count or 0)
                 if copied_rows == 0:
@@ -913,10 +1010,11 @@ class CopyMigrationWorker(BaseMigrationWorker):
                     bytes_transferred=self.performance_metrics.total_bytes,
                 )
                 self._emit_performance_metrics()
-            if not self.is_running:
-                return
+            self._raise_if_stopped("완료 검증 전")
             # 전송 경로가 센 값이 아니라 원본·대상 COUNT(*)로 완료를 판정한다.
+            # 원본 COUNT는 배치를 읽은 것과 같은 snapshot이다(아직 트랜잭션을 닫지 않았다).
             accumulated_rows = self._verify_partition_row_count(partition_name)
+            self._end_source_snapshot()
             self.performance_metrics.complete_partition()
             self._update_checkpoint_completed(
                 checkpoint,
@@ -935,6 +1033,16 @@ class CopyMigrationWorker(BaseMigrationWorker):
                     self.target_conn.rollback()
             except Exception:
                 pass
+            self._end_source_snapshot()
+            if isinstance(e, CopyCancelled) or not self.is_running:
+                # 사용자 중지: 진행 중이던 배치는 방금 롤백됐다. checkpoint는 마지막 커밋
+                # 배치에서 이미 기록되어 있으므로 건드리지 않는다(failed로 바꾸지 않는다).
+                self._log(
+                    f"{partition_name} 중지 — 커밋된 {accumulated_rows:,}행까지 기록, "
+                    "진행 중이던 배치는 롤백",
+                    "WARNING",
+                )
+                raise CopyCancelled(str(e)) from e
             if checkpoint is None:
                 checkpoint = self.checkpoint_manager.create_checkpoint(
                     self.history_id, partition_name
@@ -951,6 +1059,60 @@ class CopyMigrationWorker(BaseMigrationWorker):
                 bytes_transferred=self.performance_metrics.total_bytes,
             )
             raise Exception(f"{partition_name} COPY 실패: {str(e)}")
+
+    def _copy_batch_streaming(
+        self,
+        partition_name: str,
+        copy_to_query: str,
+        copy_from_query: str,
+        stream_buffer: CopyStreamBuffer,
+    ) -> None:
+        """배치 1개: 원본 COPY OUT(생산자 스레드) → 버퍼 → 대상 COPY IN → commit.
+
+        - 중지되면 버퍼 취소 + 원본·대상 cancel()로 양쪽 COPY가 예외로 끝나고, 생산자는
+          제한 시간 안에서만 기다린다. 대상 트랜잭션은 호출자가 롤백한다.
+        - commit은 원본 데이터가 전부 대상 COPY로 넘어갔고(C-01) 중지 요청이 없을 때만 시작한다.
+        """
+        source_conn = self.source_conn
+
+        # 배치마다 재생성되는 값이라 기본 인자로 묶어 이 반복의 것을 확정한다.
+        def copy_out(query=copy_to_query, buffer=stream_buffer, conn=source_conn):
+            try:
+                with conn.cursor() as source_cursor:
+                    source_cursor.copy_expert(query, buffer)
+            except Exception as exc:
+                buffer.set_error(exc)
+            finally:
+                buffer.close()
+
+        producer = threading.Thread(
+            target=copy_out, name=f"copy-producer-{partition_name}", daemon=True
+        )
+        self._active_stream = stream_buffer
+        try:
+            # stop()이 _active_stream 등록 전에 왔다면 여기서 잡는다(등록 뒤면 버퍼가 취소된다).
+            self._raise_if_stopped("배치 시작 전")
+            producer.start()
+            try:
+                with self.target_conn.cursor() as target_cursor:
+                    target_cursor.copy_expert(copy_from_query, stream_buffer)
+            except Exception as exc:
+                stream_buffer.set_error(exc)
+                self._abort_producer(producer, stream_buffer)
+                raise
+            if not self._join_producer(producer, self.PRODUCER_JOIN_TIMEOUT):
+                self._abort_producer(producer, stream_buffer)
+                raise Exception(f"{partition_name} COPY producer 스레드가 시간 내 종료되지 않음")
+        finally:
+            self._active_stream = None
+
+        # 원본이 보낸 데이터가 전부 대상 COPY로 넘어갔을 때만 커밋한다(감사 C-01).
+        stream_buffer.assert_fully_consumed()
+        # 중지 뒤에는 새 commit을 시작하지 않는다. 이미 시작된 commit은 stop()의 cancel()이
+        # 끊는다. commit이 예외로 끝나면 checkpoint는 전진하지 않는다(커밋 여부가 불확실해도
+        # 재개는 대상 테이블의 마지막 키를 기준으로 하므로 중복·누락이 없다).
+        self._raise_if_stopped("커밋 전 — 이 배치는 롤백")
+        self.target_conn.commit()
 
     def _migrate_partition_server_copy(self, partition_name: str, checkpoint: Any):
         """서버사이드 COPY를 사용한 파티션 마이그레이션 (os.pipe 직접 스트리밍)
@@ -1015,7 +1177,7 @@ class CopyMigrationWorker(BaseMigrationWorker):
             cols = table_config.columns
 
             cols_sql = sql.SQL(", ").join(map(sql.Identifier, cols))
-            tbl = sql.Identifier(partition_name)
+            tbl = _relation(partition_name)
 
             copy_to = sql.SQL(
                 "COPY (SELECT {cols} FROM {tbl}) "
@@ -1026,7 +1188,11 @@ class CopyMigrationWorker(BaseMigrationWorker):
                 "COPY {tbl} ({cols}) FROM STDIN WITH (FORMAT text, DELIMITER E'\\t', NULL '\\N')"
             ).format(tbl=tbl, cols=cols_sql)
 
-            # 6. os.pipe → producer thread(source COPY TO) + consumer(target COPY FROM)
+            # 6. 원본 snapshot: COPY TO와 완료 검증 COUNT를 같은 트랜잭션에서 읽는다(H-03).
+            self._raise_if_stopped("Server COPY 시작 전")
+            self._begin_source_snapshot()
+
+            # 7. os.pipe → producer thread(source COPY TO) + consumer(target COPY FROM)
             rfd, wfd = os.pipe()
             try:
                 rfile = os.fdopen(rfd, "rb", closefd=True)
@@ -1042,11 +1208,13 @@ class CopyMigrationWorker(BaseMigrationWorker):
                 raise
 
             errors: list[Exception] = []
+            source_conn = self.source_conn
+            copy_to_text = copy_to.as_string(source_conn)
 
             def _pump_source():
                 try:
-                    with self.source_conn.cursor() as cur:
-                        cur.copy_expert(copy_to.as_string(self.source_conn), wfile)
+                    with source_conn.cursor() as cur:
+                        cur.copy_expert(copy_to_text, wfile)
                 except Exception as e:
                     errors.append(e)
                 finally:
@@ -1058,27 +1226,40 @@ class CopyMigrationWorker(BaseMigrationWorker):
             # 단일 COPY 명령 안에서는 정확한 행 진행률을 알 수 없으므로 UI에
             # 무한 진행 상태를 알린 뒤 블로킹 스트리밍을 시작한다.
             self._emit_performance_metrics(force=True, current_indeterminate=True)
-            producer = threading.Thread(target=_pump_source, daemon=True)
+            producer = threading.Thread(
+                target=_pump_source, name=f"copy-producer-{partition_name}", daemon=True
+            )
             producer.start()
 
+            target_failed = False
             try:
                 with self.target_conn.cursor() as target_cursor:
                     target_cursor.copy_expert(copy_from.as_string(self.target_conn), rfile)
                     copied_rows = target_cursor.rowcount
+            except Exception:
+                target_failed = True
+                raise
             finally:
+                # 읽는 쪽을 닫으면 막힌 생산자의 다음 write가 BrokenPipe로 끝난다.
                 try:
                     rfile.close()
                 except Exception:
                     pass
-                producer.join(timeout=60)
+                if target_failed or not self.is_running:
+                    self._abort_producer(producer, None)
+                elif not self._join_producer(producer, self.PRODUCER_JOIN_TIMEOUT):
+                    self._abort_producer(producer, None)
 
-            # 7. producer 완료 확인 및 errors 체크
+            # 8. producer 완료 확인 및 errors 체크
+            # 원본 COPY가 중간에 끝나면(취소·오류) 파이프가 닫혀 대상 COPY는 '정상 EOF'로
+            # 끝난다. 그래서 커밋 전에 원본 쪽 오류와 중지 요청을 반드시 확인한다.
             if producer.is_alive():
                 raise Exception(f"{partition_name} producer 스레드가 시간 내 종료되지 않음")
             if errors:
                 raise errors[0]
+            self._raise_if_stopped("커밋 전 — 이 파티션은 롤백")
 
-            # 8. target_conn.commit()
+            # 9. target_conn.commit() (진행 중 commit은 stop()의 cancel()이 끊는다)
             self.target_conn.commit()
 
             # 9. 성능 지표 업데이트 (1회)
@@ -1086,8 +1267,9 @@ class CopyMigrationWorker(BaseMigrationWorker):
             self.performance_metrics.update(copied_rows, estimated_bytes)
             self._emit_performance_metrics(force=True)
 
-            # 10. 행 수 검증 후 파티션 완료 (원본·대상 COUNT(*))
+            # 10. 행 수 검증 후 파티션 완료 (원본 COUNT는 COPY TO와 같은 snapshot)
             copied_rows = self._verify_partition_row_count(partition_name)
+            self._end_source_snapshot()
             self.performance_metrics.complete_partition()
             self._update_checkpoint_completed(checkpoint, copied_rows, copy_method="COPY_SRV")
             self._emit_performance_metrics(force=True)
@@ -1106,6 +1288,11 @@ class CopyMigrationWorker(BaseMigrationWorker):
                 self.target_conn.rollback()
             except Exception:
                 pass
+            self._end_source_snapshot()
+            if isinstance(e, CopyCancelled) or not self.is_running:
+                # 사용자 중지: 파티션 통짜 트랜잭션이라 대상에는 아무것도 커밋되지 않았다.
+                self._log(f"{partition_name} Server-side COPY 중지 — 롤백", "WARNING")
+                raise CopyCancelled(str(e)) from e
 
             if checkpoint is None:
                 checkpoint = self.checkpoint_manager.create_checkpoint(
@@ -1126,9 +1313,12 @@ class CopyMigrationWorker(BaseMigrationWorker):
 
         완료 판정의 유일한 근거다. 워커 카운터·rows_processed는 전송 경로가 센 값이라
         전송 중 누락이 생기면 같이 틀린다. 다르면 예외 → 체크포인트는 failed로 남는다.
-        원본 파티션이 이관 중에 바뀌었을 때(오늘 날짜 등)도 여기서 드러난다.
+
+        원본 COUNT는 호출자가 연 원본 snapshot 트랜잭션(배치를 읽은 것과 같은 시점) 안에서
+        센다(H-03). 그래서 이관 중 원본에 들어온 쓰기는 양쪽 모두에서 빠진다. 재개처럼 다른
+        실행에서 읽은 부분이 섞이면, 그 사이의 원본 삽입·삭제가 여기서 불일치로 드러난다.
         """
-        query = sql.SQL("SELECT COUNT(*) FROM {}").format(sql.Identifier(partition_name))
+        query = sql.SQL("SELECT COUNT(*) FROM {}").format(_relation(partition_name))
 
         with self.source_conn.cursor() as cur:
             cur.execute(query)
@@ -1247,9 +1437,7 @@ class CopyMigrationWorker(BaseMigrationWorker):
 
         try:
             with self.source_conn.cursor() as cur:
-                cur.execute(
-                    sql.SQL("SELECT COUNT(*) FROM {}").format(sql.Identifier(partition_name))
-                )
+                cur.execute(sql.SQL("SELECT COUNT(*) FROM {}").format(_relation(partition_name)))
                 row = cur.fetchone()
                 actual = int(row[0]) if row else 0
         except Exception as e:

@@ -15,7 +15,7 @@
 - `scan_workers.py`: UI가 띄우는 조회 워커들(`ConnectionCheckWorker`, `PartitionScanWorker`,
   `TargetCompletedScanWorker`, `RowCountVerifyWorker`). 공통 베이스 `ScanWorker`가 취소·예외·세대를 처리합니다.
 - `copy_migration_worker.py`: PostgreSQL COPY 명령을 활용한 고성능 워커. 권한 점검, 성능 측정, 체크포인트를 포함합니다.
-- `migration_worker.py`: INSERT 기반 레거시 워커. 호환성이 필요한 환경에서 사용합니다.
+- (제거됨) `migration_worker.py`: OFFSET pagination INSERT 워커는 감사 M-03으로 삭제했습니다. 모든 이관은 COPY 워커(keyset + 단일 snapshot)로만 합니다.
 - `table_creator.py`: 파티션 구조를 분석해 대상에 동일한 테이블을 생성합니다.
 - `performance_metrics.py`: 처리량, 소요 시간 등 실시간 마이그레이션 지표를 계산합니다.
 
@@ -40,6 +40,20 @@
 플래그를 봅니다. 플래그는 쿼리 **사이**에서만 읽히므로, 오래 걸리는 쿼리는 `cancel_query()`가
 커넥션에 `cancel()`을 걸어야 실제로 끊깁니다. 커넥션을 2개 이상 쓰는 워커는 **전부** 추적해야
 합니다 — 하나만 걸면 나머지 구간에서 취소가 조용히 무시됩니다.
+
+- `BaseMigrationWorker.stop()`은 `_on_stop_requested()`를 부릅니다. `CopyMigrationWorker`는 진행 중인
+  `CopyStreamBuffer`를 취소하고 원본·대상 연결 모두에 `cancel()`을 **백그라운드로, 작업이 끝날 때까지
+  반복**해 보냅니다(`_cancel_connections_async`, UI 스레드에서 네트워크 호출 금지). 생산자 스레드는
+  `CANCEL_JOIN_TIMEOUT` 안에서만 기다립니다.
+- 중지는 오류가 아닙니다(`CopyCancelled`). 진행 중 배치는 롤백되고, checkpoint는 **커밋된 배치까지만**
+  남으며 `failed`로 바꾸지 않습니다. 중지 뒤에는 새 commit을 시작하지 않습니다.
+
+## 원본 snapshot 규칙 (H-03)
+- 파티션의 모든 배치(Python COPY)·단일 COPY(Server COPY)와 완료 검증 원본 `COUNT(*)`는 원본의 단일
+  `REPEATABLE READ, READ ONLY` 트랜잭션에서 읽습니다(`_begin_source_snapshot`, PG 9.1+ → 9.3 지원).
+  이 구간에서 원본 연결에 commit/rollback을 끼워 넣지 않습니다.
+- 재개는 새 snapshot입니다. 실행 사이 원본 삽입·삭제는 완료 검증 COUNT가 불일치로 드러냅니다.
+- 모든 relation은 `_relation(name)` = `"public"."name"`으로 한정합니다(H-04).
 
 ## 동작 시나리오
 1. UI 또는 서비스가 요청을 보내면 `partition_discovery.py`가 대상 파티션을 반환합니다.
