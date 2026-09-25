@@ -5,6 +5,7 @@
 - Tests are in `tests/` (markers: `unit`, `integration`); fixtures and helpers alongside.
 - Assets and packaged resources are in `assets/` and `resources/`; build scripts in repo root (`Makefile`, `build_mac.sh`, `db_migration_tool.spec`).
 - Use `migrations/` for local DB schema and `docs/` for design/usage notes.
+- See `CLAUDE.md` for environments (Windows build host / Mac editing copy / test DBs), the licensing contract, and known open issues from the code audit.
 
 ## Build, Test, and Development Commands
 - Install dev deps: `make install-dev` (uv-based) or `uv sync --all-extras`.
@@ -14,7 +15,7 @@
 - Package: `make build` (PyInstaller), `make build-mac` for macOS app bundle.
 
 ## Coding Style & Naming Conventions
-- Python 3.9+; keep code formatted with `ruff format` and lint-clean with `ruff check`.
+- Python 3.13+; keep code formatted with `ruff format` and lint-clean with `ruff check`.
 - Type hints are expected (mypy runs in CI); prefer explicit `Optional`/`| None` for nullable values.
 - Use snake_case for variables/functions, PascalCase for classes, UPPER_SNAKE for constants.
 - Keep UI strings and log messages concise; avoid non-ASCII unless already present.

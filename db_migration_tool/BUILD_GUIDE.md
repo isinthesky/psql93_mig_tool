@@ -4,7 +4,7 @@
 
 ## 사전 요구사항
 
-- **Python 3.9 이상**
+- **Python 3.13 이상**
 - **uv** (Python 패키지 관리자)
 - **macOS** (현재 macOS만 지원)
 

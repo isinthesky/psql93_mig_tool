@@ -16,7 +16,7 @@ PostgreSQL 날짜별 데이터 테이블 마이그레이션 도구
 
 ### 전제 조건
 
-- Python 3.9+
+- Python 3.13+
 - [uv](https://github.com/astral-sh/uv) (빠른 Python 패키지 관리자)
 
 **uv 설치:**
@@ -134,7 +134,7 @@ build.bat  # 빌드 실행
 
 ## 기술 스택
 
-- Python 3.9+
+- Python 3.13+
 - PySide6 (Qt6)
 - psycopg3
 - SQLAlchemy

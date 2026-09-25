@@ -13,7 +13,7 @@ PostgreSQL 9.3의 날짜별 데이터 테이블을 효율적으로 마이그레�
 
 ## 시스템 요구사항
 
-- Python 3.9 이상
+- Python 3.13 이상
 - PostgreSQL 9.3 이상 (소스 및 대상)
 - Windows 10/11 또는 macOS 10.15 이상
 - 최소 RAM: 4GB (권장: 8GB 이상)
@@ -110,7 +110,7 @@ python -m src.main
 
 ## 기술 스택
 
-- **언어**: Python 3.9+
+- **언어**: Python 3.13+
 - **GUI**: PySide6 (Qt6)
 - **데이터베이스**: psycopg3 (PostgreSQL 어댑터)
 - **테마**: QDarkStyle
