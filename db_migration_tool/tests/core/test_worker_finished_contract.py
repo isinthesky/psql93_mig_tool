@@ -13,12 +13,10 @@ from src.core.file_archive_workers import (
     FileToPostgresArchiveWorker,
     PostgresToFileArchiveWorker,
 )
-from src.core.migration_worker import MigrationWorker
 
 WORKER_CLASSES = [
     BaseMigrationWorker,
     CopyMigrationWorker,
-    MigrationWorker,
     PostgresToFileArchiveWorker,
     FileToPostgresArchiveWorker,
 ]

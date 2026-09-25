@@ -9,7 +9,6 @@ import pytest
 
 from src.core.base_migration_worker import BaseMigrationWorker
 from src.core.copy_migration_worker import CopyMigrationWorker
-from src.core.migration_worker import MigrationWorker
 from src.models.profile import ConnectionProfile
 
 
@@ -173,62 +172,37 @@ class TestBaseMigrationWorker:
         assert worker.is_running is True
 
 
-class TestMigrationWorkerRefactoring:
-    """MigrationWorker 리팩토링 검증"""
+class TestLegacyInsertWorkerRemoved:
+    """감사 M-03: legacy INSERT 워커(OFFSET pagination)는 제거했다.
 
-    @pytest.fixture
-    def mock_profile(self):
-        """Mock ConnectionProfile"""
-        profile = Mock(spec=ConnectionProfile)
-        profile.source_config = {
-            "host": "source.test",
-            "port": 5432,
-            "database": "source_db",
-            "username": "user",
-            "password": "pass",
-        }
-        profile.target_config = {
-            "host": "target.test",
-            "port": 5432,
-            "database": "target_db",
-            "username": "user",
-            "password": "pass",
-        }
-        return profile
+    OFFSET은 원본 변경 중 누락·중복이 나고, 0행 반복 종료가 불안정했으며, 완료 검증
+    COUNT도 없었다. UI·자동 선택 어디에서도 쓰이지 않았으므로 keyset+snapshot으로 다시
+    쓰는 대신 제거하고, 모든 이관은 CopyMigrationWorker(keyset + 단일 snapshot)로만 한다.
+    """
 
-    def test_migration_worker_inherits_base(self, mock_profile):
-        """MigrationWorker가 BaseMigrationWorker를 상속하는지 확인"""
-        # When: Worker 생성
-        worker = MigrationWorker(mock_profile, ["partition_1"], history_id=1)
+    def test_legacy_module_is_gone(self):
+        import importlib
 
-        # Then: BaseMigrationWorker를 상속해야 함 (MRO로 확인)
-        assert BaseMigrationWorker in MigrationWorker.__mro__
-        assert hasattr(worker, "_execute_migration")
+        with pytest.raises(ModuleNotFoundError):
+            importlib.import_module("src.core.migration_worker")
 
-    def test_migration_worker_has_insert_specific_fields(self, mock_profile):
-        """MigrationWorker가 INSERT 전용 필드를 가지는지 확인"""
-        # When: Worker 생성
-        worker = MigrationWorker(mock_profile, ["partition_1"], history_id=1)
+    def test_core_package_exports_only_copy_worker(self):
+        import src.core as core
 
-        # Then: INSERT 전용 필드가 있어야 함
-        assert hasattr(worker, "batch_size")
-        assert hasattr(worker, "min_batch_size")
-        assert hasattr(worker, "max_batch_size")
-        assert hasattr(worker, "truncate_permission")
-        assert hasattr(worker, "is_interrupted")
+        assert not hasattr(core, "MigrationWorker")
+        assert "MigrationWorker" not in core.__all__
+        assert core.CopyMigrationWorker is CopyMigrationWorker
 
-    def test_migration_worker_stop_sets_interrupted(self, mock_profile):
-        """MigrationWorker의 stop()이 is_interrupted를 설정하는지 확인"""
-        # Given: Worker 생성
-        worker = MigrationWorker(mock_profile, ["partition_1"], history_id=1)
-        worker.is_running = True
+    def test_no_offset_pagination_in_worker_sources(self):
+        """OFFSET 기반 페이지 조회가 다시 들어오지 않게 워커 소스를 고정한다."""
+        import inspect
+        import re
 
-        # When: stop 호출
-        worker.stop()
+        import src.core.base_migration_worker as base_mod
+        import src.core.copy_migration_worker as copy_mod
 
-        # Then: is_interrupted가 True가 되어야 함
-        assert worker.is_interrupted is True
-        assert worker.is_running is False
+        for mod in (base_mod, copy_mod):
+            assert not re.search(r"\bOFFSET\b", inspect.getsource(mod)), mod.__name__
 
 
 class TestCopyMigrationWorkerRefactoring:
@@ -330,31 +304,6 @@ class TestCheckpointCaching:
         profile.source_config = {"host": "test"}
         profile.target_config = {"host": "test"}
         return profile
-
-    @patch("src.core.migration_worker.psycopg.connect")
-    def test_migration_worker_caches_checkpoints(self, mock_connect, mock_profile):
-        """MigrationWorker가 체크포인트를 캐싱하는지 확인"""
-        # Given: Mock 설정
-        mock_conn = MagicMock()
-        mock_connect.return_value = mock_conn
-
-        worker = MigrationWorker(mock_profile, ["p1", "p2"], history_id=1)
-
-        # Mock checkpoint manager
-        mock_checkpoint = Mock()
-        mock_checkpoint.partition_name = "p1"
-        mock_checkpoint.status = "pending"
-
-        worker.checkpoint_manager.get_checkpoints = Mock(return_value=[mock_checkpoint])
-
-        # When: _execute_migration 실행 (에러는 무시)
-        try:
-            worker._execute_migration()
-        except Exception:
-            pass
-
-        # Then: get_checkpoints가 한 번만 호출되어야 함 (캐싱)
-        assert worker.checkpoint_manager.get_checkpoints.call_count == 1
 
     @patch("src.core.copy_migration_worker.PostgresOptimizer")
     def test_copy_worker_caches_checkpoints(self, mock_optimizer, mock_profile):

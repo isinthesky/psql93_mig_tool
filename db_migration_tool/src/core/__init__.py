@@ -1,7 +1,6 @@
 # Core module
 
 from .copy_migration_worker import CopyMigrationWorker
-from .migration_worker import MigrationWorker
 from .partition_discovery import PartitionDiscovery
 from .performance_metrics import PerformanceMetrics
 from .table_creator import TableCreator
@@ -29,7 +28,6 @@ __all__ = [
     # Core Components
     "PartitionDiscovery",
     "TableCreator",
-    "MigrationWorker",
     "CopyMigrationWorker",
     "PerformanceMetrics",
 ]
