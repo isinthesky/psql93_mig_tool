@@ -67,12 +67,15 @@ build.bat                                  :: PyInstaller -> dist\DBMigrationToo
 installer\build_installer.bat              :: Inno Setup -> dist\installer\DBMigrationTool-Setup-<ver>.exe
 ```
 - ⚠️ **`build.bat`은 빌드 전에 `tools/bump_version.py`로 패치 버전을 자동으로 올린다**(59행). 빌드 전에
-  손으로 올리지 않는다. 빌드 후 Windows에 생긴 버전 3파일 변경(pyproject/version.py/.iss)을 커밋·push하고
+  손으로 올리지 않는다. 빌드 후 Windows에 생긴 버전 4파일 변경(pyproject/version.py/.iss/uv.lock)을 커밋·push하고
   `v<버전>` 태그를 단다. (2026-09-25: 수동 1.2.6 + 빌드 자동 → 1.2.7로 출시, v1.2.6 태그는 삭제)
 - 원격 실행 시 `cmd /c "build.bat < NUL"` — 오류 경로의 `pause`가 입력 대기로 멈추지 않게 한다.
 - `.gitattributes` 도입 이전 체크아웃에는 `.bat`이 LF로 남아 있을 수 있다(cmd가 한글 줄을 오해석해
   `build_installer.bat`이 실패하던 원인). 증상이 보이면 스크립트를 지우고 `git checkout -- <file>`로 CRLF 재생성.
 - 산출물은 **미서명**(Authenticode NotSigned). 1.2.7 해시: exe `7221FF87…0EBE0`, 설치본 `9569F99D…23744`.
+  `installer\codesign.ps1` 훅이 `CODESIGN_*` 환경변수가 있으면 서명·검증하고 없으면 `UNSIGNED BUILD` 경고(BUILD_GUIDE).
+- `build.bat`은 `uv sync --locked`로 **추적되는 `uv.lock`**을 강제하고, `build_installer.bat`은
+  `installer\prerequisites.sha256` 고정 해시 + Microsoft 서명 검증 gate를 통과해야 ISCC를 돌린다(감사 M-08/M-09).
 - pytest marker: `unit` / `integration` / `slow` (`pyproject.toml` `[tool.pytest.ini_options]`).
   실DB를 쓰는 통합 테스트는 기본적으로 건너뛰므로(§6 감사 결과), `-m "not integration"` 결과만으로
   COPY/재개 경로의 정합성을 보장하지 않는다.

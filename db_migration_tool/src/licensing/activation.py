@@ -20,8 +20,12 @@ from src.utils.app_paths import AppPaths
 
 ACTIVATION_FILENAME = ".activation"
 LICENSE_FILENAME = "license.key"
-# 인스톨러가 설치 폴더에 남기는 초기 키. 앱이 첫 실행에서 사용자 폴더로 옮긴다.
+# 인스톨러가 설치 폴더에 남기는 초기 키. 앱이 첫 실행에서 사용자 폴더로 옮기고,
+# 활성화가 성공하면 지운다(감사 M-07 — 평문 키를 디스크에 오래 두지 않는다).
 LICENSE_SEED_FILENAME = "license.seed"
+# 씨앗 전용 하위 폴더. 인스톨러가 이 폴더에만 Users 수정 권한을 준다 — 관리자 설치
+# (Program Files)에서도 앱을 쓰는 일반 사용자가 씨앗을 지울 수 있어야 하기 때문이다.
+SEED_DIRNAME = "seed"
 
 
 @dataclass
@@ -61,10 +65,18 @@ def license_path() -> Path:
 
 
 def seed_path() -> Path | None:
-    """인스톨러가 남긴 초기 키 파일(exe 옆). 개발 환경에서는 None."""
+    """인스톨러가 남긴 초기 키 파일(`<설치폴더>/seed/license.seed`). 개발 환경에서는 None."""
     if not getattr(sys, "frozen", False):
         return None
-    return Path(sys.executable).parent / LICENSE_SEED_FILENAME
+    return Path(sys.executable).parent / SEED_DIRNAME / LICENSE_SEED_FILENAME
+
+
+def _seed_candidates() -> list[Path]:
+    """씨앗이 있을 수 있는 곳. 1.2.7 이하 인스톨러는 설치 폴더 바로 아래에 두었다."""
+    primary = seed_path()
+    if primary is None:
+        return []
+    return [primary, Path(sys.executable).parent / LICENSE_SEED_FILENAME]
 
 
 def _consume_seed() -> str | None:
@@ -74,24 +86,51 @@ def _consume_seed() -> str | None:
     설치하면 앱을 쓰는 사용자와 다른 계정이 되어 키가 엉뚱한 곳에 남는다. 그래서
     인스톨러는 계정과 무관한 설치 폴더에 씨앗만 두고, 실제 저장은 앱이 자기 계정에서 한다.
 
-    씨앗은 지우지 않는다 — 여러 사용자가 같은 PC를 쓰면 각자 첫 실행에서 필요하다.
+    여기서는 옮기기만 하고 지우지 않는다 — 키가 유효한지(활성화 성공)는 아직 모른다.
+    삭제는 활성화 레코드를 쓴 직후 `discard_seed()`가 한다. 그래서 같은 PC의 다른 사용자는
+    씨앗을 쓸 수 없다(평문 키 최소 수명과 맞바꾼 제약). 그 사용자는 앱에서 키를 등록한다.
     """
-    seed = seed_path()
-    if seed is None:
-        return None
-    try:
-        text = seed.read_text(encoding="utf-8").strip()
-    except (OSError, UnicodeDecodeError):
-        return None
-    if not text:
-        return None
+    for seed in _seed_candidates():
+        try:
+            text = seed.read_text(encoding="utf-8").strip()
+        except (OSError, UnicodeDecodeError):
+            continue
+        if not text:
+            continue
 
+        try:
+            write_license_key(text)
+        except OSError:
+            # 옮기지 못해도 이번 실행에는 쓸 수 있게 값은 돌려준다(씨앗은 남는다).
+            pass
+        return text
+    return None
+
+
+def _license_key_persisted() -> bool:
     try:
-        write_license_key(text)
-    except OSError:
-        # 옮기지 못해도 이번 실행에는 쓸 수 있게 값은 돌려준다.
-        pass
-    return text
+        return bool(license_path().read_text(encoding="utf-8").strip())
+    except (OSError, UnicodeDecodeError):
+        return False
+
+
+def discard_seed() -> bool:
+    """사용자 폴더에 키가 저장돼 있으면 씨앗을 지운다. 모두 지웠으면 True.
+
+    활성화 레코드를 쓴 직후(`activate`/`touch`) 부른다. 사용자 폴더에 키가 없으면 씨앗이
+    유일한 사본이므로 지우지 않는다. 삭제 실패(권한 등)는 예외로 올리지 않는다 — 라이선스
+    확인을 실패시킬 이유가 아니며, 다음 실행의 `touch`에서 다시 시도한다.
+    """
+    candidates = _seed_candidates()
+    if not candidates or not _license_key_persisted():
+        return False
+    removed = True
+    for seed in candidates:
+        try:
+            seed.unlink(missing_ok=True)
+        except OSError:
+            removed = False
+    return removed
 
 
 def read_license_key() -> str | None:
@@ -139,6 +178,8 @@ def activate(machine_id: str, serial: str, now: datetime) -> ActivationRecord:
     """이 PC로 새로 활성화한다(TOFU 최초 기록 또는 재등록)."""
     record = ActivationRecord(machine=machine_id, activated_at=now, last_seen=now, serial=serial)
     write_activation(record)
+    # 등록 성공 — 설치 폴더의 평문 씨앗은 더 필요 없다(감사 M-07).
+    discard_seed()
     return record
 
 
@@ -150,6 +191,8 @@ def touch(record: ActivationRecord, now: datetime) -> ActivationRecord:
     """
     record.last_seen = max(record.last_seen, now)
     write_activation(record)
+    # 지난 실행에서 씨앗 삭제가 실패했으면(권한 등) 여기서 다시 시도한다.
+    discard_seed()
     return record
 
 

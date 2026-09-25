@@ -114,3 +114,124 @@ class TestInstallerSeed:
         monkeypatch.setattr(activation.sys, "executable", str(exe_dir / "app.exe"))
 
         assert activation.read_license_key() is None
+
+
+class TestSeedLifetime:
+    """씨앗(평문 키)은 활성화가 성공하면 곧바로 지운다(감사 M-07).
+
+    지우는 조건은 '사용자 폴더에 license.key 가 실제로 저장됨'이다. 그 전에 지우면
+    키가 어디에도 남지 않는다.
+    """
+
+    @pytest.fixture
+    def frozen_install(self, tmp_path, monkeypatch):
+        exe_dir = tmp_path / "install"
+        exe_dir.mkdir()
+        monkeypatch.setattr(activation.sys, "frozen", True, raising=False)
+        monkeypatch.setattr(activation.sys, "executable", str(exe_dir / "app.exe"))
+        return exe_dir
+
+    def _new_seed(self, exe_dir, text="DBMT1-SEEDKEY"):
+        seed = exe_dir / activation.SEED_DIRNAME / activation.LICENSE_SEED_FILENAME
+        seed.parent.mkdir(parents=True, exist_ok=True)
+        seed.write_text(text + "\n", encoding="utf-8")
+        return seed
+
+    def test_seed_lives_in_dedicated_folder(self, frozen_install):
+        assert activation.seed_path() == (
+            frozen_install / activation.SEED_DIRNAME / activation.LICENSE_SEED_FILENAME
+        )
+
+    def test_new_location_seed_is_promoted(self, frozen_install):
+        self._new_seed(frozen_install)
+        assert activation.read_license_key() == "DBMT1-SEEDKEY"
+        assert activation.license_path().read_text(encoding="utf-8").strip() == "DBMT1-SEEDKEY"
+
+    def test_activate_deletes_seed_after_promotion(self, frozen_install):
+        seed = self._new_seed(frozen_install)
+        legacy = frozen_install / activation.LICENSE_SEED_FILENAME
+        legacy.write_text("DBMT1-OLDSEED\n", encoding="utf-8")
+
+        assert activation.read_license_key() == "DBMT1-SEEDKEY"
+        # 승격만으로는 지우지 않는다 — 키가 유효한지(활성화 성공) 아직 모른다.
+        assert seed.exists()
+
+        activation.activate("m-1", "serial-1", NOW)
+        assert not seed.exists()
+        assert not legacy.exists()
+
+    def test_seed_kept_when_license_key_not_persisted(self, frozen_install, monkeypatch):
+        seed = self._new_seed(frozen_install)
+
+        def fail_write(key):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(activation, "write_license_key", fail_write)
+        assert activation.read_license_key() == "DBMT1-SEEDKEY"
+
+        activation.activate("m-1", "serial-1", NOW)
+        # 사용자 폴더에 키가 없으니 씨앗이 유일한 사본이다. 지우면 키를 잃는다.
+        assert seed.exists()
+
+    def test_delete_failure_is_not_fatal_and_retried_on_touch(self, frozen_install, monkeypatch):
+        seed = self._new_seed(frozen_install)
+        activation.read_license_key()
+
+        real_unlink = type(seed).unlink
+        blocked = {"on": True}
+
+        def flaky_unlink(self, missing_ok=False):
+            if blocked["on"] and self.name == activation.LICENSE_SEED_FILENAME:
+                raise PermissionError("read-only install folder")
+            return real_unlink(self, missing_ok=missing_ok)
+
+        monkeypatch.setattr(type(seed), "unlink", flaky_unlink)
+
+        record = activation.activate("m-1", "serial-1", NOW)  # 예외 없이 끝나야 한다
+        assert seed.exists()
+        assert activation.read_activation() is not None
+
+        blocked["on"] = False
+        activation.touch(record, NOW + timedelta(minutes=1))
+        assert not seed.exists()
+
+    def test_discard_seed_is_noop_when_not_frozen(self):
+        assert activation.discard_seed() is False
+
+
+class TestSeedDeletedByCheckLicense:
+    """설치 후 첫 실행: 씨앗 → license.key → 서명 검증 → TOFU 활성화 → 씨앗 삭제."""
+
+    def test_first_run_consumes_and_deletes_seed(
+        self, tmp_path, monkeypatch, signing_key, fixed_machine
+    ):
+        from src.licensing import LicenseStatus, check_license
+
+        exe_dir = tmp_path / "install"
+        seed = exe_dir / activation.SEED_DIRNAME / activation.LICENSE_SEED_FILENAME
+        seed.parent.mkdir(parents=True)
+        seed.write_text(signing_key() + "\r\n", encoding="utf-8")
+        monkeypatch.setattr(activation.sys, "frozen", True, raising=False)
+        monkeypatch.setattr(activation.sys, "executable", str(exe_dir / "app.exe"))
+
+        state = check_license()
+
+        assert state.status is LicenseStatus.VALID
+        assert not seed.exists()
+        assert activation.license_path().exists()
+
+    def test_invalid_seed_is_not_deleted_by_failed_check(
+        self, tmp_path, monkeypatch, signing_key, fixed_machine
+    ):
+        """서명 검증에 실패하면 활성화가 없으므로 씨앗도 그대로 둔다(등록 성공 조건)."""
+        from src.licensing import LicenseStatus, check_license
+
+        exe_dir = tmp_path / "install"
+        seed = exe_dir / activation.SEED_DIRNAME / activation.LICENSE_SEED_FILENAME
+        seed.parent.mkdir(parents=True)
+        seed.write_text("DBMT1-NOTAVALIDKEY\n", encoding="utf-8")
+        monkeypatch.setattr(activation.sys, "frozen", True, raising=False)
+        monkeypatch.setattr(activation.sys, "executable", str(exe_dir / "app.exe"))
+
+        assert check_license().status is LicenseStatus.INVALID
+        assert seed.exists()

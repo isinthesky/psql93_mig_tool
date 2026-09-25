@@ -5,6 +5,10 @@
 설계 배경과 결정 근거는 [`docs/plans/licensing.md`](docs/plans/licensing.md)에 있다.
 이 문서는 실제로 손을 움직이는 절차만 다룬다.
 
+> **운영 발급은 라이선스 서버의 signer가 한다**(`lgetech-license-server/app/licensing.py`).
+> 이 문서의 `tools/issue_license.py`는 **개발·테스트 키와 서버 장애 시 비상 발급용**이다.
+> 서버와 같은 개인키를 이 PC에 두었다면 그 키의 사본이 하나 더 있는 것이므로 쓰고 나면 지운다.
+
 ---
 
 ## 0. 한눈에 보는 흐름
@@ -34,7 +38,10 @@
 python tools/issue_license.py --genkey --out-private "C:\경로\private.key"
 ```
 
-출력된 값을 `src/licensing/keys.py`에 붙여넣는다.
+패스프레이즈를 두 번 묻는다(12바이트 이상). 개인키는 **패스프레이즈로 암호화된 PKCS#8 PEM**으로
+저장되고 권한은 소유자 전용(POSIX 0600, Windows는 `icacls`로 현재 사용자만)이다.
+출력의 `키 ID`(공개키 SHA-256 fingerprint, `SHA256:<hex>`)를 키 관리 기록에 남긴다.
+출력된 공개키를 `src/licensing/keys.py`에 붙여넣는다.
 
 ```python
 LICENSE_PUBLIC_KEY_B32 = "NIVHG532..."   # 52자
@@ -67,14 +74,52 @@ python tools/issue_license.py --show-public --key-file "C:\경로\private.key"
 | **유출** | 누구나 만료일 무제한 키를 만들 수 있음 | 위와 동일. 사실상 전체 무력화 |
 | 덮어쓰기 | 위 '분실'과 같음 | `--genkey`가 기존 파일을 거부하므로 방지됨 |
 
+### 암호화와 패스프레이즈 (감사 M-06)
+
+- 개인키 파일은 **항상 암호화**되어 있다. 여는 데 패스프레이즈가 필요하다.
+- 패스프레이즈는 **프롬프트(getpass) 또는 환경변수 `DBMT_ISSUER_KEY_PASSPHRASE`** 로만 받는다.
+  명령줄 인자는 없다 — 셸 히스토리·프로세스 목록에 남기 때문이다. 환경변수는 비대화형
+  실행에서만 쓰고, 끝나면 지운다(`set DBMT_ISSUER_KEY_PASSPHRASE=`).
+- 패스프레이즈를 잃으면 개인키를 잃은 것과 같다. 개인키 파일과 **다른 곳**에 보관한다.
+- POSIX에서 그룹·기타 권한이 열린 키 파일(`chmod 644` 등)은 도구가 읽기를 거부한다.
+
+### 기존 평문 키 변환
+
+1.2.7 이하 도구로 만든 평문 키(정확히 32바이트)나 암호화되지 않은 PEM은 **발급에 쓸 수 없다.**
+도구가 경고와 함께 거부하고 변환만 허용한다.
+
+```bash
+python tools/issue_license.py --convert-legacy --key-file "C:\경로\old_plain.key" --out-private "C:\경로\private.key"
+```
+
+변환본으로 `--show-public`이 같은 공개키를 내는지 확인한 뒤, **평문 원본과 그 모든 사본(백업 포함)을
+폐기한다.** 도구는 원본을 지우지 않는다(되돌릴 수 없는 작업이라 사람이 한다).
+
+### 키 교체(rotation)
+
+앱은 공개키 하나만 신뢰하므로 교체는 "새 키로 전부 재발급"이다.
+
+1. `--genkey`로 새 키를 만들고 `키 ID`를 기록한다.
+2. 라이선스 서버 signer 키와 앱 `keys.py` 공개키를 **함께** 바꾼다(공용 테스트 벡터로 일치 확인).
+3. 새 앱을 빌드·배포하고, 대장의 유효 라이선스를 새 키로 재발급해 함께 전달한다
+   (옛 키로 서명된 라이선스는 새 앱에서 "서명이 올바르지 않습니다"가 된다).
+4. 재발급이 끝나면 옛 개인키의 모든 사본을 폐기하고 폐기일·`키 ID`를 기록한다.
+
+### 폐기(유출 의심)
+
+앱은 오프라인(TOFU)이라 **라이선스나 키를 원격으로 무효화할 수 없다.** 유출이 의심되면
+즉시 그 키 사용을 멈추고(서버 포함) 위 교체 절차를 긴급으로 수행한다. 옛 공개키를 가진 기존
+빌드는 유출 키로 만든 위조 키도 받아들이므로, **새 빌드로의 업그레이드가 유일한 차단 수단**이다.
+대장에서 교체 전 일련번호를 '폐기 키로 서명됨'으로 표시한다.
+
 ### 지켜야 할 것
 
 - **저장소 밖에 둔다.** `.gitignore`에 `*.key`가 있어 커밋은 막히지만,
   폴더를 통째로 복사하거나 압축할 때 딸려간다.
 - **암호화된 오프라인 백업을 만든다.** 분실이 유출보다 흔하고, 결과는 똑같이 치명적이다.
-- **경로를 인자로만 넘긴다.** 도구는 기본값도 환경변수도 읽지 않는다 —
-  실수로 커밋되는 경로를 아예 만들지 않기 위해서다.
-- 파일 크기는 정확히 **32바이트**다. 다르면 잘못된 파일이다.
+- **경로를 인자로만 넘긴다.** 도구는 키 경로의 기본값도 환경변수도 두지 않는다 —
+  실수로 커밋되는 경로를 아예 만들지 않기 위해서다(환경변수는 패스프레이즈 하나뿐이다).
+- 파일은 `-----BEGIN ENCRYPTED PRIVATE KEY-----`로 시작한다. 32바이트 파일이면 옛 평문 키이니 변환한다.
 
 ### 하지 말 것
 
@@ -99,13 +144,14 @@ python tools/issue_license.py --key-file "C:\경로\private.key" ^
   --cust "OO전자" --exp 2027-12-31 --ledger "C:\경로\ledger.csv"
 ```
 
-출력:
+패스프레이즈를 묻는다. 출력:
 
 ```
 고객사 : OO전자
 발급일 : 2026-08-05
 만료일 : 2027-08-04  (이 날까지 유효)
 일련번호: 90555d7d71cde3e6
+서명 키 : SHA256:3f1c...
 
 라이선스 키:
 
@@ -127,16 +173,29 @@ DBMT1-PMRHMIR2GEWCEY3VON2...
 
 ### 방법 A — 인스톨러에서 입력
 
-설치 마법사의 "라이선스 등록" 단계에 붙여넣는다. 하이픈·대소문자·줄바꿈은 알아서 정리된다.
-비워 두고 설치한 뒤 나중에 앱에서 등록해도 된다.
+설치 마법사의 "라이선스 등록" 단계에 붙여넣는다. 입력은 **마스킹**되어 화면에 보이지 않는다.
+하이픈·대소문자·줄바꿈은 알아서 정리된다. 비워 두고 설치한 뒤 나중에 앱에서 등록해도 된다.
 
 ### 방법 B — 무음 설치 (사내 일괄 배포)
 
+키를 **파일로** 전달한다. 명령줄에는 경로만 남는다.
+
 ```cmd
-DBMigrationTool-Setup-1.2.2.exe /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /LICENSEKEY=DBMT1-PMRH...
+DBMigrationTool-Setup-<버전>.exe /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /LICENSEFILE="C:\배포\license.txt"
 ```
 
-`/LICENSEKEY`를 빠뜨리면 키 없이 설치된다(설치 자체는 성공하며, 첫 실행에 등록 창이 뜬다).
+- 파일에는 키 한 줄만 둔다(BOM·줄바꿈·공백은 무시된다). 배포가 끝나면 파일을 지운다.
+- `/LICENSEFILE`을 지정했는데 파일이 없거나 비어 있으면 **설치를 중단**한다(조용한 미등록 방지).
+- `/LICENSEFILE`을 빠뜨리면 키 없이 설치된다(설치 자체는 성공하며, 첫 실행에 등록 창이 뜬다).
+- **`/LICENSEKEY=<키>`는 1.2.7 다음 릴리스부터 거부된다**(설치 중단). 명령줄 키는 프로세스 목록·설치 로그·배포
+  스크립트에 평문으로 남기 때문이다(감사 M-07). 기존 배포 스크립트는 `/LICENSEFILE`로 바꾼다.
+
+### 설치 후 키가 머무는 곳
+
+인스톨러는 키를 `<설치폴더>\seed\license.seed`(씨앗)에 둔다. 앱이 첫 실행에서 사용자 폴더
+(`%LOCALAPPDATA%\DBMigrationTool\license.key`)로 옮기고, **활성화가 성공하면 씨앗을 곧바로 지운다.**
+같은 PC의 다른 Windows 사용자는 씨앗을 쓸 수 없으므로 앱에서 키를 등록한다(평문 키 최소 수명과
+맞바꾼 제약). 1.2.7 이하가 남긴 `<설치폴더>\license.seed`는 업그레이드 설치가 새 위치로 옮기거나 지운다.
 
 > **업그레이드 시 주의**: 키를 비운 채 `/VERYSILENT`로 덮어써도 기존 키는 지워지지 않는다.
 > 앱에서 갱신한 키가 무음 업그레이드로 날아가는 사고를 막기 위한 것이다.
@@ -220,10 +279,15 @@ DBMigrationTool-Setup-1.2.2.exe /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /LICENS
 ## 9. 명령 요약
 
 ```bash
+# 패스프레이즈: 프롬프트 또는 DBMT_ISSUER_KEY_PASSPHRASE (명령줄 인자 없음)
+
 # 최초 1회
 python tools/issue_license.py --genkey --out-private <경로>
 
-# 공개키 다시 뽑기 (keys.py 복구)
+# 옛 평문 키 → 암호화 키 (평문 키로는 이것만 가능)
+python tools/issue_license.py --convert-legacy --key-file <평문키> --out-private <새 경로>
+
+# 공개키·키 ID 다시 뽑기 (keys.py 복구)
 python tools/issue_license.py --show-public --key-file <경로>
 
 # 발급

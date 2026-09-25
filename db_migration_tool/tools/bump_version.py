@@ -4,8 +4,10 @@
   - pyproject.toml                  패키징 메타데이터
   - src/version.py                  앱이 실행 중 표시하는 값
   - installer/DBMigrationTool.iss   인스톨러 이름·표시 버전
+  - uv.lock                         lock 안의 프로젝트 자신의 버전. 이것만 어긋나도
+                                    `uv sync --locked`(build.bat)가 실패한다.
 
-셋을 따로 고치면 반드시 어긋난다. 실제로 인스톨러는 1.2.1인데 앱 정보
+이들을 따로 고치면 반드시 어긋난다. 실제로 인스톨러는 1.2.1인데 앱 정보
 창은 1.0.0을 말하는 상태가 있었다. 그래서 이 스크립트만 쓰게 한다.
 
 사용법:
@@ -35,6 +37,10 @@ TARGETS: list[tuple[Path, bytes]] = [
     (
         ROOT / "installer" / "DBMigrationTool.iss",
         rb'(?m)^(#define AppVersion ")(\d+\.\d+\.\d+)(")',
+    ),
+    (
+        ROOT / "uv.lock",
+        rb'(?m)^(name = "db-migration-tool"\r?\nversion = ")(\d+\.\d+\.\d+)(")',
     ),
 ]
 

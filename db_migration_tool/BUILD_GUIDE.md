@@ -142,8 +142,10 @@ create-dmg \
 python -m PyInstaller DBMigrationTool.spec --clean --noconfirm
 ```
 
-`build.bat`도 같은 일을 하지만 **`dist` 폴더를 통째로 지운다.** 과거 릴리스
-아티팩트를 dist에 보관 중이라면 위 명령을 직접 쓴다.
+`build.bat`은 순서대로 ① `uv sync --locked --all-extras`(uv.lock 강제, 아래 "의존성 lock")
+② `tools/bump_version.py`(patch +1) ③ PyInstaller ④ `installer\codesign.ps1`(선택적 코드서명,
+아래 "코드서명")을 실행한다. `dist`는 지우지 않는다(`dist\prerequisites`·`dist\installer` 보존).
+버전을 올리지 않고 다시 빌드하려면 위 PyInstaller 명령을 직접 쓴다.
 
 ### 2. 인스톨러 빌드
 
@@ -161,6 +163,51 @@ winget install --id JRSoftware.InnoSetup
 
 winget은 `%LOCALAPPDATA%\Programs\Inno Setup 6`에 설치한다.
 `build_installer.bat`이 그곳과 Program Files 양쪽을 찾는다.
+
+`build_installer.bat`은 ISCC 전에 **prerequisite 검증 gate**(아래)와 실행 파일 서명 상태 확인을,
+ISCC 뒤에 인스톨러 서명 훅을 실행한다. gate가 실패하면 인스톨러를 만들지 않는다.
+
+### VC++ prerequisite 검증 (감사 M-09)
+
+`dist\prerequisites\vc_redist.x64.exe`는 저장소에 없고 빌드 호스트에만 있다. 그래서
+`installer\verify_prerequisites.ps1`이 포함 직전에 확인한다.
+
+- SHA-256이 `installer\prerequisites.sha256`의 고정값과 같을 것
+- `Get-AuthenticodeSignature` 상태가 `Valid`이고, 서명자 CN·O가 `Microsoft Corporation`일 것
+- 타임스탬프가 있을 것(벤더 인증서가 만료돼도 서명이 유효하게 남는 근거)
+
+현재 고정값: 14.44.35211.0, SHA-256 `cc0ff0eb…096b713b`(2026-09-25 my-wsl-01에서 읽기 전용 확인).
+
+**고정값 갱신 절차** (새 VC++ 런타임을 넣을 때):
+
+1. Microsoft 공식 경로(`https://aka.ms/vs/17/release/vc_redist.x64.exe`)에서 받는다.
+2. PowerShell로 서명·해시를 확인한다.
+   ```powershell
+   Get-AuthenticodeSignature dist\prerequisites\vc_redist.x64.exe | Format-List Status,SignerCertificate,TimeStamperCertificate
+   Get-FileHash -Algorithm SHA256 dist\prerequisites\vc_redist.x64.exe
+   (Get-Item dist\prerequisites\vc_redist.x64.exe).VersionInfo.FileVersion
+   ```
+3. `installer\prerequisites.sha256`의 해시와 주석(버전·크기·서명자)을 바꾸고 **그 파일만 담은 별도 커밋**으로
+   리뷰를 받는다. gate를 우회하려고 해시를 빌드 도중 바꾸지 않는다.
+
+### 코드서명 (감사 M-11)
+
+인증서가 아직 없어 기본 빌드는 **미서명**이다. `installer\codesign.ps1`이 `build.bat`(exe)과
+`build_installer.bat`(설치본)에서 호출되며, 환경변수에 따라 동작한다.
+
+| 환경변수 | 의미 |
+|---|---|
+| `CODESIGN_CERT_THUMBPRINT` | 인증서 저장소(또는 HSM/토큰)에 있는 인증서의 SHA-1 thumbprint |
+| `CODESIGN_PFX` + `CODESIGN_PFX_PASSWORD` | PFX 파일과 비밀번호. 실행 중에만 CurrentUser\My에 가져왔다가 지운다 — 비밀번호가 signtool 명령줄에 나오지 않는다 |
+| `CODESIGN_TIMESTAMP_URL` | RFC 3161 타임스탬프 서버(기본 `http://timestamp.digicert.com`) |
+| `CODESIGN_REQUIRED=1` | 인증서가 없거나 exe가 미서명이면 **실패**(릴리스 빌드용) |
+| `SIGNTOOL` | signtool.exe 경로(없으면 PATH → Windows SDK x64 최신) |
+
+- 인증서가 있으면 `signtool sign /sha1 <thumbprint> /fd SHA256 /tr <ts> /td SHA256` 후
+  `signtool verify /pa`와 `Get-AuthenticodeSignature`(Valid + 타임스탬프)로 검증한다. 실패하면 빌드 실패.
+- 인증서가 없으면 **`WARNING: UNSIGNED BUILD`** 배너를 출력하고 계속한다(개발 빌드).
+- Inno Setup이 만드는 제거 프로그램(`unins000.exe`)은 이 훅이 서명하지 않는다. 인증서를 들이면
+  `.iss`의 `SignTool=` 지시자와 ISCC `/S`로 함께 서명하도록 확장한다.
 
 ### 인스톨러가 하는 일
 
@@ -204,7 +251,8 @@ python -m PyInstaller DBMigrationTool.spec --clean --noconfirm
 
 ### 라이선스
 
-인스톨러에 라이선스 키 입력 단계가 있고, 무음 설치는 `/LICENSEKEY=...`로 넘긴다.
+인스톨러에 라이선스 키 입력 단계(마스킹)가 있고, 무음 설치는 키가 든 파일 경로를
+`/LICENSEFILE=<경로>`로 넘긴다. `/LICENSEKEY=<키>`는 명령줄·설치 로그 노출 때문에 **거부**한다(감사 M-07).
 **공개키(`src/licensing/keys.py`)가 비어 있으면 만들어진 exe는 어떤 키도 받지 않는다.**
 
 키 생성·발급·배포 절차는 [`LICENSE_GUIDE.md`](LICENSE_GUIDE.md)를 본다.
@@ -222,6 +270,25 @@ python -m PyInstaller DBMigrationTool.spec --clean --noconfirm
 ---
 
 ## 의존성 관리
+
+### 의존성 lock (감사 M-08)
+
+`uv.lock`은 **버전 관리에 포함**한다. 모든 플랫폼(Windows 휠 포함)의 버전과 SHA-256 해시가
+들어 있고, `build.bat`은 `uv sync --locked --all-extras`로 이 lock을 그대로 설치한다.
+`pyproject.toml`과 lock이 어긋나면(`--locked`) 다시 해석하지 않고 빌드를 멈춘다.
+
+- `uv.lock`은 모든 체크아웃에서 LF다(루트 `.gitattributes`의 `uv.lock text eol=lf`).
+- `tools/bump_version.py`는 lock 안의 프로젝트 자신의 버전도 함께 올린다. 빌드 후 커밋할 버전
+  파일은 `pyproject.toml`, `src/version.py`, `installer/DBMigrationTool.iss`, **`uv.lock`** 넷이다.
+
+**업데이트 절차** (빌드와 분리된 별도 커밋):
+
+1. `pyproject.toml`의 의존성을 바꾸거나, 올릴 패키지를 정한다.
+2. `uv lock`(추가·변경 반영) 또는 `uv lock --upgrade-package <이름>`(특정 패키지만 올림).
+   전체 `uv lock --upgrade`는 변경 폭이 커서 리뷰가 어렵다 — 필요할 때만 쓴다.
+3. `uv sync --locked --all-extras` 후 품질 게이트(ruff·mypy·pytest)를 통과시킨다.
+4. `git diff uv.lock`에서 바뀐 패키지·버전을 커밋 메시지에 적고 **lock 변경만 담은 커밋**으로 올린다.
+5. Windows 빌드 호스트에서 `uv lock --check`가 통과하는지 확인한다(0.10.4 이상에서 읽힘 확인).
 
 ### 의존성 업데이트
 
