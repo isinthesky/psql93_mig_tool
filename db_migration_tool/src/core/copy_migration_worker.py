@@ -551,6 +551,9 @@ class CopyMigrationWorker(BaseMigrationWorker):
             log_emitter.emit_log("ERROR", f"마이그레이션 오류: {str(e)}")
             raise
         finally:
+            # cancel 반복 스레드를 먼저 멈춘다 — psycopg2 cancel·close가 겹치면
+            # 해제된 cancel 핸들을 쓸 수 있다(M-13: 앱 종료는 모든 워커에 cancel 반복을 건다).
+            self._stop_cancel_retries()
             # 연결 종료 (성공/실패/취소 모두 확실히 닫기)
             for conn in (self.source_conn, self.target_conn):
                 if conn is not None:

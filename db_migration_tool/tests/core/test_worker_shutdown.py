@@ -458,6 +458,38 @@ class TestCopyWorkerStages:
         assert running[-1]["rows_processed"] == 8
         assert worker.stop_reason == registry_module.SHUTDOWN_REASON
 
+    def test_connections_are_not_closed_while_cancel_retry_thread_runs(
+        self, registry, estimate, qtbot
+    ):
+        """psycopg2 cancel()과 close()가 겹치면 해제된 cancel 핸들을 쓸 수 있다(M-13 리뷰)."""
+        source, target = FakeSource(_rows(20)), FakeTarget()
+        source.block_copy_no = 3
+        worker = _make_worker(source, target)
+        alive_at_close: list[bool] = []
+
+        def watch_close(conn) -> None:
+            original = conn.close
+
+            def close() -> None:
+                thread = worker._cancel_thread
+                alive_at_close.append(bool(thread is not None and thread.is_alive()))
+                original()
+
+            conn.close = close
+
+        watch_close(source)
+        watch_close(target)
+        worker.start()
+        assert source.copy_blocked.wait(5)
+
+        coordinator, elapsed = self._shutdown(registry)
+
+        _assert_clean_copy_shutdown(worker, source, target, coordinator, elapsed)
+        assert worker._cancel_thread is not None, "전제: 종료가 cancel 반복을 걸어야 합니다"
+        assert alive_at_close == [False, False], (
+            f"cancel 반복 스레드가 도는 중에 연결을 닫았습니다: {alive_at_close}"
+        )
+
     def test_during_blocked_commit(self, registry, estimate, qtbot):
         source, target = FakeSource(_rows(20)), FakeTarget()
         target.block_commit_no = 2

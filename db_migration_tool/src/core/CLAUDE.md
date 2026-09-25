@@ -118,7 +118,7 @@
 - 종료 중에 시작한 워커는 등록 즉시 멈춘다.
 - `stop()`은 UI 스레드에서 불린다. 네트워크 호출(cancel·rollback)을 직접 하지 말고 `_on_stop_requested()`에서
   `_cancel_connections_async()`를 쓴다(아카이브 워커 포함). 연결을 닫기 전에는 `_stop_cancel_retries()`로
-  cancel 반복을 멈춘다(psycopg2 cancel·close 경합). `CopyMigrationWorker`의 finally는 아직 close 뒤에
-  `_work_finished`를 세운다(H-02 리뷰 잔여).
+  cancel 반복을 멈춘다(psycopg2 cancel·close 경합). `CopyMigrationWorker`·아카이브 워커의 finally 모두
+  close 앞에서 부른다.
 - 테스트: `tests/core/test_worker_shutdown.py`(단계별 종료·timeout 강제 종료·임시 파일/잠금/스레드 누수),
   `tests/test_main_shutdown.py`(배선·중첩 모달 루프 종료).
