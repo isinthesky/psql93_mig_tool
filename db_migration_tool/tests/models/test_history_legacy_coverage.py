@@ -10,10 +10,12 @@ checkpoint가 일부만 남는다. 그 남은 집합을 그대로 계획으로 �
 
 from __future__ import annotations
 
+from datetime import datetime
+
 import pytest
 from sqlalchemy import text
 
-from src.database.local_db import Checkpoint
+from src.database.local_db import Checkpoint, MigrationHistory
 from src.models.history import (
     CheckpointManager,
     HistoryManager,
@@ -381,3 +383,126 @@ class TestMultiTypeInterruption:
 
         item = hm.get_history(hid)
         assert item is not None and item.plan_version is None
+
+
+class TestSupplementRecord:
+    """리뷰 라운드 1(H-09): 채택 때 **보충한 이름**을 따로 기록한다.
+
+    아카이브 워커는 이 이름만 '원본에 없으면 0건 완료'로 닫는다. 원래 checkpoint는 구버전이
+    실제로 고른 파티션이라, 없어졌다면 잘못된 원본·아카이브를 가리키므로 실패해야 한다.
+    """
+
+    def test_adoption_records_only_the_supplemented_names(self, history_db):
+        hid = _legacy("2026-01-01", "2026-01-03", ["point_history_260101", "point_history_260102"])
+        hm = HistoryManager()
+
+        # 이미 checkpoint가 있는 이름을 함께 넘겨도 보충분으로 기록하지 않는다.
+        hm.adopt_legacy_history(
+            hid,
+            _profile(),
+            supplement=["point_history_260101", "point_history_260103"],
+            original_types=PH_ONLY,
+        )
+
+        item = hm.get_history(hid)
+        assert item is not None
+        assert item.legacy_supplemented == ["point_history_260103"]
+
+    def test_adoption_without_gaps_records_nothing(self, history_db):
+        names = ["point_history_260101", "point_history_260102"]
+        hid = _legacy("2026-01-01", "2026-01-02", names)
+        hm = HistoryManager()
+
+        hm.adopt_legacy_history(hid, _profile(), original_types=PH_ONLY)
+
+        item = hm.get_history(hid)
+        assert item is not None and item.legacy_adopted_at is not None
+        assert item.legacy_supplemented == []
+
+    def test_planned_history_has_no_supplemented_names(self, history_db):
+        item = HistoryManager().create_planned_history(
+            _profile(), ["point_history_260101"], "2026-01-01", "2026-01-01"
+        )
+
+        assert item.legacy_supplemented == []
+
+    def test_unreadable_record_is_treated_as_nothing_supplemented(self, history_db):
+        """기록이 깨졌으면 아무 이름도 '없어도 되는' 것으로 보지 않는다(엄격)."""
+        hid = _legacy("2026-01-01", "2026-01-03", ["point_history_260101", "point_history_260102"])
+        hm = HistoryManager()
+        hm.adopt_legacy_history(
+            hid, _profile(), supplement=["point_history_260103"], original_types=PH_ONLY
+        )
+        with history_db.session_scope() as s:
+            s.execute(
+                text("UPDATE migration_history SET legacy_supplemented = :v WHERE id = :id"),
+                {"v": '{"not": "a list"}', "id": hid},
+            )
+
+        item = hm.get_history(hid)
+        assert item is not None and item.legacy_supplemented == []
+
+
+class TestTypeIntroductionDate:
+    """리뷰 라운드 1(H-08): 이력이 시작된 날에 없던 유형은 원래 작업에 들어갈 수 없다.
+
+    다중 유형(ED·RT·TH)은 94f5cae(2025-11-19), PS는 b7dbb5b(2026-03-30)에 들어왔다. 그 전에
+    시작한 이력에는 그 유형을 묻지 않는다 — 가장 흔한 PH 단일 유형 이력이 불필요하게 뒤 유형
+    보충(대상 데이터 삭제 가능)으로 바뀌는 일을 줄인다.
+    """
+
+    RANGE = ("2026-01-01", "2026-01-02")
+    PH = ["point_history_260101", "point_history_260102"]
+
+    def _started(self, db, hid: int, when: datetime | None) -> None:
+        with db.session_scope() as s:
+            s.query(MigrationHistory).filter(MigrationHistory.id == hid).update(
+                {"started_at": when}
+            )
+
+    def test_point_sec_history_is_not_asked_before_it_existed(self, history_db):
+        hid = _legacy(*self.RANGE, self.PH)
+        self._started(history_db, hid, datetime(2026, 3, 29, 23, 59))
+
+        check = HistoryManager().prepare_resume(hid, _profile())
+
+        cov = check.legacy
+        assert cov is not None
+        assert sorted(cov.undecided_types) == ["running_time_history", "trend_history"]
+        assert cov.unavailable_types == ["point_sec_history"]
+        assert "point_sec_history" not in check.message
+
+    def test_single_type_era_history_needs_no_type_decision(self, history_db):
+        hid = _legacy(*self.RANGE, self.PH)
+        self._started(history_db, hid, datetime(2025, 11, 18, 12, 0))
+        hm = HistoryManager()
+
+        cov = hm.prepare_resume(hid, _profile()).legacy
+        assert cov is not None and cov.undecided_types == {}
+
+        adopted = hm.adopt_legacy_history(hid, _profile())
+        assert adopted.verdict is ResumeVerdict.OK
+        assert adopted.pending == self.PH
+
+    def test_type_is_still_asked_on_the_day_it_was_introduced(self, history_db):
+        hid = _legacy(*self.RANGE, self.PH)
+        self._started(history_db, hid, datetime(2026, 3, 30, 9, 0))
+
+        cov = HistoryManager().prepare_resume(hid, _profile()).legacy
+
+        assert cov is not None
+        assert "point_sec_history" in cov.undecided_types
+
+    def test_unknown_start_time_asks_every_trailing_type(self, history_db):
+        hid = _legacy(*self.RANGE, self.PH)
+        self._started(history_db, hid, None)
+
+        cov = HistoryManager().prepare_resume(hid, _profile()).legacy
+
+        assert cov is not None
+        assert sorted(cov.undecided_types) == [
+            "point_sec_history",
+            "running_time_history",
+            "trend_history",
+        ]
+        assert cov.unavailable_types == []

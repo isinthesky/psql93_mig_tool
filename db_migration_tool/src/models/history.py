@@ -19,7 +19,10 @@
   고정하면 구버전 H-09 누락이 '정상'이 되어 subset만 처리하고 completed로 닫힌다.
   구버전은 checkpoint를 유형 코드 순서(ED→PH→PS→RT→TH)로 만들었으므로, checkpoint가
   없는 **뒤 유형**은 끊겨서 통째로 빠졌을 수 있다. 그 유형들은 원래 작업에 포함됐는지
-  호출자가 명시적으로 정해야 채택된다(`LegacyTypeDecisionError`).
+  호출자가 명시적으로 정해야 채택된다(`LegacyTypeDecisionError`). 이력이 시작된 날에 아직
+  없던 유형(`LEGACY_TYPE_INTRODUCED`)은 원래 작업에 들어갈 수 없으므로 묻지 않는다.
+  채택 때 보충한 이름은 `legacy_supplemented`로 따로 기록한다 — 원본에 없을 수 있는 이름은
+  이것뿐이고, 원래 checkpoint는 구버전이 실제로 고른 파티션이다.
 """
 
 from __future__ import annotations
@@ -46,6 +49,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     "INCOMPLETE_STATUSES",
+    "LEGACY_TYPE_INTRODUCED",
     "PLAN_VERSION",
     "DEFAULT_SCHEMA",
     "CheckpointItem",
@@ -61,7 +65,9 @@ __all__ = [
     "endpoint_fingerprint",
     "endpoint_identity",
     "endpoint_label",
+    "legacy_creation_order",
     "legacy_range_candidates",
+    "legacy_supplement_note",
     "planned_set_hash",
 ]
 
@@ -250,6 +256,26 @@ def legacy_creation_order() -> list[str]:
     ]
 
 
+# 유형이 이 도구에 들어온 날(커밋 날짜). 그 전에 시작한 이력에는 그 유형이 있을 수 없다.
+# 실제 배포는 커밋보다 늦으므로 '이 날짜 전'은 확실히 없던 때다(같은 날은 여전히 묻는다).
+# - 94f5cae(2025-11-19): 다중 유형 지원(ED·RT·TH). 그 전에는 point_history 하나였다.
+# - b7dbb5b(2026-03-30): point_sec_history(PS).
+LEGACY_TYPE_INTRODUCED: dict[str, date] = {
+    "energy_display": date(2025, 11, 19),
+    "running_time_history": date(2025, 11, 19),
+    "trend_history": date(2025, 11, 19),
+    "point_sec_history": date(2026, 3, 30),
+}
+
+
+def _unavailable_types(started_at: datetime | date | None) -> set[str]:
+    """이력이 시작된 날에 아직 없던 유형. 시작 시각을 모르면 빈 집합(모두 가능)."""
+    if started_at is None:
+        return set()
+    day = started_at.date() if isinstance(started_at, datetime) else started_at
+    return {table for table, introduced in LEGACY_TYPE_INTRODUCED.items() if day < introduced}
+
+
 def _type_codes() -> dict[str, str]:
     from src.core.table_types import TABLE_TYPE_CONFIG
 
@@ -286,8 +312,10 @@ class LegacyCoverage:
     - `excluded_types`: checkpoint가 없고 순서상 마지막 represented 유형보다 **앞**인 유형 —
       원래 선택했다면 checkpoint가 먼저 생겼어야 하므로 선택하지 않은 것이 확실하다. 경고하지
       않는다(선언에 넣으면 포함한다).
-    - `trailing_types`: checkpoint가 없고 순서상 **뒤**인 유형의 범위 내 후보. 선택하지 않았을
-      수도, 끊겨서 통째로 빠졌을 수도 있다 — 로컬 데이터로는 구분할 수 없다.
+    - `unavailable_types`: 이력이 시작된 날에 아직 없던 유형(`LEGACY_TYPE_INTRODUCED`) —
+      원래 작업에 들어갈 수 없다. 묻지도 경고하지도 않는다.
+    - `trailing_types`: checkpoint가 없고 순서상 **뒤**인 유형(unavailable 제외)의 범위 내 후보.
+      선택하지 않았을 수도, 끊겨서 통째로 빠졌을 수도 있다 — 로컬 데이터로는 구분할 수 없다.
     - `declared_types`: 호출자(사용자)가 원래 작업에 포함됐다고 확인한 유형. None이면 아직
       정하지 않았다(`undecided_types`가 뒤 유형 전체). 선언된 checkpoint 없는 유형은
       `included_types`가 되어 기대 집합에 들어간다.
@@ -312,6 +340,7 @@ class LegacyCoverage:
     excluded_types: list[str] = field(default_factory=list)
     declared_types: list[str] | None = None
     included_types: list[str] = field(default_factory=list)
+    unavailable_types: list[str] = field(default_factory=list)
 
     @classmethod
     def compute(
@@ -320,6 +349,7 @@ class LegacyCoverage:
         end_date: str | None,
         states: list[tuple[str, str | None]],
         original_types: Iterable[str] | None = None,
+        started_at: datetime | date | None = None,
     ) -> LegacyCoverage:
         order = legacy_creation_order()
         declared: list[str] | None = None
@@ -355,7 +385,8 @@ class LegacyCoverage:
         included = [t for t in absent if declared is not None and t in declared]
         expected = {n for t in [*represented, *included] for n in candidates[t]}
         all_candidates = {n for names in candidates.values() for n in names}
-        trailing = [t for t in absent if order.index(t) > last]
+        unavailable = _unavailable_types(started_at)
+        trailing = [t for t in absent if order.index(t) > last and t not in unavailable]
 
         base.range_ok = True
         base.range_days = (end - start).days + 1
@@ -365,6 +396,7 @@ class LegacyCoverage:
         base.gaps = sorted(expected - present_set)
         base.trailing_types = {t: candidates[t] for t in trailing}
         base.excluded_types = [t for t in absent if order.index(t) < last and t not in included]
+        base.unavailable_types = [t for t in absent if t in unavailable and t not in included]
         base.absent_types = {t: candidates[t] for t in trailing if t not in included}
         base.outside = sorted(present_set - all_candidates)
         return base
@@ -407,7 +439,7 @@ class LegacyCoverage:
         if self.gaps:
             lines.append(
                 f"누락된 파티션: {_shown(self.gaps)} — 이어서 진행하면 계획에 보충합니다. "
-                + _supplement_note(migration_mode)
+                + legacy_supplement_note(migration_mode)
             )
         undecided = [f"{t} {len(n):,}개" for t, n in self.undecided_types.items() if n]
         if undecided:
@@ -425,8 +457,8 @@ class LegacyCoverage:
         return lines
 
 
-def _supplement_note(migration_mode: str | None) -> str:
-    """보충한 파티션을 워커가 어떻게 처리하는지 — 경로별로 다르다."""
+def legacy_supplement_note(migration_mode: str | None) -> str:
+    """보충한 파티션을 워커가 어떻게 처리하는지 — 경로별로 다르다(확인 창·항목 선택 창 공용)."""
     if migration_mode == "postgres_to_file":
         return (
             "원본 DB에 없는 파티션은 0건 완료로 처리하고 파일을 만들지 않습니다. 아카이브에 "
@@ -520,6 +552,7 @@ class MigrationHistoryItem:
         planned_hash: str | None = None,
         plan_fingerprint: str | None = None,
         legacy_adopted_at: datetime | None = None,
+        legacy_supplemented: list[str] | None = None,
     ):
         self.id = id
         self.profile_id = profile_id
@@ -540,6 +573,8 @@ class MigrationHistoryItem:
         self.planned_hash = planned_hash
         self.plan_fingerprint = plan_fingerprint
         self.legacy_adopted_at = legacy_adopted_at
+        # 채택 때 보충한 파티션(원본에 없을 수 있는 이름). 채택하지 않았거나 기록이 없으면 [].
+        self.legacy_supplemented = list(legacy_supplemented or [])
 
     @property
     def is_legacy(self) -> bool:
@@ -569,7 +604,19 @@ class MigrationHistoryItem:
             planned_hash=db_history.planned_hash,
             plan_fingerprint=db_history.plan_fingerprint,
             legacy_adopted_at=db_history.legacy_adopted_at,
+            legacy_supplemented=_name_list(db_history.legacy_supplemented),
         )
+
+
+def _name_list(raw: str | None) -> list[str]:
+    """JSON 파티션 이름 목록. 읽을 수 없으면 [] — '없어도 되는 이름'을 넓히지 않는다(엄격)."""
+    try:
+        value = json.loads(raw or "[]")
+    except (TypeError, ValueError):
+        return []
+    if not isinstance(value, list) or not all(isinstance(n, str) for n in value):
+        return []
+    return sorted(set(value))
 
 
 class CheckpointItem:
@@ -724,7 +771,9 @@ class HistoryManager:
         completed = {name for name, status in states if status == "completed"}
 
         if row.plan_version is None:
-            coverage = LegacyCoverage.compute(row.start_date, row.end_date, states, original_types)
+            coverage = LegacyCoverage.compute(
+                row.start_date, row.end_date, states, original_types, row.started_at
+            )
             return ResumeCheck(
                 ResumeVerdict.LEGACY,
                 history_id,
@@ -838,7 +887,8 @@ class HistoryManager:
         끊긴 이력은 누락이 gaps로 드러나지 않는다. 범위를 해석할 수 없거나 checkpoint가 없으면
         거부한다.
 
-        보충 checkpoint 생성과 계획 기록은 한 트랜잭션이다. 한 번만 기록된다(이미 계획이
+        보충 checkpoint 생성, 계획 기록, 보충한 이름 기록(`legacy_supplemented`)은 한
+        트랜잭션이다. 한 번만 기록된다(이미 계획이
         있으면 ValueError). 이후 재개는 엄격 모드로 검사한다.
         """
         row = self.repo.get_by_id(history_id)
@@ -847,7 +897,9 @@ class HistoryManager:
         if row.plan_version is not None:
             raise ValueError("이미 계획이 기록된 이력입니다")
         states = self.repo.get_checkpoint_states(history_id)
-        coverage = LegacyCoverage.compute(row.start_date, row.end_date, states, original_types)
+        coverage = LegacyCoverage.compute(
+            row.start_date, row.end_date, states, original_types, row.started_at
+        )
         if not coverage.present:
             raise ValueError("체크포인트가 없어 계획을 복원할 수 없습니다. 작업을 폐기하세요.")
         if not coverage.range_ok:
@@ -868,11 +920,15 @@ class HistoryManager:
 
         names = sorted(set(coverage.present) | extra)
         plan = MigrationPlan.from_profile(profile, names, schema)
+        added = sorted(extra - set(coverage.present))
         bound = self.repo.bind_legacy_plan(
             history_id,
             coverage.present,
-            add_partitions=sorted(extra - set(coverage.present)),
+            add_partitions=added,
             legacy_adopted_at=datetime.now(),
+            # 보충한 이름만 기록한다: 아카이브 워커가 '원본에 없으면 0건 완료'로 닫아도 되는
+            # 것은 이 이름뿐이다(원래 checkpoint는 구버전이 실제로 고른 파티션).
+            legacy_supplemented=json.dumps(added),
             **plan.to_columns(),
         )
         if not bound:

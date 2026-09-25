@@ -160,10 +160,11 @@ class ArchiveMigrationWorkerBase(BaseMigrationWorker):
         self.partition_failures: list[dict[str, str]] = []
         # 인증/체크섬 없는 아카이브를 쓰겠다는 사용자의 명시적 확인(docs/base/archive-trust-boundary.md).
         self.allow_legacy_unverified = False
-        # legacy에서 채택한 이력(H-08/H-09)만 True. 채택 때 보충한 파티션은 명명 규칙으로 만든
-        # '있을 수 있는 이름'이라, 원본(DB·manifest)에 실제로 없으면 0건 완료로 닫는다(copy 워커와
-        # 같은 규칙). 새로 만든 계획은 원본 목록에서 고른 파티션이므로 없어졌으면 실패로 둔다.
-        self.tolerate_absent_source = False
+        # legacy 이력을 채택할 때 **보충한 이름**(H-08/H-09, `legacy_supplemented`). 명명 규칙으로
+        # 만든 '있을 수 있는 이름'이라, 원본(DB·manifest)에 실제로 없으면 0건 완료로 닫는다.
+        # 그 밖의 파티션 — 채택한 이력의 원래 checkpoint, 새로 만든 계획 — 은 구버전·현재 버전이
+        # 원본 목록에서 실제로 고른 것이므로, 없어졌다면 잘못된 원본·아카이브라는 신호다. 실패로 둔다.
+        self.absent_ok_partitions: frozenset[str] = frozenset()
 
     def configure_archive_security(
         self, *, passphrase: str | None = None, allow_legacy_unverified: bool = False
@@ -420,7 +421,7 @@ class ArchiveMigrationWorkerBase(BaseMigrationWorker):
     def _complete_absent_partition(
         self, checkpoint: Any, partition_name: str, *, where: str, copy_method: str
     ) -> None:
-        """원본에 실제로 없는 파티션을 0건 완료로 닫는다(`tolerate_absent_source`일 때만)."""
+        """원본에 실제로 없는 보충 파티션을 0건 완료로 닫는다(`absent_ok_partitions`에 든 이름만)."""
         self._log(
             f"{partition_name} - {where}에 없는 파티션입니다(이전 버전 작업을 채택할 때 보충한 "
             "이름). 0건 완료로 처리합니다.",
@@ -546,8 +547,9 @@ class PostgresToFileArchiveWorker(ArchiveMigrationWorkerBase):
                     checkpoints[partition_name] = checkpoint
 
                 try:
-                    if self.tolerate_absent_source and not self._source_partition_exists(
-                        partition_name
+                    if (
+                        partition_name in self.absent_ok_partitions
+                        and not self._source_partition_exists(partition_name)
                     ):
                         self._complete_absent_partition(
                             checkpoint,
@@ -785,7 +787,12 @@ class PostgresToFileArchiveWorker(ArchiveMigrationWorkerBase):
         `information_schema.tables`는 권한 없는 테이블을 숨기므로 쓰지 않는다(권한 문제를 부재로
         오판하면 조용히 0건 완료가 된다). PG 9.3에는 `to_regclass`가 없어 `pg_catalog`를 본다.
         조회 자체가 실패하면 예외를 그대로 올린다 — 부재로 취급하지 않는다.
+
+        조회 **전에도** rollback한다. '오류 시 건너뛰기'에서 앞 파티션 export가 실패하면 원본
+        트랜잭션이 중단 상태로 남는다(`_export_partition`은 다음 파티션의 격리 수준 설정이 그 상태를
+        닫는다). 그대로 조회하면 'current transaction is aborted'로 실패한다(실DB 확인에서 발견).
         """
+        self.source_conn.rollback()
         try:
             with self.source_conn.cursor() as cur:
                 cur.execute(
@@ -967,10 +974,11 @@ class FileToPostgresArchiveWorker(ArchiveMigrationWorkerBase):
     def _absent_from_archive(self, partition_name: str) -> bool:
         """manifest에 항목이 없는 파티션이 아카이브에 **실제로** 없는가.
 
-        legacy에서 채택한 이력(`tolerate_absent_source`)이고 규칙상 파일 자리에도 파일이 없을
+        legacy 채택 때 보충한 이름(`absent_ok_partitions`)이고 규칙상 파일 자리에도 파일이 없을
         때만 True다. 항목은 없는데 파일이 있으면 manifest 누락(손상·변조)이므로 실패로 둔다.
+        원래 checkpoint가 manifest에 없으면 다른 아카이브를 골랐다는 신호이므로 실패로 둔다.
         """
-        if not self.tolerate_absent_source:
+        if partition_name not in self.absent_ok_partitions:
             return False
         try:
             path = self.archive_store.build_partition_file_path(partition_name)

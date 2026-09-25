@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import copy
 import os
+from datetime import datetime
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -322,19 +323,19 @@ class TestLegacyMultiTypeAdoption:
     """리뷰 major(H-08): 다중 유형 legacy 이력이 유형 경계에서 끊기면 뒤 유형이 통째로 없다.
 
     PH checkpoint만 남은 이력은 'PH만 고른 작업'과 'PH 뒤에서 끊긴 PH+PS(+RT/TH) 작업'을
-    로컬 데이터로 구분할 수 없다. 뒤 유형(PS·RT·TH)의 포함 여부를 사용자가 명시적으로 고르고,
-    기본값은 포함(보충)이다. ED는 생성 순서상 PH보다 앞이라 원래 선택하지 않은 것이 확실하다.
+    로컬 데이터로 구분할 수 없다. 뒤 유형(PS·RT·TH)의 포함 여부를 사용자가 유형마다 명시적으로
+    고른다 — **기본값이 없다**(리뷰 라운드 1: 기본 포함은 가장 흔한 PH 단일 유형 이력을 뒤 유형
+    보충, import에서는 대상 TRUNCATE로 바꾼다). ED는 생성 순서상 PH보다 앞이라 원래 선택하지
+    않은 것이 확실하다. 이력이 시작된 날에 없던 유형도 묻지 않는다.
     """
 
-    def test_trailing_types_are_supplemented_by_default(self, qtbot, db):
+    def test_trailing_types_chosen_to_include_are_supplemented(self, qtbot, db):
         hid = _legacy_history()
         dlg = _wizard(qtbot, _profile())
 
         with (
-            patch.object(
-                resume_guard.LegacyTypeChooser,
-                "exec",
-                return_value=resume_guard.QDialog.DialogCode.Accepted,
+            _choose(
+                ["point_history", "point_sec_history", "running_time_history", "trend_history"]
             ),
             patch.object(resume_guard.QMessageBox, "question", return_value=YES) as question,
         ):
@@ -349,6 +350,27 @@ class TestLegacyMultiTypeAdoption:
         assert dlg._frozen_selection == expected
         item = HistoryManager().get_history(hid)
         assert item is not None and item.planned_count == len(expected)
+
+    def test_accepting_the_chooser_without_deciding_writes_nothing(self, qtbot, db):
+        """'확인'만 눌러서는 어떤 유형도 포함·제외되지 않는다(기본값 없음, fail-closed)."""
+        hid = _legacy_history()
+        dlg = _wizard(qtbot, _profile())
+
+        with (
+            patch.object(
+                resume_guard.LegacyTypeChooser,
+                "exec",
+                return_value=resume_guard.QDialog.DialogCode.Accepted,
+            ),
+            patch.object(resume_guard.QMessageBox, "question", return_value=YES) as question,
+        ):
+            dlg._on_resume_clicked()
+
+        question.assert_not_called()
+        assert dlg.resume_mode is False
+        item = HistoryManager().get_history(hid)
+        assert item is not None and item.plan_version is None
+        assert _counts(db) == (1, 3)
 
     def test_unselected_types_are_not_in_the_warning(self, qtbot, db):
         _legacy_history()
@@ -383,27 +405,64 @@ class TestLegacyMultiTypeAdoption:
         assert item is not None and item.plan_version is None
         assert _counts(db) == (1, 3)
 
-    def test_chooser_defaults_to_including_every_trailing_type(self, qtbot, db):
+    def test_chooser_has_no_default_and_requires_every_decision(self, qtbot, db):
         hid = _legacy_history()
         coverage = HistoryManager().prepare_resume(hid, _profile()).legacy
         assert coverage is not None
 
-        chooser = resume_guard.LegacyTypeChooser(None, coverage)
+        chooser = resume_guard.LegacyTypeChooser(None, coverage, "postgres_to_postgres")
         qtbot.addWidget(chooser)
 
         # checkpoint가 있는 유형은 고를 대상이 아니다(항상 포함). 앞 유형(ED)은 보이지 않는다.
-        assert sorted(chooser.boxes) == [
+        assert sorted(chooser.choices) == [
             "point_sec_history",
             "running_time_history",
             "trend_history",
         ]
-        assert all(box.isChecked() for box in chooser.boxes.values())
-        chooser.boxes["point_sec_history"].setChecked(False)
-        assert chooser.chosen_types() == [
-            "point_history",
-            "running_time_history",
-            "trend_history",
-        ]
+        assert not any(
+            include.isChecked() or exclude.isChecked()
+            for include, exclude in chooser.choices.values()
+        )
+        assert not chooser.ok_button.isEnabled()
+        assert chooser.chosen_types() is None
+
+        chooser.choices["point_sec_history"][0].setChecked(True)
+        chooser.choices["running_time_history"][1].setChecked(True)
+        assert not chooser.ok_button.isEnabled()
+        assert chooser.chosen_types() is None
+
+        chooser.choices["trend_history"][1].setChecked(True)
+        assert chooser.ok_button.isEnabled()
+        assert chooser.chosen_types() == ["point_history", "point_sec_history"]
+
+    def test_import_chooser_says_including_empties_target_partitions(self, qtbot, db):
+        hid = _legacy_history()
+        coverage = HistoryManager().prepare_resume(hid, _profile()).legacy
+        assert coverage is not None
+
+        chooser = resume_guard.LegacyTypeChooser(None, coverage, "file_to_postgres")
+        qtbot.addWidget(chooser)
+
+        assert "비운 뒤" in chooser.intro.text()
+
+    def test_types_that_did_not_exist_yet_are_not_asked(self, qtbot, db):
+        """다중 유형 지원(2025-11-19) 전에 시작한 이력은 PH 단일 유형이 확실하다."""
+        hid = _legacy_history()
+        with db.session_scope() as s:
+            s.query(MigrationHistory).filter(MigrationHistory.id == hid).update(
+                {"started_at": datetime(2025, 11, 1, 10, 0)}
+            )
+        dlg = _wizard(qtbot, _profile())
+
+        with (
+            patch.object(resume_guard, "choose_original_types") as chooser,
+            patch.object(resume_guard.QMessageBox, "question", return_value=YES),
+        ):
+            dlg._on_resume_clicked()
+
+        chooser.assert_not_called()
+        assert dlg.resume_mode is True
+        assert dlg._frozen_selection == PLAN
 
 
 class TestArchiveResumeGate:
@@ -453,10 +512,16 @@ class TestArchiveResumeGate:
         _settle(dlg)
         return worker_cls
 
-    def test_adopted_legacy_archive_run_tolerates_absent_partitions(self, qtbot, db, tmp_path):
-        """H-09 리뷰 major: 보충한 '있을 수 있는 이름'이 원본에 없어도 작업이 끝날 수 있어야 한다."""
+    def test_adopted_legacy_archive_run_tolerates_only_supplemented_partitions(
+        self, qtbot, db, tmp_path
+    ):
+        """H-09 리뷰: 보충한 '있을 수 있는 이름'만 원본에 없어도 0건 완료로 닫는다.
+
+        리뷰 라운드 1: 원래 checkpoint(PLAN[:2])는 구버전이 실제로 고른 파티션이라, 없어졌다면
+        잘못된 원본·아카이브를 가리킨다 — 워커에 '없어도 되는 이름'으로 넘기지 않는다.
+        """
         archive = {"kind": "file", "archive_path": str(tmp_path / "a")}
-        _legacy_history()
+        _legacy_history(PLAN[:2])
         dlg = self._dialog(qtbot, _profile(SRC, archive))
 
         with (
@@ -469,7 +534,21 @@ class TestArchiveResumeGate:
 
         worker_cls.assert_called_once()
         assert worker_cls.call_args.args[1] == PLAN
-        assert worker_cls.return_value.tolerate_absent_source is True
+        assert worker_cls.return_value.absent_ok_partitions == frozenset({PLAN[2]})
+
+    def test_adopted_legacy_without_gaps_tolerates_nothing(self, qtbot, db, tmp_path):
+        archive = {"kind": "file", "archive_path": str(tmp_path / "a")}
+        _legacy_history()
+        dlg = self._dialog(qtbot, _profile(SRC, archive))
+
+        with (
+            _choose(["point_history"]),
+            patch.object(resume_guard.QMessageBox, "question", return_value=YES),
+        ):
+            dlg._on_resume_clicked()
+        worker_cls = self._start(dlg)
+
+        assert worker_cls.return_value.absent_ok_partitions == frozenset()
 
     def test_planned_archive_run_keeps_absent_partitions_failing(self, qtbot, db, tmp_path):
         archive = {"kind": "file", "archive_path": str(tmp_path / "a")}
@@ -480,7 +559,7 @@ class TestArchiveResumeGate:
         worker_cls = self._start(dlg)
 
         worker_cls.assert_called_once()
-        assert worker_cls.return_value.tolerate_absent_source is False
+        assert worker_cls.return_value.absent_ok_partitions == frozenset()
 
 
 # ---------------------------------------------------------------- M-12

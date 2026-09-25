@@ -9,11 +9,13 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from PySide6.QtWidgets import (
-    QCheckBox,
+    QButtonGroup,
     QDialog,
     QDialogButtonBox,
+    QGridLayout,
     QLabel,
     QMessageBox,
+    QRadioButton,
     QVBoxLayout,
     QWidget,
 )
@@ -25,6 +27,7 @@ from src.models.history import (
     ResumeVerdict,
     endpoint_label,
     legacy_creation_order,
+    legacy_supplement_note,
 )
 
 if TYPE_CHECKING:
@@ -63,13 +66,19 @@ class LegacyTypeChooser(QDialog):
 
     구버전은 checkpoint를 유형 코드 순서로 만들었으므로, checkpoint가 없는 **뒤 유형**은
     원래 선택하지 않았을 수도, 끊겨서 통째로 빠졌을 수도 있다. 로컬 기록으로는 구분할 수
-    없어 사용자가 정한다. 기본값은 **포함**이다 — 모르고 '확인'만 눌러도 빠진 유형을 버리지
-    않는다(원본에 없는 파티션은 0건 완료로 처리된다).
-    checkpoint가 있는 유형은 항상 포함, 순서상 앞의 빈 유형은 선택하지 않은 것이 확실해
-    보여 주지 않는다.
+    없어 사용자가 유형마다 '있었음(보충)'/'없었음(제외)'을 고른다.
+
+    **기본값이 없다**(리뷰 라운드 1). 기본 포함은 가장 흔한 PH 단일 유형 이력을 뒤 유형 범위
+    전체의 보충으로 바꾸고, import 경로에서는 대상 파티션을 묻지 않고 비운다. 기본 제외는
+    끊긴 다중 유형 작업을 subset 완료로 되돌린다. 그래서 모든 유형을 정하기 전에는 '확인'이
+    꺼져 있고, 정하지 않은 채 닫히면 아무것도 기록하지 않는다.
+    checkpoint가 있는 유형은 항상 포함한다. 순서상 앞의 빈 유형과 이력이 시작된 날에 없던
+    유형은 원래 작업에 있을 수 없어 묻지 않는다.
     """
 
-    def __init__(self, parent: QWidget | None, coverage: LegacyCoverage):
+    def __init__(
+        self, parent: QWidget | None, coverage: LegacyCoverage, migration_mode: str | None = None
+    ):
         super().__init__(parent)
         self.setWindowTitle("원래 작업의 항목 확인")
         self._represented = list(coverage.represented_types)
@@ -77,23 +86,51 @@ class LegacyTypeChooser(QDialog):
         present = ", ".join(_type_label(t) for t in self._represented) or "(없음)"
 
         layout = QVBoxLayout(self)
-        intro = QLabel(
-            "이 작업은 이전 버전에서 만들어져 어떤 항목을 골랐는지 기록이 없습니다.\n"
-            f"체크포인트가 남은 항목(항상 포함): {present}\n\n"
-            f"이전 버전은 항목 순서({order})로 체크포인트를 만들었기 때문에, 중간에 끊겼다면\n"
-            "아래 항목이 통째로 빠졌을 수 있습니다. 원래 작업에 없던 항목만 체크를 해제하세요.\n"
-            "체크된 항목은 기록된 날짜 범위 전체를 계획에 보충합니다(원본에 없는 파티션은 "
-            "0건 완료로 처리)."
-        )
-        intro.setWordWrap(True)
-        layout.addWidget(intro)
+        lines = [
+            "이 작업은 이전 버전에서 만들어져 어떤 항목을 골랐는지 기록이 없습니다.",
+            f"체크포인트가 남은 항목(항상 포함): {present}",
+        ]
+        if coverage.unavailable_types:
+            lines.append(
+                "이 작업을 시작할 때 도구에 없던 항목(제외): "
+                + ", ".join(_type_label(t) for t in coverage.unavailable_types)
+            )
+        lines += [
+            "",
+            f"이전 버전은 항목 순서({order})로 체크포인트를 만들었기 때문에, 중간에 끊겼다면 "
+            "아래 항목이 통째로 빠졌을 수 있습니다. 항목마다 원래 작업에 있었는지 고르세요. "
+            "기본값은 없습니다. 모르면 취소하고 원래 작업의 기록을 확인하세요.",
+            "",
+            "'있었음'을 고른 항목은 기록된 날짜 범위 전체를 계획에 보충합니다. "
+            + legacy_supplement_note(migration_mode),
+        ]
+        if migration_mode == "file_to_postgres":
+            lines.append(
+                "원래 작업에 없던 항목을 '있었음'으로 고르면 그 항목의 대상 데이터(아카이브 "
+                "이후에 쌓인 행 포함)가 아카이브 내용으로 덮어써질 수 있습니다."
+            )
+        self.intro = QLabel("\n".join(lines))
+        self.intro.setWordWrap(True)
+        layout.addWidget(self.intro)
 
-        self.boxes: dict[str, QCheckBox] = {}
-        for table_name, names in coverage.trailing_types.items():
-            box = QCheckBox(f"{_type_label(table_name)} — 범위 후보 {len(names):,}개")
-            box.setChecked(True)
-            self.boxes[table_name] = box
-            layout.addWidget(box)
+        # 유형마다 (있었음, 없었음) 라디오 한 쌍. 둘 다 꺼진 상태로 시작한다.
+        self.choices: dict[str, tuple[QRadioButton, QRadioButton]] = {}
+        grid = QGridLayout()
+        for row, (table_name, names) in enumerate(coverage.trailing_types.items()):
+            include = QRadioButton("있었음(보충)")
+            exclude = QRadioButton("없었음(제외)")
+            group = QButtonGroup(self)
+            group.addButton(include)
+            group.addButton(exclude)
+            include.toggled.connect(self._refresh)
+            exclude.toggled.connect(self._refresh)
+            grid.addWidget(
+                QLabel(f"{_type_label(table_name)} — 범위 후보 {len(names):,}개"), row, 0
+            )
+            grid.addWidget(include, row, 1)
+            grid.addWidget(exclude, row, 2)
+            self.choices[table_name] = (include, exclude)
+        layout.addLayout(grid)
 
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
@@ -101,16 +138,31 @@ class LegacyTypeChooser(QDialog):
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
+        ok_button = buttons.button(QDialogButtonBox.StandardButton.Ok)
+        assert ok_button is not None
+        self.ok_button = ok_button
+        self._refresh()
 
-    def chosen_types(self) -> list[str]:
-        """원래 작업에 포함된 유형: checkpoint가 있는 유형 + 체크된 뒤 유형."""
-        checked = [t for t, box in self.boxes.items() if box.isChecked()]
-        return sorted({*self._represented, *checked})
+    def decided(self) -> bool:
+        """모든 뒤 유형을 '있었음'이나 '없었음'으로 정했는가."""
+        return all(inc.isChecked() or exc.isChecked() for inc, exc in self.choices.values())
+
+    def _refresh(self, *_args: object) -> None:
+        self.ok_button.setEnabled(self.decided())
+
+    def chosen_types(self) -> list[str] | None:
+        """원래 작업에 포함된 유형(checkpoint가 있는 유형 + '있었음' 유형). 덜 정했으면 None."""
+        if not self.decided():
+            return None
+        included = [t for t, (inc, _exc) in self.choices.items() if inc.isChecked()]
+        return sorted({*self._represented, *included})
 
 
-def choose_original_types(parent: QWidget | None, coverage: LegacyCoverage) -> list[str] | None:
-    """원래 작업의 유형을 고르게 한다. 취소하면 None."""
-    chooser = LegacyTypeChooser(parent, coverage)
+def choose_original_types(
+    parent: QWidget | None, coverage: LegacyCoverage, migration_mode: str | None = None
+) -> list[str] | None:
+    """원래 작업의 유형을 고르게 한다. 취소했거나 다 정하지 않았으면 None(아무것도 쓰지 않음)."""
+    chooser = LegacyTypeChooser(parent, coverage, migration_mode)
     if chooser.exec() != QDialog.DialogCode.Accepted:
         return None
     return chooser.chosen_types()
@@ -144,7 +196,7 @@ def resolve_resume(
         if coverage.undecided_types:
             # 유형 경계에서 끊긴 다중 유형 작업은 누락이 gaps로 드러나지 않는다(H-08 리뷰).
             # 뒤 유형을 원래 작업에 넣을지 먼저 정하고, 그 결정으로 누락을 다시 계산한다.
-            original_types = choose_original_types(parent, coverage)
+            original_types = choose_original_types(parent, coverage, profile.migration_mode)
             if original_types is None:
                 return None
             try:

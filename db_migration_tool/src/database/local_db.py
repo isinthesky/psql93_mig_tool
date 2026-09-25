@@ -73,6 +73,9 @@ class MigrationHistory(Base):
     plan_fingerprint: Mapped[str | None] = mapped_column(String(64))
     # legacy 이력을 사용자가 확인하고 현재 endpoint에 묶은 시각
     legacy_adopted_at: Mapped[datetime | None] = mapped_column(DateTime)
+    # 채택 때 범위 대비 누락으로 보충한 파티션(JSON, 정렬). 명명 규칙으로 만든 '있을 수 있는
+    # 이름'이라 원본에 없을 수 있다 — 아카이브 워커는 이 이름만 원본 부재를 0건 완료로 닫는다.
+    legacy_supplemented: Mapped[str | None] = mapped_column(Text)
 
 
 class Checkpoint(Base):
@@ -211,6 +214,7 @@ class LocalDatabase:
         ("migration_history", "planned_hash", "VARCHAR(64)"),
         ("migration_history", "plan_fingerprint", "VARCHAR(64)"),
         ("migration_history", "legacy_adopted_at", "DATETIME"),
+        ("migration_history", "legacy_supplemented", "TEXT"),
     )
 
     def _migrate_schema(self):
