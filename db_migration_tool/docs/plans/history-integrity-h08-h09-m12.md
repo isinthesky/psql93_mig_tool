@@ -79,17 +79,25 @@ checkpoint bulk INSERT → commit한다. 어느 INSERT에서 실패하든 histor
      - `represented_types` = checkpoint가 하나라도 있는 유형 → 원래 선택된 것이 확실하다.
      - `excluded_types` = checkpoint가 없고 순서상 마지막 represented 유형보다 **앞**인 유형 → 선택했다면
        checkpoint가 먼저 생겼어야 하므로 선택하지 않은 것이 확실하다. 확인 창·경고에 넣지 않는다.
-     - `trailing_types` = checkpoint가 없고 순서상 **뒤**인 유형 → 선택하지 않았을 수도, 유형 경계에서
-       끊겨 통째로 빠졌을 수도 있다. 로컬 기록으로는 구분할 수 없으므로 **사용자가 정한다**
+     - `unavailable_types` = 이력이 시작된 날(`started_at`, 생성 때만 기록)에 도구에 아직 없던 유형
+       (`LEGACY_TYPE_INTRODUCED`) → 원래 작업에 들어갈 수 없다. 묻지도 경고하지도 않는다. 기준은 유형을
+       넣은 커밋 날짜다: 다중 유형(ED·RT·TH) 94f5cae 2025-11-19, PS b7dbb5b 2026-03-30. 배포는 커밋보다
+       늦으므로 '그 날짜 전'은 확실히 없던 때다(같은 날은 여전히 묻는다). `started_at`이 없으면 적용하지 않는다.
+     - `trailing_types` = checkpoint가 없고 순서상 **뒤**인 유형(unavailable 제외) → 선택하지 않았을 수도,
+       유형 경계에서 끊겨 통째로 빠졌을 수도 있다. 로컬 기록으로는 구분할 수 없으므로 **사용자가 정한다**
        (`original_types`를 주기 전에는 `undecided_types`).
    - `gaps` = (represented ∪ 포함하기로 한 유형)의 기대 파티션 중 checkpoint가 없는 것.
      `absent_types` = 계획에 넣지 않는 뒤 유형(미결정·제외)의 후보. `outside` = 범위 밖·규칙 밖
      checkpoint(계획에 그대로 둔다).
 3. UI(`resolve_resume`, `src/ui/dialogs/resume_guard.py`)
    - 뒤 유형이 있으면 먼저 **원래 작업의 항목 확인** 창(`LegacyTypeChooser`)을 띄운다. 뒤 유형마다
-     체크박스와 범위 후보 수를 보여 주고 **기본값은 포함(체크)**이다 — 모르고 '확인'만 눌러도 끊겨서
-     빠진 유형을 버리지 않는다. checkpoint가 있는 유형은 항상 포함(고를 수 없음), 앞 유형은 보이지 않는다.
-     취소하면 아무것도 쓰지 않는다. 마법사·아카이브 창의 `selected_table_types`는 쓰지 않는다 — 재개 버튼은
+     범위 후보 수와 '있었음(보충)'/'없었음(제외)' 한 쌍을 보여 주고 **기본값은 없다** — 모든 유형을 정하기
+     전에는 '확인'이 꺼져 있고, 정하지 않은 채 닫히면(취소 포함) 아무것도 쓰지 않는다. 기본 포함은 가장 흔한
+     PH 단일 유형 이력을 뒤 유형 범위 전체의 보충으로 바꾸고(import는 대상 파티션을 묻지 않고 비움), 기본
+     제외는 끊긴 다중 유형 작업을 subset 완료로 되돌리기 때문이다. 창에는 '있었음'을 골랐을 때 경로별로
+     무엇이 일어나는지(4번 표) 쓰고, import 경로에서는 원래 없던 항목을 고르면 대상 데이터(아카이브 이후에
+     쌓인 행 포함)가 덮어써질 수 있다고 따로 경고한다. checkpoint가 있는 유형은 항상 포함(고를 수 없음),
+     앞 유형은 보이지 않고, 시작한 날에 없던 유형은 '제외'로 안내만 한다. 마법사·아카이브 창의 `selected_table_types`는 쓰지 않는다 — 재개 버튼은
      1단계(연결)에 있어 그 값은 사용자가 고른 적 없는 기본값(PH)이기 때문이다.
    - 그 결정으로 `prepare_resume(..., original_types=...)`을 다시 계산한 뒤 예/아니오(기본 아니오)로 확인을
      받는다. 확인 창에는 다음을 수치로 보여 준다.
@@ -99,29 +107,37 @@ checkpoint bulk INSERT → commit한다. 어느 INSERT에서 실패하든 histor
      - 선택하지 않은 유형(앞 유형·사용자가 제외한 뒤 유형)은 보여 주지 않는다.
    - 범위를 해석할 수 없으면(빈 값·형식 오류·시작>끝) 채택 확인 없이 거부하고 폐기를 안내한다.
 4. "예"면 `adopt_legacy_history(..., supplement=gaps, original_types=...)`가 현재 identity와
-   **(남은 checkpoint ∪ 누락 보충분)**을 계획으로 한 번 기록하고 `legacy_adopted_at`을 남긴다.
+   **(남은 checkpoint ∪ 누락 보충분)**을 계획으로 한 번 기록하고 `legacy_adopted_at`과 **보충한 이름**
+   (`legacy_supplemented`, JSON 정렬 목록 — 이미 checkpoint가 있던 이름은 넣지 않는다)을 남긴다.
    - `gaps`를 전부 보충하지 않으면 `LegacyPlanGapError`, 뒤 유형의 포함 여부를 정하지 않으면
      (`original_types=None`인데 `trailing_types`가 있으면) `LegacyTypeDecisionError`로 거부한다(모델 계층
      규칙 — UI를 거치지 않는 호출도 subset 채택을 할 수 없다). 모르는 유형 이름은 `ValueError`.
    - `supplement`는 범위의 기대 파티션이어야 한다(범위 밖 이름은 `ValueError`).
-   - 보충 checkpoint INSERT와 계획 기록(조건부 UPDATE `plan_version IS NULL` + checkpoint 집합 재확인)을
-     **한 트랜잭션**에서 한다. 보충이 실패하면 계획 기록도 rollback되고, 두 번 채택되거나 확인 중 바뀐
+   - 보충 checkpoint INSERT와 계획·보충 이름 기록(조건부 UPDATE `plan_version IS NULL` + checkpoint 집합
+     재확인)을 **한 트랜잭션**에서 한다. 보충이 실패하면 계획 기록도 rollback되고, 두 번 채택되거나 확인 중 바뀐
      집합으로 채택되지 않는다.
-   - 보충분은 명명 규칙으로 만든 '있을 수 있는 이름'이다. 워커는 **원본에 실제로 없는** 파티션을 0건 완료로
-     닫는다(무결성 판정은 유지). 아카이브 워커는 채택한 이력(`legacy_adopted_at`)일 때만 이 규칙을 쓴다
-     (`tolerate_absent_source`) — 새로 만든 계획은 원본 목록에서 고른 파티션이라 없어졌으면 실패로 둔다.
-     | 경로 | '실제 부재'(0건 완료) | 여전히 실패 | 대상에 데이터가 있으면 |
+   - 보충분은 명명 규칙으로 만든 '있을 수 있는 이름'이다. 워커는 **원본에 실제로 없는** 보충분을 0건 완료로
+     닫는다(무결성 판정은 유지). 아카이브 워커는 이 규칙을 **보충한 이름에만** 쓴다(`absent_ok_partitions` =
+     채택한 이력의 `legacy_supplemented`). 같은 이력의 **원래 checkpoint**는 구버전이 실제 탐색·manifest 목록에서
+     고른 실존 파티션이므로, 원본에 없다면 잘못된 원본 DB나 다른 기간의 아카이브를 가리킨다는 신호다 — legacy는
+     identity를 확인할 수 없어 이것이 사실상 마지막 방어선이므로 실패로 둔다(존재 확인도 하지 않고 export·import
+     단계에서 원래대로 실패). 새로 만든 계획도 같다. 기록을 읽을 수 없으면 빈 집합(엄격)으로 본다.
+     | 경로 | 보충분의 '실제 부재'(0건 완료) | 여전히 실패 | 대상에 데이터가 있으면 |
      |---|---|---|---|
-     | PostgreSQL → PostgreSQL (copy) | 원본 DB에 테이블 없음 | 그 외 오류 | TRUNCATE 여부를 묻는다 |
-     | PostgreSQL → File (export) | `pg_catalog`에 relation 없음(권한과 무관, PG 9.3 호환) | 존재 확인 쿼리 실패, COUNT·COPY 실패 | 아카이브의 같은 파티션을 새로 내보낸 내용으로 교체 |
-     | File → PostgreSQL (import) | manifest 항목 **과** 규칙상 파일(`partitions/<이름>.csv`)이 모두 없음 | 항목만 없고 파일은 있음(manifest 누락), 항목은 있는데 파일 없음·체크섬 불일치 | 묻지 않고 비운 뒤 아카이브 내용으로 다시 적재(`truncate_mode="auto"`) |
+     | PostgreSQL → PostgreSQL (copy) | 원본 DB에 테이블 없음(copy 워커는 원래부터 모든 파티션에 이 규칙) | 그 외 오류 | TRUNCATE 여부를 묻는다 |
+     | PostgreSQL → File (export) | `pg_catalog`에 relation 없음(권한과 무관, PG 9.3 호환) | 원래 checkpoint·새 계획 파티션이 원본에 없음, 존재 확인 쿼리 실패, COUNT·COPY 실패 | 아카이브의 같은 파티션을 새로 내보낸 내용으로 교체 |
+     | File → PostgreSQL (import) | manifest 항목 **과** 규칙상 파일(`partitions/<이름>.csv`)이 모두 없음 | 원래 checkpoint·새 계획 파티션이 manifest에 없음, 항목만 없고 파일은 있음(manifest 누락), 항목은 있는데 파일 없음·체크섬 불일치 | 묻지 않고 비운 뒤 아카이브 내용으로 다시 적재(`truncate_mode="auto"`) |
 5. 채택 이후에는 일반 이력과 같이 엄격하게 검사한다(연결이 바뀌면 거부).
 6. checkpoint가 하나도 없는 legacy 이력은 유형 순서를 추정할 근거가 없으므로 채택을 거부하고 폐기를 안내한다.
    명명 규칙 밖 checkpoint만 있으면 모든 유형이 뒤 유형으로 취급되어 사용자가 전부 정한다.
 7. 한계
-   - 뒤 유형의 포함 여부는 사용자의 판단에 기댄다. 기본값이 '포함'이라 원래 PH만 고른 작업을 확인 없이
-     채택하면 PS·RT·TH의 범위 파티션까지 옮긴다(원본에 없으면 0건 완료, 대상에 데이터가 있으면 경로별 규칙).
-     누락보다 초과를 택한 fail-closed 기본값이다.
+   - 뒤 유형의 포함 여부는 사용자의 판단에 기댄다. 기본값이 없으므로 PH 단일 유형 이력(2026-03-30 이후
+     시작)도 PS·RT·TH를 하나씩 정해야 한다. 원래 없던 유형을 '있었음'으로 고르면 그 범위 파티션까지 옮긴다
+     (원본에 없으면 0건 완료, 대상에 데이터가 있으면 경로별 규칙 — import는 묻지 않고 비운다).
+   - 시작일 기준 제외는 로컬 시계와 `started_at`에 기댄다. 유형 도입 뒤 구버전 빌드로 시작한 이력은 제외되지
+     않고 묻는다(안전한 방향).
+   - v1.2.8에서 채택한 이력은 `legacy_supplemented`가 NULL이다. 그 이력의 아카이브 재개는 보충분도 원본
+     부재를 허용하지 않는다(엄격 — v1.2.8과 같은 동작). 필요하면 폐기하고 새 작업으로 진행한다.
    - 앞 유형 추론은 구버전 정렬 순서에 기댄다. 당시 사용자가 앞 유형의 파티션을 전부 체크 해제했다면 그
      유형은 선택하지 않은 것과 같게 처리된다(그 작업에 포함되지 않았으므로 결과는 같다).
    - 원본 DB 재스캔(실제 존재 목록과의 교집합)은 채택 시점에 하지 않는다. 재개 확인이 UI 스레드에서
@@ -145,7 +161,7 @@ checkpoint bulk INSERT → commit한다. 어느 INSERT에서 실패하든 histor
 `LocalDatabase._migrate_schema()`는 `PRAGMA table_info`로 없는 컬럼만 골라 한 트랜잭션으로
 `ALTER TABLE ... ADD COLUMN`한다(멱등). 예전처럼 모든 ALTER 예외를 삼키지 않는다 — 추가에 실패한 채
 올라가면 모든 이력 조회가 `no such column`으로 깨지기 때문이다. 구버전(1.0, 1.2.7) DB 파일 fixture로
-56건 이력·112건 checkpoint가 보존되고 새 컬럼이 NULL로 추가되는지 테스트한다.
+56건 이력·112건 checkpoint가 보존되고 새 컬럼(`legacy_supplemented` 포함)이 NULL로 추가되는지 테스트한다.
 
 ## 8. 테스트
 
@@ -153,10 +169,10 @@ checkpoint bulk INSERT → commit한다. 어느 INSERT에서 실패하든 histor
 |---|---|
 | `tests/models/test_history_plan_integrity.py` | N번째(첫/중간/마지막) checkpoint INSERT를 SQLite 트리거로 실패 → history·checkpoint 0건, 계획 기준 pending, 누락 보충, 계획 변조·계획 밖 checkpoint 차단 |
 | `tests/models/test_history_endpoint_identity.py` | 지문 규칙(비밀번호·SSL 무시, 각 identity 필드 반영, 비밀 미포함), identity·방향·mode·schema 변경 거부, 비밀번호 교체 허용, legacy 확인·채택 |
-| `tests/models/test_history_legacy_coverage.py` | legacy 채택 커버리지: 리뷰 재현(범위 3일·checkpoint 2개) 누락 보고, 보충 없는 채택 거부(무기록), 보충 채택 시 범위 전체 계획, 월 단위 누락, 범위 밖 checkpoint 유지, 범위 밖 보충 거부, 범위 해석 불가 거부, 보충 INSERT 실패 시 계획 기록까지 rollback. 다중 유형 끊김(`TestMultiTypeInterruption`): 유형 경계·유형 중간 끊김에서 뒤 유형 미결정 채택 거부(무기록), 포함한 뒤 유형 보충, 앞 유형·제외 유형은 경고에 없음, checkpoint 있는 유형은 제외 불가, 모르는 유형 거부 |
-| `tests/core/test_archive_absent_partitions.py` | 아카이브 워커의 원본 부재 처리: 채택 이력에서 manifest·파일 모두 없는 파티션 / 원본 DB에 없는 테이블은 0건 완료, 채택 이력이 아니면 실패, 항목 없이 파일만 있으면 실패, 항목은 있는데 파일 없으면 실패, 존재 확인 쿼리 실패는 부재가 아님 |
+| `tests/models/test_history_legacy_coverage.py` | legacy 채택 커버리지: 리뷰 재현(범위 3일·checkpoint 2개) 누락 보고, 보충 없는 채택 거부(무기록), 보충 채택 시 범위 전체 계획, 월 단위 누락, 범위 밖 checkpoint 유지, 범위 밖 보충 거부, 범위 해석 불가 거부, 보충 INSERT 실패 시 계획 기록까지 rollback. 다중 유형 끊김(`TestMultiTypeInterruption`): 유형 경계·유형 중간 끊김에서 뒤 유형 미결정 채택 거부(무기록), 포함한 뒤 유형 보충, 앞 유형·제외 유형은 경고에 없음, checkpoint 있는 유형은 제외 불가, 모르는 유형 거부. 보충 이름 기록(`TestSupplementRecord`): 보충한 이름만 기록(이미 있던 이름 제외), 누락 없으면 빈 기록, 새 계획은 빈 기록, 깨진 기록은 빈 집합. 시작일 기준 제외(`TestTypeIntroductionDate`): PS 도입 전 시작 이력은 PS를 묻지 않음, 다중 유형 도입 전 이력은 유형 결정 없이 채택, 도입 당일은 여전히 묻기, 시작 시각 없으면 전부 묻기 |
+| `tests/core/test_archive_absent_partitions.py` | 아카이브 워커의 원본 부재 처리: 보충한 이름(`absent_ok_partitions`)이 manifest·파일 모두 없음 / 원본 DB에 없는 테이블이면 0건 완료, 보충한 이름이 아니면 실패, **채택 이력의 원래 checkpoint가 manifest·원본 DB에 없으면 실패**(존재 확인도 하지 않음), 보충 경고 로그는 보충한 이름만, '오류 시 건너뛰기'에서 앞 파티션 export 실패로 원본 트랜잭션이 중단돼도 다음 보충분 확인은 동작(확인 전 rollback), 항목 없이 파일만 있으면 실패, 항목은 있는데 파일 없으면 실패, 존재 확인 쿼리 실패는 부재가 아님 |
 | `tests/database/test_local_db_schema_migration.py` | 구버전 DB 파일 fixture 업그레이드·멱등성 |
-| `tests/ui/test_history_guards.py` | 마법사 원자 생성 실패 시 orphan 0·워커 미시작, 두 다이얼로그의 재개 거부·허용·폐기·legacy 확인(누락 수치 표시·보충 채택·거절 시 무기록·범위 불명 거부), 원래 항목 확인 창(기본 포함으로 뒤 유형 보충, 선택하지 않은 유형은 확인 문구에 없음, 취소 시 무기록), 아카이브 채택 이력만 `tolerate_absent_source`, 프로필 삭제 차단·폐기 후 삭제·조회 실패 차단, 편집 경고 |
+| `tests/ui/test_history_guards.py` | 마법사 원자 생성 실패 시 orphan 0·워커 미시작, 두 다이얼로그의 재개 거부·허용·폐기·legacy 확인(누락 수치 표시·보충 채택·거절 시 무기록·범위 불명 거부), 원래 항목 확인 창(기본값 없음 — 모두 정하기 전 '확인' 비활성, 정하지 않고 수락해도 무기록, '있었음' 유형 보충, 선택하지 않은 유형은 확인 문구에 없음, 취소 시 무기록, import 경로 덮어쓰기 경고, 다중 유형 도입 전 이력은 창을 띄우지 않음), 아카이브 워커에는 채택 때 보충한 이름만 `absent_ok_partitions`(원래 checkpoint·새 계획은 빈 집합), 프로필 삭제 차단·폐기 후 삭제·조회 실패 차단, 편집 경고 |
 | `tests/models/test_e2e_tool_history_api.py` | `tools/e2e_verify_copy.py`가 새 API로 이력을 만들고 identity 게이트를 검사 |
 
 ## 9. 남은 한계
