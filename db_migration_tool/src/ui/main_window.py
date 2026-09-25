@@ -405,10 +405,10 @@ class MainWindow(QMainWindow):
         이력은 만들어질 때의 endpoint에 묶여 있으므로(H-08) 바꾸고 나면 그 작업은 재개가
         거부된다. 비밀번호·SSL만 바꾸는 것은 identity가 아니므로 묻지 않는다.
         """
-        changed = endpoint_fingerprint(profile.source_config) != endpoint_fingerprint(
-            profile_data.get("source_config")
-        ) or endpoint_fingerprint(profile.target_config) != endpoint_fingerprint(
-            profile_data.get("target_config")
+        before = self._recorded_endpoint_fingerprints(profile)
+        changed = before is None or before != (
+            endpoint_fingerprint(profile_data.get("source_config")),
+            endpoint_fingerprint(profile_data.get("target_config")),
         )
         if not changed:
             return True
@@ -429,6 +429,28 @@ class MainWindow(QMainWindow):
             QMessageBox.StandardButton.No,
         )
         return reply == QMessageBox.StandardButton.Yes
+
+    def _recorded_endpoint_fingerprints(self, profile) -> tuple[str, str] | None:
+        """편집 전 endpoint 지문(원본, 대상). 알 수 없으면 None(=변경으로 보고 묻는다).
+
+        잠긴 프로필(키를 쓸 수 없어 복호화하지 못한 행)은 설정이 기본값이라 비교 기준이
+        될 수 없다. 이때는 미완료 이력에 기록된 지문(H-08)을 기준으로 삼는다. 이력이 없거나
+        legacy라 지문이 없으면 None을 돌려주고, 경고 여부는 뒤의 미완료 작업 수 확인이 정한다.
+        """
+        if not getattr(profile, "locked", False):
+            return (
+                endpoint_fingerprint(profile.source_config),
+                endpoint_fingerprint(profile.target_config),
+            )
+        try:
+            history = self.vm.history_manager.get_incomplete_history(profile.id)
+        except Exception:
+            return None
+        if history is None:
+            return None
+        if not history.source_fingerprint or not history.target_fingerprint:
+            return None  # legacy 이력: 기록된 지문이 없다
+        return (history.source_fingerprint, history.target_fingerprint)
 
     def delete_connection(self):
         """연결 삭제 (ViewModel로 위임)

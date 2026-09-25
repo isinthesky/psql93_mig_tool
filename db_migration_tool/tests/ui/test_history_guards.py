@@ -334,7 +334,11 @@ def window():
     win.license_state = None
     win.vm.current_profile = MagicMock(id=1)
     win.vm.current_profile.name = "p"
-    for name in ("_delete_with_unfinished_work", "_confirm_identity_change"):
+    for name in (
+        "_delete_with_unfinished_work",
+        "_confirm_identity_change",
+        "_recorded_endpoint_fingerprints",
+    ):
         setattr(win, name, getattr(MainWindow, name).__get__(win))
     return win
 
@@ -423,3 +427,64 @@ class TestProfileEditIdentityWarning:
     def test_identity_edit_confirmed_saves(self, window):
         self._edit(window, SRC, dict(DST, database="temp"), YES)
         window.vm.update_profile.assert_called_once()
+
+
+class TestLockedProfileIdentityWarning:
+    """잠긴 프로필(w1-secrets)은 설정이 기본값이라 profile 설정과 비교할 수 없다.
+
+    복호화하지 못한 프로필의 설정은 localhost:5432 같은 기본값이므로, 예전처럼 profile
+    설정과 비교하면 같은 endpoint를 다시 입력해도 '변경됨'으로 판정돼 재개 불가 경고가
+    잘못 뜬다. 잠긴 프로필은 미완료 이력에 기록된 endpoint 지문과 비교한다.
+    """
+
+    def _edit_locked(self, window, history, new_src, new_dst, answer=NO):
+        db_row = MagicMock(id=1, created_at=None, updated_at=None)
+        db_row.name = "p"
+        locked = ConnectionProfile.locked_from_db_model(db_row, "키 없음")
+        window.vm.current_profile = locked
+        window.vm.history_manager.count_incomplete_histories.return_value = 1
+        window.vm.history_manager.get_incomplete_history.return_value = history
+        with (
+            patch("src.ui.main_window.ConnectionDialog") as dialog,
+            patch("src.ui.main_window.QMessageBox.question", return_value=answer) as question,
+        ):
+            dialog.return_value.exec.return_value = True
+            dialog.return_value.get_profile_data.return_value = {
+                "name": "p",
+                "source_config": new_src,
+                "target_config": new_dst,
+            }
+            MainWindow.edit_connection(window)
+        return question
+
+    @staticmethod
+    def _history(src, dst):
+        from src.models.history import MigrationHistoryItem, endpoint_fingerprint
+
+        return MigrationHistoryItem(
+            id=7,
+            profile_id=1,
+            status="failed",
+            plan_version=1,
+            source_fingerprint=endpoint_fingerprint(src),
+            target_fingerprint=endpoint_fingerprint(dst),
+        )
+
+    def test_reentering_recorded_endpoint_saves_without_warning(self, window):
+        question = self._edit_locked(window, self._history(SRC, DST), SRC, DST)
+        question.assert_not_called()
+        window.vm.update_profile.assert_called_once()
+
+    def test_different_endpoint_than_recorded_still_warns(self, window):
+        question = self._edit_locked(
+            window, self._history(SRC, DST), SRC, dict(DST, database="temp")
+        )
+        question.assert_called_once()
+        window.vm.update_profile.assert_not_called()
+
+    def test_legacy_history_without_fingerprint_warns(self, window):
+        from src.models.history import MigrationHistoryItem
+
+        legacy = MigrationHistoryItem(id=7, profile_id=1, status="failed")
+        question = self._edit_locked(window, legacy, SRC, DST)
+        question.assert_called_once()
