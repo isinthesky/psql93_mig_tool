@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from src.models.history import endpoint_fingerprint
 from src.ui.dialogs.connection_dialog import ConnectionDialog
 from src.ui.dialogs.file_archive_migration_dialog import FileArchiveMigrationDialog
 from src.ui.dialogs.history_dialog import HistoryDialog
@@ -344,25 +345,102 @@ class MainWindow(QMainWindow):
         dialog = ConnectionDialog(self, profile)
         if dialog.exec():
             profile_data = dialog.get_profile_data()
+            if not self._confirm_identity_change(profile, profile_data):
+                return
             self.vm.update_profile(profile.id, profile_data)
 
+    def _confirm_identity_change(self, profile, profile_data) -> bool:
+        """미완료 작업이 있는 프로필의 원본·대상을 바꾸려 하면 미리 알린다.
+
+        이력은 만들어질 때의 endpoint에 묶여 있으므로(H-08) 바꾸고 나면 그 작업은 재개가
+        거부된다. 비밀번호·SSL만 바꾸는 것은 identity가 아니므로 묻지 않는다.
+        """
+        changed = endpoint_fingerprint(profile.source_config) != endpoint_fingerprint(
+            profile_data.get("source_config")
+        ) or endpoint_fingerprint(profile.target_config) != endpoint_fingerprint(
+            profile_data.get("target_config")
+        )
+        if not changed:
+            return True
+        try:
+            unfinished = self.vm.history_manager.count_incomplete_histories(profile.id)
+        except Exception:
+            unfinished = 1  # 판정을 못 하면 있다고 보고 묻는다
+        if not unfinished:
+            return True
+        reply = QMessageBox.question(
+            self,
+            "연결 정보 변경",
+            f"'{profile.name}' 프로필에 끝나지 않은 작업이 있습니다.\n\n"
+            "원본·대상 연결(host·port·database·user 또는 경로)을 바꾸면 그 작업은 "
+            "이어서 진행할 수 없습니다(다른 대상으로 흩어지는 것을 막기 위해 거부됩니다).\n"
+            "비밀번호만 바꾸는 경우에는 재개할 수 있습니다.\n\n그래도 저장할까요?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        return reply == QMessageBox.StandardButton.Yes
+
     def delete_connection(self):
-        """연결 삭제 (ViewModel로 위임)"""
-        if self.vm.current_profile is None or self.vm.current_profile.id is None:
+        """연결 삭제 (ViewModel로 위임)
+
+        미완료(running/failed/partial) 작업이 있는 프로필은 그대로 지우지 않는다(M-12).
+        지우면 이력·체크포인트가 어떤 화면에서도 재개할 수 없는 orphan이 된다.
+        사용자가 명시적으로 폐기를 고른 경우에만 미완료 작업을 폐기(취소)한 뒤 삭제한다.
+        """
+        profile = self.vm.current_profile
+        if profile is None or profile.id is None:
+            return
+
+        try:
+            unfinished = self.vm.history_manager.count_incomplete_histories(profile.id)
+        except Exception as exc:
+            # 판정을 못 하면 지우지 않는다. 재개 게이트와 반대로 여기서는 막는 쪽이 안전하다.
+            QMessageBox.critical(
+                self,
+                "연결 프로필 삭제",
+                f"미완료 작업 여부를 확인하지 못해 삭제하지 않았습니다.\n\n{exc}",
+            )
+            return
+
+        if unfinished:
+            self._delete_with_unfinished_work(profile, unfinished)
             return
 
         # 무엇을 지우는지, 무엇이 남는지를 확인 창에서 그대로 말한다.
         reply = QMessageBox.question(
             self,
             "연결 프로필 삭제",
-            f"'{self.vm.current_profile.name}' 연결 프로필을 삭제할까요?\n\n"
+            f"'{profile.name}' 연결 프로필을 삭제할까요?\n\n"
             "작업 이력과 저장된 연결은 삭제되지 않습니다.",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         )
 
         if reply == QMessageBox.StandardButton.Yes:
-            self.vm.delete_profile(self.vm.current_profile.id)
+            self.vm.delete_profile(profile.id)
+
+    def _delete_with_unfinished_work(self, profile, unfinished: int) -> None:
+        """미완료 작업이 있는 프로필 — 기본은 차단, 명시적 폐기를 고르면 폐기 후 삭제."""
+        QMessageBox.warning(
+            self,
+            "연결 프로필 삭제",
+            f"'{profile.name}' 프로필에 끝나지 않은 작업 {unfinished}건이 있어 바로 삭제할 수 없습니다.\n\n"
+            "프로필을 지우면 그 작업은 어디에서도 이어서 진행할 수 없게 됩니다.\n"
+            "먼저 마이그레이션 창에서 '이어서 진행'으로 작업을 끝내는 것을 권장합니다.",
+        )
+        reply = QMessageBox.question(
+            self,
+            "미완료 작업 폐기 후 삭제",
+            f"미완료 작업 {unfinished}건을 폐기(취소 처리)하고 '{profile.name}' 프로필을 삭제할까요?\n\n"
+            "폐기한 작업은 다시 이어서 진행할 수 없습니다.\n"
+            "대상에 이미 옮긴 데이터와 작업 이력 기록은 지워지지 않습니다.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        self.vm.history_manager.abandon_incomplete_histories(profile.id)
+        self.vm.delete_profile(profile.id)
 
     def start_migration(self):
         """마이그레이션 시작"""

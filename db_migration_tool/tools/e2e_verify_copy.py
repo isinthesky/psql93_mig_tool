@@ -11,6 +11,11 @@ connection_status 참 개수를 각각 계산해 비교한다. 워커가 스스�
 - 로컬 이력 DB는 임시 폴더를 쓴다(실제 %APPDATA% 프로필·이력에 손대지 않음).
 - --drop-after를 주면 이 스크립트가 만든 테이블만 검증 후 삭제한다.
 
+이력은 앱과 같은 경로(`create_planned_history` — 이력+checkpoint+불변 계획을 한 트랜잭션)로
+만들고, 재개 시나리오는 `prepare_resume`이 돌려준 계획 기준 미완료 파티션으로 재개한다.
+재개 전에 endpoint를 바꾼 프로필은 거부되고 비밀번호만 바꾼 프로필은 허용되는지도 확인한다
+(로컬 이력 DB만 읽으며 원본·대상 DB에는 접근하지 않는다).
+
 비밀번호는 환경변수로만 받는다: DBMIG_E2E_SRC_PW, DBMIG_E2E_DST_PW
 
 예:
@@ -37,7 +42,7 @@ from PySide6.QtCore import QCoreApplication  # noqa: E402
 
 from src.core.copy_migration_worker import CopyMigrationWorker  # noqa: E402
 from src.database.local_db import LocalDatabase  # noqa: E402
-from src.models.history import CheckpointManager, HistoryManager  # noqa: E402
+from src.models.history import CheckpointManager, HistoryManager, ResumeVerdict  # noqa: E402
 from src.models.profile import ConnectionProfile  # noqa: E402
 from src.utils.app_paths import AppPaths  # noqa: E402
 
@@ -92,6 +97,26 @@ def _run(worker: CopyMigrationWorker) -> str | None:
         err = str(exc)
     print(f"    elapsed {time.time() - t0:.1f}s error={err}")
     return err
+
+
+def _identity_gate_ok(hm: HistoryManager, hid: int, src: dict, dst: dict) -> bool:
+    """H-08: 대상이 바뀐 프로필은 거부, 비밀번호만 바뀐 프로필은 허용되는가."""
+    moved = ConnectionProfile(
+        id=0,
+        name="e2e",
+        source_config=src,
+        target_config=dict(dst, database=f"{dst['database']}_moved"),
+    )
+    rotated = ConnectionProfile(
+        id=0,
+        name="e2e",
+        source_config=dict(src, password="rotated"),
+        target_config=dict(dst, password="rotated"),
+    )
+    refused = hm.prepare_resume(hid, moved).verdict is ResumeVerdict.IDENTITY_CHANGED
+    allowed = hm.prepare_resume(hid, rotated).allowed
+    print(f"    identity 게이트: 대상 변경 거부={refused}, 비밀번호 교체 허용={allowed}")
+    return refused and allowed
 
 
 def main() -> int:
@@ -149,7 +174,8 @@ def main() -> int:
             print("    대상에 이미 존재 — 덮어쓰지 않고 건너뜀")
             ok = False
             continue
-        hid = hm.create_history(profile_id=0, start_date="e2e", end_date="e2e").id
+        hid = hm.create_planned_history(profile, [table], "e2e", "e2e").id
+        assert hid is not None
         w = CopyMigrationWorker(
             profile, [table], hid, resume=False, batch_size=a.batch_size, copy_mode=mode
         )
@@ -167,11 +193,23 @@ def main() -> int:
         _run(w)
         if interrupt:
             print(f"    중단 시점 대상 {_aggregates(dst, table)[0]:,}행 → 재개")
-            _run(
-                CopyMigrationWorker(
-                    profile, [table], hid, resume=True, batch_size=a.batch_size, copy_mode=mode
+            if not _identity_gate_ok(hm, hid, src, dst):
+                ok = False
+            check = hm.prepare_resume(hid, profile)
+            print(f"    재개 검증 {check.verdict} pending={check.pending}")
+            if not check.allowed:
+                ok = False
+            elif check.pending:
+                _run(
+                    CopyMigrationWorker(
+                        profile,
+                        check.pending,
+                        hid,
+                        resume=True,
+                        batch_size=a.batch_size,
+                        copy_mode=mode,
+                    )
                 )
-            )
         cps = [c for c in cm.get_checkpoints(hid) if c.partition_name == table]
         status = cps[-1].status if cps else None
         s_agg, d_agg = _aggregates(src, table), _aggregates(dst, table)
