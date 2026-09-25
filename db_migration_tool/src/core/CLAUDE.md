@@ -29,6 +29,11 @@
 - 사후 검증(`RowCountVerifyWorker`)은 정확한 값이 목적이므로 `COUNT(*)`를 씁니다.
 - 진행량 기록은 워커의 성능 카운터가 아니라 **체크포인트 합계**를 씁니다. 카운터는 실행
   1회분만 세므로 재개하면 진행량이 뒤로 갑니다.
+- **파티션 완료 판정은 `CopyMigrationWorker._verify_partition_row_count()`의 원본·대상 `COUNT(*)`
+  일치로만 합니다**(Python COPY·Server COPY 공통). 다르면 예외 → 체크포인트 `failed`.
+- Python COPY의 `CopyStreamBuffer`: 행 수·마지막 키는 **소비자(대상에 넘긴 데이터)** 기준,
+  CSV 레코드 경계(`_CsvRecordTracker`, 따옴표 인식)로 셉니다. 커밋 전 `assert_fully_consumed()`로
+  생산량 == 소비량을 확인합니다. 취소·오류에서 `read()`는 짧은 EOF가 아니라 예외를 던집니다.
 
 ## 취소 규약
 조회 워커는 `isInterruptionRequested()`를 보고, `BaseMigrationWorker` 계열은 자체 `stop()`

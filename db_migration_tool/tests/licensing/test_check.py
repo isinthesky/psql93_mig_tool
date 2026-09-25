@@ -114,6 +114,39 @@ class TestTofu:
         assert check_license(NOW).status is LicenseStatus.VALID
 
 
+class TestFailClosed:
+    """감사 H-07 — 확인 과정의 예외가 '제한 없음'으로 새면 안 된다.
+
+    예전에는 예외가 main.py까지 올라가 license_state=None이 되었고, 메인 창은 None을
+    '제한 아님'으로 읽었다. `.activation`을 폴더로 바꾸는 것만으로 만료 키가 우회됐다.
+    """
+
+    def test_activation_path_is_a_directory(self, signing_key, app_dir):
+        _install(signing_key(expires=TODAY - timedelta(days=30)))
+        (app_dir / ".activation").mkdir()
+
+        state = check_license(NOW)  # 예외를 던지지 않는다
+
+        assert state.status is LicenseStatus.CHECK_FAILED
+        assert state.is_restricted
+        assert state.message
+
+    def test_machine_id_failure(self, signing_key, monkeypatch):
+        from src.licensing import machine
+
+        _install(signing_key())
+
+        def boom() -> str:
+            raise OSError("WMI unavailable")
+
+        monkeypatch.setattr(machine, "get_machine_id", boom)
+
+        state = check_license(NOW)
+
+        assert state.status is LicenseStatus.CHECK_FAILED
+        assert state.is_restricted
+
+
 class TestClockTampering:
     def test_turning_clock_back_is_caught(self, signing_key):
         _install(signing_key(expires=TODAY + timedelta(days=200)))

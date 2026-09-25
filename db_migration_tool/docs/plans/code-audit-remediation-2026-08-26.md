@@ -195,3 +195,23 @@
 9. 실제 DB·Windows 릴리스 matrix와 최종 독립 재감사
 
 각 작업 단위는 문제 재현 테스트, 최소 수정, 회귀 테스트, 운영 복구 절차를 함께 제출해야 한다.
+
+## 8. 진행 현황 (2026-09-25)
+
+브랜치 `fix/copy-integrity-license-failclosed`.
+
+| ID | 상태 | 수정 내용 |
+|---|---|---|
+| C-01 | 해결 | `CopyStreamBuffer`: 정상 종료(close)와 취소를 분리. close는 큐 빈자리를 기다려 종료 표시를 넣고 소비자는 끝까지 비운다. 취소·오류에서 `read()`는 예외를 던져 대상 COPY가 실패(커밋 안 됨). 커밋 전 `assert_fully_consumed()`(생산 문자 수 == 소비 문자 수). 행 수·마지막 키는 소비자 기준. |
+| C-02 | 해결 | `_CsvRecordTracker`: 따옴표 상태를 청크 사이에 이어 추적해 CSV 레코드 경계를 판정, 마지막 레코드만 `csv` 모듈로 분해. 따옴표 없는 청크는 기존 split 빠른 경로. 닫히지 않은 따옴표로 EOF면 오류. |
+| (신규) | 추가 | `_verify_partition_row_count()`: Python COPY·Server COPY 모두 완료 기록 전에 원본·대상 `COUNT(*)` 일치를 확인. 불일치면 `failed`. |
+| H-01 | 워커 측 해결 | `skip_on_error`로 건너뛴 파티션이 있으면 실행 끝에 예외 → UI가 이력을 `failed`로 유지, '이어서 시작'이 실패 파티션을 다시 잡는다. |
+| H-07 | 해결 | `check_license()`는 예외를 던지지 않고 `CHECK_FAILED`(제한 모드: 재개만 허용)를 돌려준다. `main.py`도 예외 시 `None` 대신 `CHECK_FAILED`. |
+
+검증
+- 단위 테스트 593 passed (기존 570 + 신규 23): `tests/core/test_copy_stream_integrity.py`(큐 크기 1/2/8 느린 소비자, 모든 청크 분할 지점, 무작위 분할 200회, 이스케이프 따옴표, 취소/오류), `tests/core/test_copy_worker_completeness.py`, `tests/licensing/test_check.py::TestFailClosed`.
+  - 수정 전 코드에서 C-01 테스트는 40행 중 마지막 8행(큐 크기와 동일)이 사라지는 것으로 재현됨.
+- 실DB E2E (bms93 PG 9.3 → bms30 `temp` PG 16, 파티션당 약 471만 행): Python COPY 전체, Server COPY 전체, Python COPY 5배치 후 중지→재개 — 세 경우 모두 원본·대상 `count`, `sum(path_id)`, `sum(issued_date)`, `sum(length(changed_value))`, `connection_status` 참 개수 일치. 테스트 파티션은 검증 후 삭제.
+- ruff format/check 통과. mypy는 기존 오류 1건(`src/ui/dialogs/log_viewer_dialog.py:387`, 이번 변경과 무관) 유지.
+
+남은 항목: H-02~H-06, H-08, H-09, M-01~M-14, 서명 릴리스(단계 5). 재감사 전까지 운영 승인 보류 원칙은 유지한다.

@@ -16,6 +16,10 @@
 
     MISSING > INVALID > WRONG_MACHINE > EXPIRED > EXPIRING > VALID
 
+확인 과정 자체가 예외로 실패하면(`.activation`이 폴더로 바뀜, 쓰기 권한 없음, 머신 ID 조회
+실패 등) `CHECK_FAILED` — 역시 제한 모드다. **예외를 밖으로 던지지 않는다.** 예전에는 예외가
+호출자까지 올라가 '확인 안 됨 = 제한 없음'으로 새어 나갔다(감사 H-07, fail-open).
+
 복합 조건(예: 만료됐는데 다른 PC이기도 함)은 앞선 것 하나로 결정된다.
 어차피 `EXPIRED`와 `WRONG_MACHINE`은 둘 다 제한 모드라 사용자가 겪는 차이는
 안내 문구뿐이다.
@@ -43,6 +47,7 @@ class LicenseStatus(Enum):
     MISSING = "missing"  # 키 파일이 없다
     INVALID = "invalid"  # 형식 오류·서명 불일치·미지원 버전
     WRONG_MACHINE = "wrong_machine"  # 다른 PC에서 활성화된 키
+    CHECK_FAILED = "check_failed"  # 확인 과정이 예외로 실패 — 제한 모드로 닫는다
 
     @property
     def is_restricted(self) -> bool:
@@ -77,7 +82,26 @@ def check_license(now: datetime | None = None) -> LicenseState:
     """라이선스를 확인한다. 앱 시작 시 **한 번만** 부른다.
 
     부작용: 활성화 레코드를 만들거나(TOFU 최초 실행) `last_seen`을 갱신한다.
+    어떤 예외도 밖으로 던지지 않는다 — 실패는 `CHECK_FAILED`(제한 모드)다.
     """
+    try:
+        return _check_license(now)
+    except Exception as exc:  # noqa: BLE001 — 확인 실패는 무엇이든 제한 모드로 닫는다
+        return check_failed_state(exc)
+
+
+def check_failed_state(exc: BaseException) -> LicenseState:
+    """확인 과정이 실패했을 때의 상태. 새 작업은 막고 중단된 작업의 재개는 허용한다."""
+    return LicenseState(
+        LicenseStatus.CHECK_FAILED,
+        message=(
+            f"라이선스 상태를 확인하지 못했습니다({type(exc).__name__}: {exc}). "
+            "제한 모드로 시작합니다 — 중단된 작업의 재개만 가능합니다."
+        ),
+    )
+
+
+def _check_license(now: datetime | None) -> LicenseState:
     now = now or datetime.now()
     today = now.date()
     machine_id = machine.get_machine_id()
@@ -161,6 +185,7 @@ __all__ = [
     "EXPIRING_SOON_DAYS",
     "LicenseState",
     "LicenseStatus",
+    "check_failed_state",
     "check_license",
     "register_key",
 ]

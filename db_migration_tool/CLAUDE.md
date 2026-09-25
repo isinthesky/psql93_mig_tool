@@ -84,6 +84,10 @@ installer\build_installer.bat              :: Inno Setup -> dist\installer\DBMig
 `docs/plans/code-audit-remediation-2026-08-26.md` 기준(commit `3813ac3`, app 1.2.5) — 이 계획을
 구현하고 재감사를 통과하기 전에는 **데이터 이관용 운영 배포에 적합하다고 승인할 수 없다.**
 
+**2026-09-25 수정(브랜치 `fix/copy-integrity-license-failclosed`)**: C-01, C-02, H-07, H-01(워커 측) 해결 +
+모든 복사 경로에 **파티션 완료 전 원본·대상 `COUNT(*)` 일치 검증** 추가. 상세·검증 결과는 감사 문서 §8.
+아래 원문 설명은 수정 전 상태 기록이다. 나머지 H-02~H-06, H-08, H-09, M-*는 미해결.
+
 - **C-01** — `CopyStreamBuffer.close()`가 큐 포화 시 취소 상태를 설정하지만 `read()`가 남은 데이터를
   비우지 않고 EOF를 반환한다. 대상에는 앞부분만 반영되는데 checkpoint는 전진할 수 있다
   (`src/core/copy_migration_worker.py:87-145,803-857`).

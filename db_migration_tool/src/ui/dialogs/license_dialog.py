@@ -28,6 +28,7 @@ _LAMP = {
     LicenseStatus.MISSING: ("idle", "미등록"),
     LicenseStatus.INVALID: ("error", "키 오류"),
     LicenseStatus.WRONG_MACHINE: ("error", "다른 PC"),
+    LicenseStatus.CHECK_FAILED: ("error", "확인 실패"),
 }
 
 

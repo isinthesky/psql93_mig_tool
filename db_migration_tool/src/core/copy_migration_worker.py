@@ -2,10 +2,12 @@
 PostgreSQL COPY 명령 기반 고성능 마이그레이션 워커
 """
 
+import csv
 import os
+import re
 import threading
 import time
-from queue import Empty, Queue
+from queue import Empty, Full, Queue
 from typing import Any
 
 import psycopg2
@@ -27,15 +29,83 @@ from src.utils.enhanced_logger import log_emitter
 from src.utils.validators import VersionValidator
 
 
-class CopyStreamBuffer:
-    """COPY OUT 데이터를 스트리밍으로 흘려보내며 마지막 키를 추적하는 버퍼
+class _CsvRecordTracker:
+    """PostgreSQL COPY ... (FORMAT CSV) 출력의 **레코드 경계**를 청크 단위로 추적한다.
 
-    - write(): 소스 COPY OUT이 호출, 큐에 청크를 적재하며 마지막 행 path_id/issued_date 추적
-    - read(): 대상 COPY IN이 호출, 큐에서 청크를 꺼내 전송 (EOF 시 빈 문자열 반환)
-    큐 크기를 제한해 한번에 전체 파티션을 메모리에 적재하지 않는다.
+    CSV에서 따옴표 안의 줄바꿈·쉼표는 데이터다. 물리 줄(split("\\n"))을 행으로 세면 행 수가
+    부풀고, 배치 마지막 행의 값에 줄바꿈이 있으면 값 조각을 재개 키로 기록하게 된다(감사 C-02).
+
+    - 따옴표 상태를 청크 사이에 이어서 추적한다. `""` 이스케이프는 토글이 두 번이라 자연히 상쇄된다.
+    - 따옴표가 전혀 없는 청크(대부분의 숫자 이력 데이터)는 기존처럼 split으로 빠르게 처리한다.
+    - 필드 분해는 마지막 레코드 하나만 `csv` 모듈로 한다.
     """
 
-    # write()가 큐에 넣을 때 최대 대기 시간 (초). 이 시간이 지나면 교착 대신 예외 발생
+    _SPECIAL = re.compile(r'["\n]')
+
+    def __init__(self) -> None:
+        self._pending = ""  # 아직 끝나지 않은 레코드
+        self._in_quotes = False
+        self._last_record: str | None = None
+        self.row_count = 0
+
+    def feed(self, data: str) -> None:
+        if not data:
+            return
+        if not self._in_quotes and '"' not in data and '"' not in self._pending:
+            lines = (self._pending + data).split("\n")
+            self._pending = lines.pop()
+            for line in lines:
+                if line:
+                    self.row_count += 1
+                    self._last_record = line
+            return
+
+        pending, in_q, start = self._pending, self._in_quotes, 0
+        for m in self._SPECIAL.finditer(data):
+            if m.group() == '"':
+                in_q = not in_q
+            elif not in_q:
+                end = m.start()
+                record = pending + data[start:end]
+                pending, start = "", end + 1
+                if record:
+                    self.row_count += 1
+                    self._last_record = record
+        self._pending = pending + data[start:]
+        self._in_quotes = in_q
+
+    def finish(self) -> None:
+        """EOF. 개행 없이 끝난 마지막 레코드를 확정한다."""
+        if self._in_quotes:
+            raise RuntimeError("COPY CSV 스트림이 닫히지 않은 따옴표로 끝났습니다")
+        if self._pending:
+            self.row_count += 1
+            self._last_record = self._pending
+            self._pending = ""
+
+    def last_fields(self) -> list[str] | None:
+        if self._last_record is None:
+            return None
+        record = self._last_record[:-1] if self._last_record.endswith("\r") else self._last_record
+        return next(csv.reader([record]))
+
+
+class CopyStreamBuffer:
+    """원본 COPY OUT → 대상 COPY IN 스트리밍 버퍼.
+
+    - write(): 원본 COPY OUT(생산자 스레드)이 호출. 청크를 제한 크기 큐에 넣는다.
+    - read(): 대상 COPY IN(소비자)이 호출. EOF면 "" 를 돌려준다.
+    - 행 수·마지막 키는 **소비자가 실제로 대상에 넘긴 데이터** 기준으로 센다.
+
+    정합성 규약(감사 C-01):
+    - 정상 종료(close)와 취소(cancel/set_error)는 다른 상태다. 정상 종료는 큐에 빈자리가 날
+      때까지 기다려 종료 표시를 넣고, 소비자는 그 표시까지 큐를 끝까지 비운다.
+    - 취소·오류에서 read()는 짧은 EOF가 아니라 **예외**를 던진다. 그래야 대상 COPY가
+      실패하고 커밋되지 않는다.
+    - 커밋 전 assert_fully_consumed()로 생산량 == 소비량을 확인한다.
+    """
+
+    # write()/close()가 큐 빈자리를 기다리는 최대 시간(초). 넘으면 교착 대신 오류로 끝낸다.
     _WRITE_TIMEOUT = 30
 
     def __init__(self, max_queue_size: int = 8, extra_track_indices: list[int] | None = None):
@@ -45,145 +115,132 @@ class CopyStreamBuffer:
             extra_track_indices: CSV에서 추가로 추적할 컬럼 인덱스 목록
                 (예: save_type이 columns[2]이면 [2] 전달)
         """
-        self.queue: Queue[str | bytes | None] = Queue(maxsize=max_queue_size)
-        self.last_key: str | None = None
-        self.last_date: str | None = None
-        self.last_extra: dict[int, str] = {}  # {csv_index: last_value}
+        self.queue: Queue[str | None] = Queue(maxsize=max_queue_size)
         self._extra_track_indices = extra_track_indices or []
-        self.row_count: int = 0
+        self._tracker = _CsvRecordTracker()
         self.total_bytes: int = 0
-        self._partial_line: str = ""
-        self._closed = False
+        self.produced_chars: int = 0
+        self.consumed_chars: int = 0
+        self._closed = False  # 생산자가 끝났다(더 쓰지 않는다)
+        self._eof = False  # 소비자가 종료 표시까지 다 읽었다
         self._cancel = threading.Event()
         self.error: Exception | None = None
 
-    def write(self, data: str | bytes):
-        """COPY OUT이 호출하는 write; 청크를 큐에 적재
+    # --- 소비자 기준 추적 결과 -------------------------------------------------
+    @property
+    def row_count(self) -> int:
+        return self._tracker.row_count
 
-        교착 방지: 큐가 가득 찬 상태에서 _WRITE_TIMEOUT 초 대기 후 예외 발생
-        """
+    def _last_field(self, idx: int) -> str | None:
+        fields = self._tracker.last_fields()
+        if fields is None or idx >= len(fields):
+            return None
+        return fields[idx]
+
+    @property
+    def last_key(self) -> str | None:
+        return self._last_field(0)
+
+    @property
+    def last_date(self) -> str | None:
+        return self._last_field(1)
+
+    @property
+    def last_extra(self) -> dict[int, str]:
+        fields = self._tracker.last_fields()
+        if fields is None:
+            return {}
+        return {i: fields[i] for i in self._extra_track_indices if i < len(fields)}
+
+    # --- 생산자 ---------------------------------------------------------------
+    def write(self, data: str | bytes):
+        """COPY OUT이 호출하는 write; 청크를 큐에 적재"""
         if self._closed or self._cancel.is_set():
             return
 
         # psycopg2는 bytes를 줄 수 있으므로 문자열로 변환
-        if isinstance(data, bytes):
-            data_str = data.decode("utf-8")
-        else:
-            data_str = data
+        data_str = data.decode("utf-8") if isinstance(data, bytes) else data
 
-        self._track_last_row(data_str)
+        self.produced_chars += len(data_str)
         self.total_bytes += len(data_str.encode("utf-8"))
         try:
-            self.queue.put(data, timeout=self._WRITE_TIMEOUT)
-        except Exception:
+            self.queue.put(data_str, timeout=self._WRITE_TIMEOUT)
+        except Full:
             if not self._cancel.is_set():
                 self.set_error(TimeoutError("CopyStreamBuffer.write() 큐 대기 시간 초과"))
 
-    def read(self, size: int = -1) -> str:
-        """COPY IN이 호출하는 read; 큐에서 꺼내 전달"""
-        if self.error:
-            raise self.error
+    def close(self):
+        """생산 종료(정상 EOF). 소비자가 큐를 비울 때까지 기다렸다가 종료 표시를 넣는다."""
+        if self._closed:
+            return
+        self._closed = True
+        deadline = time.monotonic() + self._WRITE_TIMEOUT
+        while not self._cancel.is_set():
+            try:
+                self.queue.put(None, timeout=0.2)
+                return
+            except Full:
+                if time.monotonic() > deadline:
+                    self.set_error(
+                        TimeoutError("CopyStreamBuffer.close() 종료 신호 전달 시간 초과")
+                    )
+                    return
 
-        if self._closed and self.queue.empty():
+    # --- 소비자 ---------------------------------------------------------------
+    def read(self, size: int = -1) -> str:
+        """COPY IN이 호출하는 read; 큐에서 꺼내 전달. 취소·오류는 예외로 알린다."""
+        self._raise_if_aborted()
+        if self._eof:
             return ""
 
         chunks: list[str] = []
-        bytes_read = 0
-
-        while size < 0 or bytes_read < size:
-            if self._cancel.is_set():
-                break
+        read_chars = 0
+        while size < 0 or read_chars < size:
             try:
                 chunk = self.queue.get(timeout=1)
             except Empty:
-                if self._closed or self._cancel.is_set():
-                    break
-                if self.error:
-                    raise self.error
+                self._raise_if_aborted()
                 continue
 
             if chunk is None:
-                self._closed = True
+                self._eof = True
+                self._tracker.finish()
                 break
 
-            # psycopg2 COPY IN은 str을 기대하므로 bytes면 디코드
-            if isinstance(chunk, bytes):
-                chunk_str = chunk.decode("utf-8")
-            else:
-                chunk_str = chunk
-
-            chunks.append(chunk_str)
-            bytes_read += len(chunk_str)
-
-            if size > 0 and bytes_read >= size:
-                break
+            chunks.append(chunk)
+            read_chars += len(chunk)
+            self.consumed_chars += len(chunk)
+            self._tracker.feed(chunk)
 
         return "".join(chunks)
 
-    def close(self):
-        """생산 종료 시 호출 (EOF 신호)"""
-        if self._partial_line:
-            self._finalize_partial_line()
+    def _raise_if_aborted(self) -> None:
+        if self.error:
+            raise self.error
+        if self._cancel.is_set():
+            raise RuntimeError("COPY 스트림이 취소되었습니다")
 
-        self._closed = True
-        # 큐가 가득 차 있어도 안전하게 종료 신호 전달
-        try:
-            self.queue.put_nowait(None)
-        except Exception:
-            # 큐가 가득 차면 cancel 이벤트로 소비자 깨움
-            self._cancel.set()
+    def assert_fully_consumed(self) -> None:
+        """커밋 직전 호출. 원본이 보낸 모든 데이터가 대상 COPY로 넘어갔는지 확인한다."""
+        self._raise_if_aborted()
+        if not self._eof or self.consumed_chars != self.produced_chars:
+            raise RuntimeError(
+                "COPY 스트림 불완전 — 커밋하지 않습니다: "
+                f"생산 {self.produced_chars:,}자 / 소비 {self.consumed_chars:,}자 (EOF={self._eof})"
+            )
 
+    # --- 중단 -----------------------------------------------------------------
     def cancel(self):
         """양쪽 스레드를 강제 해제하기 위한 취소"""
         self._cancel.set()
         self._closed = True
 
     def set_error(self, exc: Exception):
-        """프로듀서에서 발생한 오류를 기록"""
-        self.error = exc
+        """프로듀서/컨슈머에서 발생한 오류를 기록하고 양쪽을 멈춘다"""
+        if self.error is None:
+            self.error = exc
         self._cancel.set()
-        self.close()
-
-    def _track_last_row(self, data: str):
-        """마지막 행 키와 행 수 추적 (청크 경계 고려)"""
-        combined = self._partial_line + data
-        lines = combined.split("\n")
-        self._partial_line = lines.pop()  # 마지막 조각은 다음 청크와 합치기
-
-        for line in lines:
-            if not line:
-                continue
-
-            self.row_count += 1
-            parts = line.split(",")
-            try:
-                self.last_key = parts[0]
-                self.last_date = parts[1]
-            except IndexError:
-                continue
-            # 추가 PK 컬럼 추적
-            for idx in self._extra_track_indices:
-                if idx < len(parts):
-                    self.last_extra[idx] = parts[idx]
-
-    def _finalize_partial_line(self):
-        """마지막 미완성 행 정리 (COPY OUT이 개행 없이 끝난 경우)"""
-        line = self._partial_line
-        self._partial_line = ""
-
-        if not line:
-            return
-
-        self.row_count += 1
-        parts = line.split(",")
-        try:
-            self.last_key = parts[0]
-            self.last_date = parts[1]
-        except IndexError:
-            pass
-        for idx in self._extra_track_indices:
-            if idx < len(parts):
-                self.last_extra[idx] = parts[idx]
+        self._closed = True
 
 
 class CopyMigrationWorker(BaseMigrationWorker):
@@ -278,6 +335,8 @@ class CopyMigrationWorker(BaseMigrationWorker):
 
             # 성능 지표 초기화
             self.performance_metrics.total_partitions = len(self.partitions)
+            # skip_on_error로 건너뛴 파티션. 하나라도 있으면 실행을 '완료'로 끝내지 않는다.
+            skipped: list[str] = []
 
             # 각 파티션 처리
             for i, partition in enumerate(self.partitions):
@@ -345,8 +404,17 @@ class CopyMigrationWorker(BaseMigrationWorker):
                             "WARNING",
                             f"{partition} - 오류 발생, 건너뛰고 계속 진행: {str(e)}",
                         )
+                        skipped.append(partition)
                         continue
                     raise
+
+            if self.is_running and skipped:
+                # 건너뛴 파티션을 두고 '완료'로 끝내면 이력이 completed가 되어 재개 대상에서
+                # 사라진다(감사 H-01). 실패로 끝내 '이어서 시작'이 실패 파티션을 다시 잡게 한다.
+                raise RuntimeError(
+                    f"{len(skipped)}개 파티션이 실패해 건너뛰었습니다: {', '.join(skipped)}. "
+                    "나머지는 완료되었습니다. '이어서 시작'으로 실패한 파티션만 다시 시도할 수 있습니다."
+                )
 
             if self.is_running:  # 정상 완료
                 final_stats = self.performance_metrics.get_stats()
@@ -815,9 +883,10 @@ class CopyMigrationWorker(BaseMigrationWorker):
                     raise Exception(
                         f"{partition_name} COPY producer 스레드가 시간 내 종료되지 않음"
                     )
-                if stream_buffer.error:
-                    raise stream_buffer.error
+                # 원본이 보낸 데이터가 전부 대상 COPY로 넘어갔을 때만 커밋한다(감사 C-01).
+                stream_buffer.assert_fully_consumed()
                 self.target_conn.commit()
+                # 행 수·마지막 키는 소비자(대상에 넘긴 데이터) 기준, CSV 레코드 경계로 센 값이다.
                 copied_rows = int(stream_buffer.row_count or 0)
                 if copied_rows == 0:
                     break
@@ -858,6 +927,8 @@ class CopyMigrationWorker(BaseMigrationWorker):
                 self._emit_performance_metrics()
             if not self.is_running:
                 return
+            # 전송 경로가 센 값이 아니라 원본·대상 COUNT(*)로 완료를 판정한다.
+            accumulated_rows = self._verify_partition_row_count(partition_name)
             self.performance_metrics.complete_partition()
             self._update_checkpoint_completed(
                 checkpoint,
@@ -1027,7 +1098,8 @@ class CopyMigrationWorker(BaseMigrationWorker):
             self.performance_metrics.update(copied_rows, estimated_bytes)
             self._emit_performance_metrics(force=True)
 
-            # 10. 파티션 완료
+            # 10. 행 수 검증 후 파티션 완료 (원본·대상 COUNT(*))
+            copied_rows = self._verify_partition_row_count(partition_name)
             self.performance_metrics.complete_partition()
             self._update_checkpoint_completed(checkpoint, copied_rows, copy_method="COPY_SRV")
             self._emit_performance_metrics(force=True)
@@ -1060,6 +1132,37 @@ class CopyMigrationWorker(BaseMigrationWorker):
                     bytes_transferred=self.performance_metrics.total_bytes,
                 )
             raise Exception(f"{partition_name} Server-side COPY 실패: {str(e)}")
+
+    def _verify_partition_row_count(self, partition_name: str) -> int:
+        """원본과 대상 파티션의 COUNT(*)가 정확히 같은지 확인하고 그 값을 돌려준다.
+
+        완료 판정의 유일한 근거다. 워커 카운터·rows_processed는 전송 경로가 센 값이라
+        전송 중 누락이 생기면 같이 틀린다. 다르면 예외 → 체크포인트는 failed로 남는다.
+        원본 파티션이 이관 중에 바뀌었을 때(오늘 날짜 등)도 여기서 드러난다.
+        """
+        query = sql.SQL("SELECT COUNT(*) FROM {}").format(sql.Identifier(partition_name))
+
+        with self.source_conn.cursor() as cur:
+            cur.execute(query)
+            row = cur.fetchone()
+            source_rows = int(row[0]) if row else 0
+        with self.target_conn.cursor() as cur:
+            cur.execute(query)
+            row = cur.fetchone()
+            target_rows = int(row[0]) if row else 0
+        try:
+            self.target_conn.commit()  # 조회 트랜잭션을 닫는다
+        except Exception:
+            pass
+
+        if source_rows != target_rows:
+            raise RuntimeError(
+                f"{partition_name} 행 수 불일치 — 원본 {source_rows:,} / 대상 {target_rows:,}. "
+                "완료로 기록하지 않습니다. 원본이 이관 중 바뀌지 않았는지 확인하고, "
+                "이 파티션을 처음부터 다시 이관하세요(기존 데이터 삭제 후 새 작업)."
+            )
+        self._log(f"{partition_name} 행 수 검증 통과: 원본 = 대상 = {source_rows:,}", "SUCCESS")
+        return source_rows
 
     def _prepare_target_table(
         self,

@@ -100,15 +100,16 @@ def main():
     # 라이선스 확인 — DB 초기화 뒤, 창을 띄우기 전에 딱 한 번만 한다.
     # 실행 중에는 다시 확인하지 않는다. 마이그레이션이 도는 도중 만료됐다고
     # 작업을 끊으면 소스와 대상이 어긋난 채로 남는다.
-    from src.licensing import check_license
+    from src.licensing import check_failed_state, check_license
 
     try:
         license_state = check_license()
     except Exception as e:
-        # 라이선스 확인이 실패했다고 도구를 못 쓰게 만들지 않는다.
-        # 중단된 마이그레이션을 재개해야 할 수도 있다.
+        # check_license()는 예외를 던지지 않지만, 만약을 위해 여기서도 제한 모드로 닫는다.
+        # 제한 모드도 중단된 마이그레이션의 재개는 허용하므로 도구가 잠기지 않는다.
+        # (None을 넘기면 메인 창이 '제한 아님'으로 읽는다 — 감사 H-07 fail-open)
         print(f"Warning: 라이선스 확인 실패 ({e})")
-        license_state = None
+        license_state = check_failed_state(e)
 
     window.set_license_state(license_state)
 
