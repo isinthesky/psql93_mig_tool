@@ -384,9 +384,9 @@ class LogViewerDialog(QDialog):
                 self.session_filter.clear()
                 self.session_filter.addItem("전체 세션")
 
-                for session_id, start_time in sessions:
+                for session_id, started_at in sessions:
                     if session_id:
-                        display_text = f"{session_id} - {start_time.strftime('%m/%d %H:%M')}"
+                        display_text = f"{session_id} - {started_at.strftime('%m/%d %H:%M')}"
                         self.session_filter.addItem(display_text)
 
                 # 이전 선택 복원

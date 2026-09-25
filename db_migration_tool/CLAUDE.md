@@ -77,6 +77,8 @@ installer\build_installer.bat              :: Inno Setup -> dist\installer\DBMig
 - 공개키: `NIVHG532XSXX7YERKROEOP3SKSP5VNODHIJ7URFKQ43Y747KR5DQ`
   (`src/licensing/keys.py`의 `LICENSE_PUBLIC_KEY_B32`, 발급 서버의 서명키와 쌍).
   **키 형식·서명 규칙을 바꾸면 앱/서버 양쪽을 함께 수정**하고 공개키 일치 여부를 확인한다.
+- 공용 테스트 벡터: `tests/licensing/fixtures/dbmt1_vectors.json` + `tests/licensing/test_dbmt1_vectors.py`.
+  원본 생성기는 서버 `scripts/dbmt1_test_vectors.py`(테스트 전용 시드). 파일을 이쪽에서 직접 고치지 않는다.
 - 검사 진입점은 `check_license()`(`src/licensing/__init__.py`) 하나뿐이며 앱 시작 시 1회만 호출한다
   (§6 H-07 참고).
 
