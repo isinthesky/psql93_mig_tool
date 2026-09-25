@@ -215,3 +215,20 @@
 - ruff format/check 통과. mypy는 기존 오류 1건(`src/ui/dialogs/log_viewer_dialog.py:387`, 이번 변경과 무관) 유지.
 
 남은 항목: H-02~H-06, H-08, H-09, M-01~M-14, 서명 릴리스(단계 5). 재감사 전까지 운영 승인 보류 원칙은 유지한다.
+
+### 8.1 릴리스·배포 경로 (M-06 ~ M-11) — 브랜치 `audit/w1-release`
+
+| ID | 상태 | 수정 내용 | 남은 것 |
+|---|---|---|---|
+| M-06 | 해결 | `tools/issue_license.py`: 개인키를 PKCS#8 PEM + `BestAvailableEncryption`으로만 저장(`O_EXCL`, POSIX 0600 / Windows `icacls`). 패스프레이즈는 getpass 또는 `DBMT_ISSUER_KEY_PASSPHRASE`만(CLI 인자 없음, `allow_abbrev=False`), 새 키는 12바이트 이상. 그룹·기타 권한이 열린 키는 거부. 키 ID = 공개키 SHA-256 fingerprint를 생성·발급·조회 때 출력. 평문 키(raw 32B·비암호 PEM)는 패스프레이즈를 묻기 전에 거부하고 `--convert-legacy`로 변환만 허용(원본은 사람이 폐기). docstring·`LICENSE_GUIDE.md`에 rotation·폐기 절차와 "운영 발급은 라이선스 서버 signer, 이 도구는 개발·비상용" 명시. 리뷰 지적(서버 signer는 raw 32바이트만 읽어 교체 절차가 그대로는 실행되지 않음)에 따라 `--export-signer-raw <새 경로>` 추가. 암호화 원본에서만, O_EXCL·0600, 덮어쓰기 거부, 평문 경고·폐기 안내, 키 ID·`EXPECTED_PUBLIC_KEY_B32` 출력. 내보낸 raw로는 도구가 발급하지 않음. 교체 절차에 두 형식과 서버 배치·`match` 확인 단계를 명시. | 기존 평문 키 사본이 있다면 변환 후 폐기(운영 작업). 서버 signer가 암호화 PEM+패스프레이즈 secret을 읽도록 바꾸기(라이선스 서버 저장소 후속) |
+| M-07 | 해결(Windows 설치 smoke 대기) | `.iss`: `/LICENSEKEY=`를 감지하면 값은 기록하지 않고 설치 중단, 무음 설치는 `/LICENSEFILE=<경로>`(읽기 실패·빈 파일이면 중단). 입력 필드 마스킹(`Add(..., True)`), 키 값 `Log()` 없음. 씨앗을 `{app}\seed\license.seed`로 옮기고 `[Dirs] users-modify`로 일반 사용자 앱이 지울 수 있게 함. 1.2.7 이하 `{app}\license.seed`는 업그레이드가 이동·삭제. 앱: `activation.discard_seed()`가 `activate`/`touch` 직후(=등록 성공) 사용자 폴더에 `license.key`가 저장된 경우에만 씨앗 삭제, 실패는 비치명·다음 실행 재시도. | clean VM에서 관리자/사용자 설치·무음 설치·업그레이드 smoke(릴리스 단계) |
+| M-08 | 해결 | `uv.lock` 추적(`.gitignore`에서 제거, 루트 `.gitattributes`에 `uv.lock text eol=lf`). `build.bat`은 `uv sync --locked --all-extras`(lock drift면 실패, `uv pip install` 제거). `tools/bump_version.py`가 lock 안의 프로젝트 버전도 함께 올려 다음 빌드의 `--locked`가 깨지지 않음. 업데이트 절차는 `BUILD_GUIDE.md` "의존성 lock". | CI 부재 — lock 강제는 build.bat에서만 |
+| M-09 | 해결 | `installer/verify_prerequisites.ps1` + `installer/prerequisites.sha256`: 고정 SHA-256 일치, `Get-AuthenticodeSignature` Valid, 서명자 CN·O = Microsoft Corporation, 타임스탬프 존재를 모두 만족해야 `build_installer.bat`이 ISCC를 실행. 고정값은 my-wsl-01 `dist\prerequisites\vc_redist.x64.exe`를 읽기 전용 확인(14.44.35211.0, `CC0FF0EB…096B713B`, 서명자 thumbprint `8F985BE8…1A1DB975`, Microsoft Time-Stamp). 갱신 절차는 `BUILD_GUIDE.md`. | — |
+| M-10 | 해결(회귀 검사 추가) | 원인은 LF 줄바꿈 UTF-8 배치를 `cmd.exe`가 잘못 끊어 읽은 것. 루트 `.gitattributes`(`*.bat/*.cmd/*.ps1/*.iss eol=crlf`)가 이미 정규화했고 1.2.7을 이 상태로 빌드함. `tests/release/test_windows_script_encoding.py`가 `git check-attr eol`=crlf, 작업 트리 bare LF 0, 파일별 인코딩(build·installer bat UTF-8 무BOM + `chcp 65001`, `.iss` UTF-8 BOM, `.ps1` ASCII, `run_dev.bat` CP949)을 고정. LF 1개 파일 주입 시 실패함을 확인. | clean Windows VM CI에서 직접 실행 |
+| M-11 | 부분(훅만) | 인증서가 없어 실제 서명 불가. `installer/codesign.ps1`: `CODESIGN_CERT_THUMBPRINT` 또는 `CODESIGN_PFX`+`CODESIGN_PFX_PASSWORD`(PFX는 실행 중에만 CurrentUser\My에 가져와 비밀번호가 signtool 명령줄에 안 나옴)가 있으면 `signtool sign /fd SHA256 /tr <ts> /td SHA256` → `signtool verify /pa` → `Get-AuthenticodeSignature` Valid+타임스탬프 확인. 없으면 `WARNING: UNSIGNED BUILD` 배너, `CODESIGN_REQUIRED=1`이면 실패. `build.bat`(exe)·`build_installer.bat`(서명 상태 확인 + 설치본 서명)에 연결. | 코드서명 인증서 조달, `unins000.exe` 서명(Inno `SignTool=`), 릴리스 gate에서 `CODESIGN_REQUIRED=1` |
+
+검증 (2026-09-25)
+- 단위 테스트 666 passed(기준 607 + 신규 59): `tests/release/test_issue_license.py`(21, 리뷰 수리 후 32 — 전체 677), `tests/release/test_release_scripts.py`(21), `tests/release/test_windows_script_encoding.py`(9), `tests/licensing/test_activation.py` 씨앗 수명 8. 신규 테스트는 구현 전 기능 부재로 실패함을 먼저 확인.
+- ruff format/check, mypy(src) 통과. `uv lock --check`가 Mac uv 0.11.16과 Windows 호스트 버전 uv 0.10.4(uvx) 모두 통과.
+- my-wsl-01 **출력 없는** 확인(임시 폴더 `C:\Temp`에서 실행 후 삭제, 저장소·dist 무변경): `verify_prerequisites.ps1` 실제 파일 exit 0 / 틀린 해시·다른 서명자(notepad, CN=Microsoft Windows)·파일 없음 exit 1. `codesign.ps1` 인증서 없음 → UNSIGNED 배너 exit 0, `CODESIGN_REQUIRED=1` → exit 1, `-CheckOnly` Microsoft 서명 파일 → OK. 버전 추출 `for /f` → `1.2.7`. `ISCC /O-`(산출물 비활성)로 새 `.iss` `[Code]` 컴파일 성공, 일부러 주석을 깨뜨린 사본은 `Syntax error`로 실패(음성 대조).
+- 실제 Windows 빌드(`build.bat`/`build_installer.bat` 전체 실행)와 설치 smoke는 릴리스 단계에서 수행한다.

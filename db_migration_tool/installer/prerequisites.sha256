@@ -1,0 +1,13 @@
+# Pinned SHA-256 of third-party files bundled from dist\prerequisites (audit M-09).
+# installer\verify_prerequisites.ps1 (called by build_installer.bat) refuses to build
+# unless each file matches this hash AND carries a valid, timestamped Authenticode
+# signature from "Microsoft Corporation".
+#
+# vc_redist.x64.exe
+#   Microsoft Visual C++ 2015-2022 Redistributable (x64) 14.44.35211.0, 25635768 bytes
+#   signer : CN=Microsoft Corporation (issuer: Microsoft Code Signing PCA 2011)
+#   signer thumbprint 8F985BE8FD256085C90A95D3C74580511A1DB975, timestamped
+#   recorded 2026-09-25 read-only from my-wsl-01 dist\prerequisites
+#
+# Update procedure: see BUILD_GUIDE.md "VC++ prerequisite".
+cc0ff0eb1dc3f5188ae6300faef32bf5beeba4bdd6e8e445a9184072096b713b  vc_redist.x64.exe

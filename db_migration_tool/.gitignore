@@ -132,8 +132,8 @@ env.bak/
 venv.bak/
 
 # uv
+# uv.lock 은 추적한다(감사 M-08 — 재현 가능한 빌드). build.bat 이 `uv sync --locked` 로 강제한다.
 .python-version
-uv.lock
 .ruff_cache/
 
 # Spyder project settings

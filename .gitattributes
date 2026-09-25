@@ -6,3 +6,5 @@
 *.cmd text eol=crlf
 *.ps1 text eol=crlf
 *.iss text eol=crlf
+# uv.lock 은 모든 체크아웃에서 LF(autocrlf=true 인 Windows 포함). bump_version 이 바이트로 고친다.
+uv.lock text eol=lf
