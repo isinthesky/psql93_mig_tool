@@ -361,3 +361,32 @@ temp `partition_table_info`에 남은 세 행도 지웠다.
 
 검증: 단위 1111 passed / 3 skipped / 21 deselected(wave2 대비 +41), ruff format·check, mypy(61 files) 통과.
 실DB E2E는 하지 않았다. 종료 경로는 DB 쪽 동작이 wave2 중지 경로와 같고, 미커밋 배치는 연결 종료로 롤백된다.
+
+### 8.6 D2 릴리스 — 1.2.8 (my-wsl-01, 2026-09-25)
+
+main `b678338`에서 Windows 빌드. 릴리스 커밋 `c1b17cf`, 태그 `v1.2.8`.
+
+| 단계 | 결과 |
+|---|---|
+| 실데이터 백업 | 어떤 실행보다 먼저 `%APPDATA%`(= `C:\Users\hijde\AppData\Roaming`)의 앱 파일(`db_migration.db`, 옛 `db_migration.backup-*.db`, `.encryption_key`, `profile_fernet.key`, `.activation`, `license.key`, `logs\`)과 개발 실행 데이터(`Python\`의 DB·키·로그, `pytest-qt-qapp\`)를 `DBMigrationTool-backup-20260925\`로 복사했다. 29개 파일 SHA-256 29/29 일치. 설치 앱과 실프로필 통합 테스트는 모두 `%APPDATA%` 루트를 쓴다 |
+| pull·환경 | `git pull --ff-only` 성공. 추적 `.bat/.cmd/.ps1/.iss` 7개 모두 CRLF(bare LF 0), 재체크아웃 불필요. `uv.lock` 추적 확인 후 `uv sync --frozen --all-extras`(uv 0.10.4)와 `uv lock --check` 통과 |
+| 단위 테스트 | 처음 1106 passed / 2 failed. 두 건 모두 테스트가 POSIX를 전제한 문제였다(경로 구분자 문자열 비교, 텍스트 모드 `\n`→`\r\n` 변환으로 checksum 불일치). `b678338`로 고친 뒤 **1108 passed / 6 skipped / 21 deselected**. ruff format·check, mypy(61 files) 통과 |
+| 실프로필 통합 | `DBMIG_RUN_REAL_PROFILE_TESTS=1 -m integration -k saved_profiles` **1 passed**(bms93·bms30 연결). 적용 전에는 평문 키 파일(과거 공개 키 아님)이 암호문 7건을 모두 풀었고 legacy 키로 풀리는 암호문은 0건이었다. 적용 후 키 파일은 `DBMT-KEY2:dpapi`(migrated, 이전 키 저널 없음), DB 키 상태 `dpapi`, 새 키로 7/7 복호화, legacy 0건, 교체 전 평문 키로 0/7. 프로필 3개 모두 읽힘(잠김 0, bms93→bms30 1). `*.bak-pre-keywrap` 잔여 0 |
+| 빌드 | `build.bat`이 1.2.7 → 1.2.8로 올리고 exe 생성. `build_installer.bat`의 M-09 gate 통과(`vc_redist.x64.exe` 14.44.35211.0, 고정 해시·Microsoft 서명 일치). 두 산출물 모두 `WARNING: UNSIGNED BUILD`(M-11 보류) |
+| 버전 동기화 | Mac에서 `bump_version.py --set 1.2.8`. 4파일 blob 해시가 Windows와 같음을 확인하고 커밋·태그·push. Windows는 버전 파일을 `git checkout`으로 되돌린 뒤 pull, 작업 트리 깨끗 |
+
+산출물
+
+| 파일 | SHA-256 | 크기 | ProductVersion | 서명 |
+|---|---|---:|---|---|
+| `dist\DBMigrationTool.exe` | `E2CE917C47DB906E600951CCD5A2624EC7F6D24CCF8D2A4FBC67DBA31C86B4A1` | 65,614,080 | 없음(PyInstaller spec에 버전 리소스 없음) | NotSigned |
+| `dist\installer\DBMigrationTool-Setup-1.2.8.exe` | `2B6FF2404DFBFE142D22343B3337BA3BC2A9B3D9BCDF68D69B0A4A78D4868CDC` | 90,496,100 | 1.2.8 | NotSigned |
+
+릴리스 커밋 `c1b17cf` 메시지의 exe 해시 축약 `…9C86B4A1`은 오기다. 정확한 값은 위 표다.
+
+주의·남은 것
+- 백업 폴더에는 교체 전 평문 키와 그 키로 풀리는 DB 사본이 함께 있다. 이 폴더가 H-06/M-05 노출 경로이므로
+  1.2.8이 안정되면 지운다.
+- `%APPDATA%\Python\`(개발 실행)과 `pytest-qt-qapp\`에는 아직 평문 키가 있다. 그 경로로 앱을 실행하면 같은 1회 마이그레이션이 적용된다.
+- 미서명이라 배포용 릴리스가 아니다(M-11). 설치·업그레이드·제거 smoke와 Windows 실제 TLS 연결은 하지 않았다.
+

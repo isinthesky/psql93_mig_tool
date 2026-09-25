@@ -6,7 +6,7 @@
   target에 새로 생성)을 소스 `bms93`(PG 9.3)에서 대상 `bms30`(PG 16)로 이관한다.
 - 부가 기능: 파일 아카이브 export/import 프로필(`src/core/file_archive_workers.py`,
   `src/ui/dialogs/file_archive_migration_dialog.py`).
-- 버전 `1.2.5` (`src/version.py`, `pyproject.toml`, `installer/DBMigrationTool.iss` 세 곳
+- 버전 `1.2.8` (`src/version.py`, `pyproject.toml`, `installer/DBMigrationTool.iss`, `uv.lock` 네 곳
   동기화, `tools/bump_version.py`가 관리 — 손으로 고치지 않는다).
 - `requires-python = ">=3.13"` (`pyproject.toml`), uv로 관리.
 
@@ -60,7 +60,7 @@ make test    # pytest tests/ -v --tb=short (test-unit / test-integration / test-
 ### Windows (`my-wsl-01`, `db_migration_tool\`)
 ```bat
 uv run ruff format --check src tests && uv run ruff check src tests && uv run mypy src
-uv run pytest -m "not integration" -v      :: 단위 테스트 — Mac 1111 passed / 3 skipped (2026-09-25 wave3 병합 후)
+uv run pytest -m "not integration" -v      :: 단위 테스트 — Windows 1108 passed / 6 skipped, Mac 1111 passed / 3 skipped (1.2.8)
 set DBMIG_RUN_REAL_PROFILE_TESTS=1&& .venv\Scripts\python.exe -m pytest -m integration -k saved_profiles -q
                                             :: 실DB 연결 검증(APPDATA 프로필의 source=bms93, target=bms30) — 1 passed
 build.bat                                  :: PyInstaller -> dist\DBMigrationTool.exe
@@ -68,11 +68,13 @@ installer\build_installer.bat              :: Inno Setup -> dist\installer\DBMig
 ```
 - ⚠️ **`build.bat`은 빌드 전에 `tools/bump_version.py`로 패치 버전을 자동으로 올린다**(59행). 빌드 전에
   손으로 올리지 않는다. 빌드 후 Windows에 생긴 버전 4파일 변경(pyproject/version.py/.iss/uv.lock)을 커밋·push하고
-  `v<버전>` 태그를 단다. (2026-09-25: 수동 1.2.6 + 빌드 자동 → 1.2.7로 출시, v1.2.6 태그는 삭제)
+  `v<버전>` 태그를 단다. (2026-09-25: 수동 1.2.6 + 빌드 자동 → 1.2.7로 출시, v1.2.6 태그는 삭제.
+  1.2.8은 Mac에서 `bump_version.py --set`으로 같은 버전을 커밋하고 Windows는 버전 파일을 되돌린 뒤 pull)
 - 원격 실행 시 `cmd /c "build.bat < NUL"` — 오류 경로의 `pause`가 입력 대기로 멈추지 않게 한다.
 - `.gitattributes` 도입 이전 체크아웃에는 `.bat`이 LF로 남아 있을 수 있다(cmd가 한글 줄을 오해석해
   `build_installer.bat`이 실패하던 원인). 증상이 보이면 스크립트를 지우고 `git checkout -- <file>`로 CRLF 재생성.
-- 산출물은 **미서명**(Authenticode NotSigned). 1.2.7 해시: exe `7221FF87…0EBE0`, 설치본 `9569F99D…23744`.
+- 산출물은 **미서명**(Authenticode NotSigned). 1.2.8 해시: exe `E2CE917C…31C86B4A1`, 설치본 `2B6FF240…D4868CDC`
+  (전체 값·실데이터 백업·키 래핑 결과는 감사 문서 §8.6). 1.2.7: exe `7221FF87…0EBE0`, 설치본 `9569F99D…23744`.
   `installer\codesign.ps1` 훅이 `CODESIGN_*` 환경변수가 있으면 서명·검증하고 없으면 `UNSIGNED BUILD` 경고(BUILD_GUIDE).
 - `build.bat`은 `uv sync --locked`로 **추적되는 `uv.lock`**을 강제하고, `build_installer.bat`은
   `installer\prerequisites.sha256` 고정 해시 + Microsoft 서명 검증 gate를 통과해야 ISCC를 돌린다(감사 M-08/M-09).
