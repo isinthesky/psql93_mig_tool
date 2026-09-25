@@ -110,7 +110,7 @@ class _Checkpoint:
     error_message = None
 
 
-def _worker(mode: str, batch: int) -> CopyMigrationWorker:
+def _worker(mode: str, batch: int, resume: bool = False) -> CopyMigrationWorker:
     profile = ConnectionProfile(
         id=1, name="it", source_config=_config(SRC_DSN), target_config=_config(DST_DSN)
     )
@@ -118,7 +118,7 @@ def _worker(mode: str, batch: int) -> CopyMigrationWorker:
         patch("src.core.base_migration_worker.HistoryManager"),
         patch("src.core.base_migration_worker.CheckpointManager"),
     ):
-        w = CopyMigrationWorker(profile, [PART], 1, batch_size=batch, copy_mode=mode)
+        w = CopyMigrationWorker(profile, [PART], 1, resume=resume, batch_size=batch, copy_mode=mode)
     w.checkpoint_manager.get_checkpoints.return_value = []
     w.checkpoint_manager.create_checkpoint.return_value = _Checkpoint()
     w.cp_calls = w.checkpoint_manager.update_checkpoint_status  # type: ignore[attr-defined]
@@ -261,3 +261,80 @@ class TestCancelOnRealPostgres:
         statuses = _statuses(w)
         assert not [kw for s, kw in statuses if s == "running" and kw.get("rows_processed")]
         assert "failed" not in [s for s, _ in statuses]
+
+
+def _target_count() -> int:
+    with _conn(DST_DSN) as d, d.cursor() as cur:
+        cur.execute(f"SELECT count(*) FROM public.{PART}")
+        return int(cur.fetchone()[0])
+
+
+def _approve_truncate(w) -> list[tuple[str, int]]:
+    """UI 대신 TRUNCATE 확인에 '예'로 답한다(워커 스레드에서 바로 응답)."""
+    from PySide6.QtCore import Qt
+
+    asked: list[tuple[str, int]] = []
+
+    def approve(table, rows):
+        asked.append((table, rows))
+        w.truncate_permission = True
+
+    w.truncate_requested.connect(approve, Qt.ConnectionType.DirectConnection)
+    return asked
+
+
+class TestApprovedTruncateOnRealPostgres:
+    """H-02 후속: 첫 COPY 도중 중지돼도 승인한 TRUNCATE는 남고, 재개가 낡은 행을 잇지 않는다.
+
+    실제 TableCreator.ensure_partition_ready(TRUNCATE를 커밋하지 않고 넘긴다)와 실제 트랜잭션으로
+    확인한다. 대상에는 같은 파티션을 예전에 복사한 행(행 수 같음)이 있고, 그 뒤 원본이 바뀌었다.
+    """
+
+    @pytest.mark.parametrize("mode", ["python", "server"])
+    def test_stop_in_first_copy_then_resume_recopies_fresh_rows(self, mode):
+        _reset(1200)
+        w0 = _worker("python", batch=500)
+        w0.is_running = True
+        w0._execute_migration()
+        assert _target_count() == 1200
+        with _conn(SRC_DSN) as s, s.cursor() as cur:  # 예전 복사 이후 원본 변경
+            cur.execute(f"UPDATE public.{PART} SET changed_value = 'fresh' WHERE path_id = 20")
+        fresh = _rows(SRC_DSN)
+
+        # 1차: 승인한 TRUNCATE 뒤 첫 COPY에서 중지
+        w1 = _worker(mode, batch=500)
+        asked = _approve_truncate(w1)
+        if mode == "python":
+            real_batch = w1._copy_batch_streaming
+
+            def stop_then_batch(*args, **kwargs):
+                w1.stop()
+                return real_batch(*args, **kwargs)
+
+            w1._copy_batch_streaming = stop_then_batch
+        else:
+            real_begin = w1._begin_source_snapshot
+
+            def stop_then_begin():
+                w1.stop()
+                return real_begin()
+
+            w1._begin_source_snapshot = stop_then_begin
+        w1.is_running = True
+        w1._execute_migration()
+
+        assert asked == ([(PART, 1200)] if mode == "python" else [])
+        assert "failed" not in [s for s, _ in _statuses(w1)]
+        assert _target_count() == 0, "승인한 TRUNCATE가 중지와 함께 롤백돼 옛 행이 남았습니다"
+
+        # 2차: 재개(Python COPY). 커밋된 배치가 없으니 처음부터 복사해 최신 내용이 된다.
+        w2 = _worker(mode, batch=500, resume=True)
+        cp = _Checkpoint()
+        cp.status = "running"
+        w2.checkpoint_manager.get_checkpoints.return_value = [cp]
+        _approve_truncate(w2)
+        w2.is_running = True
+        w2._execute_migration()
+
+        assert _rows(DST_DSN) == fresh, "재개 결과에 낡은 행이 남았습니다"
+        assert any(s == "completed" and kw["rows_processed"] == 1200 for s, kw in _statuses(w2))

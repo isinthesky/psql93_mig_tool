@@ -816,7 +816,19 @@ class CopyMigrationWorker(BaseMigrationWorker):
                     except (json.JSONDecodeError, KeyError, TypeError):
                         pass
             # --- 대상 테이블 준비 ---
-            resume_expected = bool(self.should_resume)
+            # 대상의 기존 행을 '이 작업이 커밋한 앞부분'으로 믿고 이어 붙이는(keep) 것은 이 작업이
+            # 커밋한 배치 기록(rows_processed>0)이 있을 때뿐이다. 기록이 없는데 행이 있으면(시작 전
+            # 중단된 파티션, 이전 버전 checkpoint, 커밋 직후 checkpoint 갱신 전 crash) 그 행이 누구
+            # 것인지 알 수 없다. keep하면 옛 행의 마지막 키 뒤부터 붙이고, 행 수가 같으면 낡은
+            # 내용인 채 completed가 된다 → 일반 실행처럼 사용자에게 TRUNCATE를 확인한다.
+            committed_progress = bool(checkpoint) and int(checkpoint.rows_processed or 0) > 0
+            resume_expected = bool(self.should_resume) and committed_progress
+            if self.should_resume and not committed_progress:
+                self._log(
+                    f"{partition_name} 재개: 커밋된 배치 기록이 없어 처음부터 진행합니다 "
+                    "(대상에 기존 행이 있으면 삭제 여부를 확인합니다)",
+                    "INFO",
+                )
             _created, target_row_count = self._prepare_target_table(
                 partition_name, checkpoint=checkpoint, resume_expected=resume_expected
             )
@@ -1398,6 +1410,14 @@ class CopyMigrationWorker(BaseMigrationWorker):
             truncate_mode=truncate_mode,
             confirm_callback=cb,
         )
+        # ensure_partition_ready는 TRUNCATE를 커밋하지 않고 대상 트랜잭션에 남긴다. 그대로 COPY와
+        # 묶으면, 중지(H-02: 이제 배치 도중에 실제로 끊긴다)나 실패로 첫 배치(Server COPY는 파티션
+        # 전체)가 롤백될 때 승인한 TRUNCATE도 함께 롤백돼 옛 행이 되살아난다. checkpoint는 '커밋된
+        # 배치 0'이라 대상 상태와 어긋나고, 재개가 그 옛 행을 앵커로 삼는다. 그래서 준비 결과를
+        # 여기서 커밋해 '대상 = 이 작업이 커밋한 배치들'을 항상 성립시킨다.
+        # (대가: 승인·자동 TRUNCATE 뒤 이관이 실패하면 옛 데이터는 복구되지 않는다 — 삭제는 이미
+        # 사용자가 승인했거나 server 모드의 full restart 정책이다.)
+        self.target_conn.commit()
 
         # 결과에 따른 로그 출력
         if created:

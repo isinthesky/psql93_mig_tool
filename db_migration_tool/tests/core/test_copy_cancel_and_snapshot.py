@@ -7,6 +7,7 @@
   (READ COMMITTED) 문장마다 최신 행을 본다. ``COPY (SELECT ... WHERE 키 > ... LIMIT n)``의
   keyset 조건을 해석해 배치를 돌려준다.
 - 대상: COPY FROM이 버퍼를 EOF까지 읽어 pending에 두고, commit에서 committed로 옮긴다.
+  ``TRUNCATE``도 트랜잭션에 묶인다(commit이면 committed를 비우고, rollback이면 되살린다).
 - 양쪽 모두 ``cancel()``을 부르면 진행 중인(또는 막힌) 문장이 QueryCanceled로 끝난다.
 
 감사 문서 §3 H-02/H-03/H-04 완료 판정:
@@ -191,6 +192,11 @@ class FakeTarget:
         self.block_commit_no: int | None = None
         self.commit_blocked = threading.Event()
         self._commit_calls = 0
+        self.tx_truncated = False  # 이 트랜잭션에서 TRUNCATE했고 아직 커밋 전
+        self.copied_in = 0  # COPY FROM으로 받은 행 누계(커밋 여부 무관)
+
+    def _visible(self) -> list[tuple[int, int]]:
+        return ([] if self.tx_truncated else list(self.committed)) + list(self.pending)
 
     def cursor(self):
         return _FakeCursor(self)
@@ -205,13 +211,18 @@ class FakeTarget:
             self.commit_blocked.set()
             self.cancel_event.wait(_FAKE_BLOCK_SECONDS)
             self.pending = []
+            self.tx_truncated = False
             raise psycopg2.errors.QueryCanceled("canceling statement due to user request")
+        if self.tx_truncated:
+            self.committed = []
+            self.tx_truncated = False
         self.committed.extend(self.pending)
         self.pending = []
         self.commits += 1
 
     def rollback(self):
         self.pending = []
+        self.tx_truncated = False
         self.rollbacks += 1
 
     def close(self):
@@ -220,10 +231,13 @@ class FakeTarget:
     def execute(self, query: Any, params: Any = None):
         text = _text(query)
         self.statements.append(text)
+        if text.upper().startswith("TRUNCATE"):
+            self.tx_truncated = True
+            return None
         if "COUNT(*)" in text.upper():
-            return (len(self.committed) + len(self.pending),)
+            return (len(self._visible()),)
         if "DESC LIMIT 1" in text:
-            rows = sorted(self.committed)
+            rows = sorted(self._visible())
             return rows[-1] if rows else None
         return None
 
@@ -244,6 +258,7 @@ class FakeTarget:
         for rec in parsed:
             if rec:
                 self.pending.append((int(rec[0]), int(rec[1])))
+                self.copied_in += 1
 
 
 class _FakeCursor:
@@ -293,7 +308,9 @@ class _Checkpoint:
         self.error_message = None
 
 
-def _make_worker(source: FakeSource, target: FakeTarget, *, copy_mode="python", batch=4):
+def _make_worker(
+    source: FakeSource, target: FakeTarget, *, copy_mode="python", batch=4, resume=False
+):
     profile = ConnectionProfile(
         id=1, name="p", source_config={"host": "s"}, target_config={"host": "t"}
     )
@@ -301,7 +318,9 @@ def _make_worker(source: FakeSource, target: FakeTarget, *, copy_mode="python", 
         patch("src.core.base_migration_worker.HistoryManager"),
         patch("src.core.base_migration_worker.CheckpointManager"),
     ):
-        w = CopyMigrationWorker(profile, [PARTITION], 1, batch_size=batch, copy_mode=copy_mode)
+        w = CopyMigrationWorker(
+            profile, [PARTITION], 1, resume=resume, batch_size=batch, copy_mode=copy_mode
+        )
     w._log = lambda message, level="INFO": None
     w.checkpoint_manager.get_checkpoints.return_value = []
     w.checkpoint_manager.create_checkpoint.return_value = _Checkpoint()
@@ -610,6 +629,10 @@ class TestSchemaQualifiedRelations:
         worker = _make_worker(source, target)
         worker._prepare_target_table = MagicMock(return_value=(False, 2))
         worker.should_resume = True
+        # 재개가 대상 기존 행을 잇는 것은 이 작업이 커밋한 배치 기록이 있을 때뿐이다(keep 조건).
+        cp = _Checkpoint()
+        cp.status, cp.rows_processed, cp.last_path_id, cp.last_issued_date = "running", 2, 20, 1000
+        worker.checkpoint_manager.get_checkpoints.return_value = [cp]
         worker.is_running = True
         worker._execute_migration()
 
@@ -623,3 +646,145 @@ class TestSchemaQualifiedRelations:
 
         src = inspect.getsource(mod)
         assert "sql.Identifier(partition_name)" not in src
+
+
+# ---------------------------------------------------------------------------
+# H-02 후속: 승인한 TRUNCATE와 중지·재개
+# ---------------------------------------------------------------------------
+
+
+class _FakeTableCreator:
+    """TableCreator.ensure_partition_ready의 계약만 흉내 낸다.
+
+    실제 구현처럼 TRUNCATE는 **커밋하지 않고** 호출자의 대상 트랜잭션에 남긴다. 'ask'면 워커의
+    확인 콜백(= truncate_requested 시그널 → UI 응답)을 그대로 부른다.
+    """
+
+    modes: list[str] = []
+
+    def __init__(self, _source_conn, target_conn):
+        self.target = target_conn
+
+    def ensure_partition_ready(self, name, truncate_mode="auto", confirm_callback=None):
+        _FakeTableCreator.modes.append(truncate_mode)
+        with self.target.cursor() as cur:
+            cur.execute(f'SELECT COUNT(*) FROM "public"."{name}"')
+            count = cur.fetchone()[0]
+            if count > 0 and truncate_mode != "keep":
+                ok = truncate_mode == "auto" or confirm_callback(name, count)
+                if not ok:
+                    raise Exception(f"기존 데이터 처리가 취소되었습니다: {name}")
+                cur.execute(f'TRUNCATE TABLE "public"."{name}" RESTART IDENTITY')
+        return (False, count)
+
+
+@pytest.fixture
+def table_creator():
+    _FakeTableCreator.modes = []
+    with patch("src.core.copy_migration_worker.TableCreator", _FakeTableCreator):
+        yield _FakeTableCreator
+
+
+def _real_prepare(worker) -> list[tuple[str, int]]:
+    """_make_worker가 가짜로 바꾼 대상 준비를 실제 구현으로 되돌리고, TRUNCATE 확인 요청을
+    UI 대신 '예'로 답한다(DirectConnection — 워커 스레드에서 바로 응답)."""
+    from PySide6.QtCore import Qt
+
+    del worker._prepare_target_table
+    asked: list[tuple[str, int]] = []
+
+    def approve(table, rows):
+        asked.append((table, rows))
+        worker.truncate_permission = True
+
+    worker.truncate_requested.connect(approve, Qt.ConnectionType.DirectConnection)
+    return asked
+
+
+def _stale_target(n: int) -> FakeTarget:
+    """같은 파티션을 예전에 복사해 둔 대상(키는 같고 내용은 낡았다고 본다)."""
+    target = FakeTarget()
+    target.committed = [(r[0], r[1]) for r in _rows(n)]
+    return target
+
+
+def _resume_worker(target: FakeTarget, checkpoint: _Checkpoint, rows: int = 20):
+    source = FakeSource(_rows(rows))
+    target.closed = 0
+    worker = _make_worker(source, target, resume=True)
+    worker.checkpoint_manager.get_checkpoints.return_value = [checkpoint]
+    asked = _real_prepare(worker)
+    return worker, asked
+
+
+class TestApprovedTruncateSurvivesStop:
+    """중지가 배치 도중에 실제로 끊기므로, 승인한 TRUNCATE가 롤백돼 옛 행이 남으면 안 된다.
+
+    남으면 재개(keep)가 옛 행의 마지막 키 뒤부터 이어 붙이고, 행 수가 같으면 낡은 내용인 채
+    completed가 된다.
+    """
+
+    @pytest.mark.parametrize("mode", ["python", "server"])
+    def test_stop_in_first_copy_then_resume_leaves_no_stale_rows(
+        self, estimate, table_creator, mode
+    ):
+        source, target = FakeSource(_rows(20)), _stale_target(20)
+        source.block_copy_no = 1
+        worker = _make_worker(source, target, copy_mode=mode)
+        asked = _real_prepare(worker)
+        runner = _Runner(worker).start()
+
+        assert source.copy_blocked.wait(5), "첫 COPY에 도달하지 못했습니다"
+        worker.stop()
+        runner.thread.join(_FAKE_BLOCK_SECONDS + 5)
+        assert runner.error is None
+        assert table_creator.modes == (["ask"] if mode == "python" else ["auto"])
+        assert asked == ([(PARTITION, 20)] if mode == "python" else [])
+        assert target.committed == [], (
+            "승인한 TRUNCATE가 중지와 함께 롤백돼 옛 행이 대상에 남았습니다"
+        )
+
+        # 재개(Python COPY로 전환됨): 커밋된 배치가 없으니 처음부터 전부 다시 복사해야 한다.
+        cp = _Checkpoint()
+        cp.status = "running"
+        w2, _ = _resume_worker(target, cp)
+        copied_before = target.copied_in
+        w2.is_running = True
+        w2._execute_migration()
+
+        assert target.copied_in - copied_before == 20, "재개가 옛 행을 앵커로 삼아 건너뛰었습니다"
+        assert sorted(target.committed) == sorted((r[0], r[1]) for r in _rows(20))
+        completed = [kw for s, kw in _checkpoint_calls(w2) if s == "completed"]
+        assert completed and completed[-1]["rows_processed"] == 20
+
+    def test_resume_without_committed_progress_does_not_keep_existing_rows(
+        self, estimate, table_creator
+    ):
+        """재개 대상인데 커밋된 배치 기록이 없는 파티션(시작 전 중단·이전 버전 checkpoint)에
+        대상 행이 있으면, 그 행은 이 작업이 쓴 것이라는 근거가 없다 → keep하지 않고 확인한다."""
+        target = _stale_target(20)
+        w, asked = _resume_worker(target, _Checkpoint())  # pending, rows_processed=0
+        w.is_running = True
+        w._execute_migration()
+
+        assert table_creator.modes == ["ask"]
+        assert asked == [(PARTITION, 20)]
+        assert target.copied_in == 20
+        assert sorted(target.committed) == sorted((r[0], r[1]) for r in _rows(20))
+
+    def test_resume_with_committed_progress_keeps_rows_and_continues(self, estimate, table_creator):
+        """커밋된 배치 기록이 있으면(rows_processed>0) 기존처럼 keep하고 마지막 키 뒤부터 잇는다."""
+        target = FakeTarget()
+        target.committed = [(r[0], r[1]) for r in _rows(8)]
+        cp = _Checkpoint()
+        cp.status = "running"
+        cp.rows_processed = 8
+        cp.last_path_id = 80
+        cp.last_issued_date = 1000
+        w, asked = _resume_worker(target, cp)
+        w.is_running = True
+        w._execute_migration()
+
+        assert table_creator.modes == ["keep"] and asked == []
+        assert target.copied_in == 12
+        assert sorted(target.committed) == sorted((r[0], r[1]) for r in _rows(20))

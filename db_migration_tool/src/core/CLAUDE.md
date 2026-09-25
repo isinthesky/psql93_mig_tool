@@ -47,6 +47,12 @@
   `CANCEL_JOIN_TIMEOUT` 안에서만 기다립니다.
 - 중지는 오류가 아닙니다(`CopyCancelled`). 진행 중 배치는 롤백되고, checkpoint는 **커밋된 배치까지만**
   남으며 `failed`로 바꾸지 않습니다. 중지 뒤에는 새 commit을 시작하지 않습니다.
+- 대상 준비(`_prepare_target_table`)의 결과, 즉 승인했거나 자동으로 한 TRUNCATE는 COPY 전에 **따로 커밋**합니다.
+  `ensure_partition_ready`는 TRUNCATE를 커밋하지 않고 넘기므로, COPY와 묶이면 첫 배치(Server COPY는 파티션
+  전체)가 중지·실패로 롤백될 때 옛 행이 되살아나고, 재개(keep)가 그 옛 행을 앵커로 삼습니다. 이렇게 하면
+  대상에는 늘 '이 작업이 커밋한 배치'만 남습니다.
+- 재개가 대상 기존 행을 두고 이어 붙이는(keep) 것은 checkpoint에 커밋된 배치 기록(`rows_processed>0`)이
+  있을 때뿐입니다. 기록이 없는데 대상에 행이 있으면 일반 실행처럼 TRUNCATE를 확인(ask)합니다.
 
 ## 원본 snapshot 규칙 (H-03)
 - 파티션의 모든 배치(Python COPY)·단일 COPY(Server COPY)와 완료 검증 원본 `COUNT(*)`는 원본의 단일

@@ -9,6 +9,10 @@
    남지 않는지, 대상 행 수 == checkpoint에 기록된 커밋 행 수인지, 오류 시그널이 없는지 본다.
 3. 계획 기준 재개(prepare_resume) → 완료 후 원본·대상 집계 5종 대조(e2e_verify_copy와 같은 방식).
 
+--stale-target: 대상에 같은 파티션의 '예전 복사본'(일부 행 내용을 표식으로 바꿔 낡게 만든 것)을
+먼저 만들어 두고, 승인한 TRUNCATE 뒤 첫 배치(Server는 단일 COPY) 도중 중지한다. 중지 뒤 대상이
+비어 있어야 하고(TRUNCATE는 COPY와 별개로 커밋), 재개 결과에 낡은 표식 행이 없어야 한다.
+
 안전장치는 e2e_verify_copy.py와 같다: 원본 읽기 전용, 대상 DB는 --allow-target-db(기본 temp)만,
 대상에 같은 테이블이 있으면 건너뜀, 로컬 이력은 임시 폴더, --drop-after는 이 스크립트가 만든
 테이블만 삭제. 비밀번호는 환경변수 DBMIG_E2E_SRC_PW / DBMIG_E2E_DST_PW로만 받는다.
@@ -34,6 +38,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import e2e_verify_copy as base  # noqa: E402
+import psycopg2.extensions  # noqa: E402
 from PySide6.QtCore import QCoreApplication, Qt  # noqa: E402
 
 from src.core.copy_migration_worker import CopyMigrationWorker  # noqa: E402
@@ -83,6 +88,11 @@ def main() -> int:
     ap.add_argument("--bound", type=float, default=10.0, help="중지 허용 시간(초)")
     ap.add_argument("--allow-target-db", default="temp", help="쓰기를 허용할 대상 DB 이름")
     ap.add_argument("--drop-after", action="store_true")
+    ap.add_argument(
+        "--stale-target",
+        action="store_true",
+        help="대상에 낡은 예전 복사본을 먼저 만들고 승인한 TRUNCATE 뒤 중지→재개를 확인",
+    )
     a = ap.parse_args()
 
     if a.dst_db != a.allow_target_db:
@@ -116,6 +126,27 @@ def main() -> int:
         print("    대상에 이미 존재 — 덮어쓰지 않고 건너뜀")
         return 1
 
+    stale_marker = "STALE-E2E"
+    if a.stale_target:
+        # 예전 복사본: 별도 이력으로 전체 복사(Server COPY) 뒤, 일부 행을 낡은 내용으로 바꾼다.
+        hid0 = hm.create_planned_history(profile, [table], "e2e-old", "e2e-old").id
+        assert hid0 is not None
+        print("    예전 복사본 만드는 중(대상 temp만 씀)")
+        if base._run(CopyMigrationWorker(profile, [table], hid0, copy_mode="server")) is not None:
+            print("    예전 복사본을 만들지 못했습니다")
+            return 1
+        with base._connect(dst) as conn, conn.cursor() as cur:
+            t = psycopg2.extensions.quote_ident(table, cur)
+            cur.execute(
+                f"UPDATE public.{t} SET changed_value = %s WHERE path_id = "
+                f"(SELECT min(path_id) FROM public.{t})",
+                (stale_marker,),
+            )
+            print(f"    낡은 표식 행 {cur.rowcount:,}개")
+            conn.commit()
+        if a.stop_after > 0 and a.mode == "python":
+            a.stop_after = 0  # 승인한 TRUNCATE와 같은 트랜잭션이던 첫 배치 도중에 멈춘다
+
     hid = hm.create_planned_history(profile, [table], "e2e", "e2e").id
     assert hid is not None
     w = CopyMigrationWorker(
@@ -127,8 +158,17 @@ def main() -> int:
         lambda m, lvl="INFO": print(f"    [{lvl}] {m}") if lvl in ("WARNING", "ERROR") else None,
         Qt.ConnectionType.DirectConnection,
     )
+    asked: list[tuple[str, int]] = []
+
+    def approve(tbl, rows, _w=w):
+        asked.append((tbl, rows))
+        _w.truncate_permission = True  # UI 대신 '예'(삭제 후 진행)
+
+    w.truncate_requested.connect(approve, Qt.ConnectionType.DirectConnection)
     committed = {"n": 0}
     reached = threading.Event()
+    if a.stop_after <= 0:
+        reached.set()  # 첫 배치 도중에 멈춘다
     real = w.checkpoint_manager.update_checkpoint_status
 
     def spy(cid, status, _real=real, **kw):
@@ -211,33 +251,49 @@ def main() -> int:
         and cp_status != "failed"
         and not errors
     )
-    print(f"    CANCEL {'OK' if cancel_ok else 'FAIL'}")
+    print(f"    CANCEL {'OK' if cancel_ok else 'FAIL'} (TRUNCATE 확인 요청={asked})")
 
     check = hm.prepare_resume(hid, profile)
     print(f"    재개 검증 {check.verdict} pending={check.pending}")
     resume_ok = bool(check.allowed and check.pending)
+    resume_asked: list[tuple[str, int]] = []
     if resume_ok:
-        base._run(
-            CopyMigrationWorker(
-                profile,
-                check.pending,
-                hid,
-                resume=True,
-                batch_size=a.batch_size,
-                copy_mode="python",
-            )
+        rw = CopyMigrationWorker(
+            profile,
+            check.pending,
+            hid,
+            resume=True,
+            batch_size=a.batch_size,
+            copy_mode="python",
         )
+
+        def approve_resume(tbl, rows, _w=rw):
+            resume_asked.append((tbl, rows))
+            _w.truncate_permission = True
+
+        rw.truncate_requested.connect(approve_resume, Qt.ConnectionType.DirectConnection)
+        base._run(rw)
+        print(f"    재개 중 TRUNCATE 확인 요청={resume_asked}")
     cps = [c for c in cm.get_checkpoints(hid) if c.partition_name == table]
     status = cps[-1].status if cps else None
     s_agg, d_agg = base._aggregates(src, table), base._aggregates(dst, table)
     match = s_agg == d_agg and status == "completed"
     print(f"    checkpoint={status}\n    source={s_agg}\n    target={d_agg}")
     print(f"    RESULT {'MATCH' if match else 'MISMATCH'}")
+    stale_left = 0
+    if a.stale_target:
+        with base._connect(dst) as conn, conn.cursor() as cur:
+            t = psycopg2.extensions.quote_ident(table, cur)
+            cur.execute(
+                f"SELECT count(*) FROM public.{t} WHERE changed_value = %s", (stale_marker,)
+            )
+            stale_left = int(cur.fetchone()[0])
+        print(f"    재개 뒤 낡은 표식 행={stale_left:,}")
     if a.drop_after:
         base._drop(dst, table)
         print("    (검증 후 대상 테이블 삭제)")
 
-    ok = cancel_ok and resume_ok and match
+    ok = cancel_ok and resume_ok and match and stale_left == 0
     print("ALL OK" if ok else "SOME FAILED")
     return 0 if ok else 1
 
