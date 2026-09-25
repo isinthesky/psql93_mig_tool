@@ -317,6 +317,8 @@ class HistoryRepository(BaseRepository[MigrationHistory]):
         같은지를 다시 보고 기록한다. 둘 중 하나라도 어긋나면 아무것도 쓰지 않는다.
         `add_partitions`(범위 대비 누락 보충분)는 계획 기록과 **같은 트랜잭션**에서
         pending checkpoint로 만든다 — 보충이 실패하면 계획 기록도 rollback된다.
+        `plan_fields`에는 보충한 이름의 기록(`legacy_supplemented`)도 들어간다 — 계획과 함께
+        한 번만 쓰이므로, 아카이브 워커가 원본 부재를 허용하는 이름이 나중에 넓어지지 않는다.
 
         Returns:
             기록했으면 True, 이미 계획이 있거나 집합이 바뀌었으면 False.

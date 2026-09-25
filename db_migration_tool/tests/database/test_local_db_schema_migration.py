@@ -65,6 +65,7 @@ NEW_HISTORY_COLUMNS = {
     "planned_hash",
     "plan_fingerprint",
     "legacy_adopted_at",
+    "legacy_supplemented",
 }
 
 HISTORY_ROWS = 56  # Windows 사용자 DB 규모

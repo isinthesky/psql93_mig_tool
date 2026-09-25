@@ -186,7 +186,8 @@ class TestLegacyHistory:
         hid = self._legacy()
         hm = HistoryManager()
 
-        adopted = hm.adopt_legacy_history(hid, _profile())
+        # 뒤 유형(PS·RT·TH)은 원래 작업에 없었다고 명시한다(PH 단일 유형 작업).
+        adopted = hm.adopt_legacy_history(hid, _profile(), original_types=["point_history"])
 
         assert adopted.verdict is ResumeVerdict.OK
         assert adopted.pending == PLAN[1:]
