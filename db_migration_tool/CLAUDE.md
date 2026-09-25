@@ -66,6 +66,13 @@ set DBMIG_RUN_REAL_PROFILE_TESTS=1&& .venv\Scripts\python.exe -m pytest -m integ
 build.bat                                  :: PyInstaller -> dist\DBMigrationTool.exe
 installer\build_installer.bat              :: Inno Setup -> dist\installer\DBMigrationTool-Setup-<ver>.exe
 ```
+- ⚠️ **`build.bat`은 빌드 전에 `tools/bump_version.py`로 패치 버전을 자동으로 올린다**(59행). 빌드 전에
+  손으로 올리지 않는다. 빌드 후 Windows에 생긴 버전 3파일 변경(pyproject/version.py/.iss)을 커밋·push하고
+  `v<버전>` 태그를 단다. (2026-09-25: 수동 1.2.6 + 빌드 자동 → 1.2.7로 출시, v1.2.6 태그는 삭제)
+- 원격 실행 시 `cmd /c "build.bat < NUL"` — 오류 경로의 `pause`가 입력 대기로 멈추지 않게 한다.
+- `.gitattributes` 도입 이전 체크아웃에는 `.bat`이 LF로 남아 있을 수 있다(cmd가 한글 줄을 오해석해
+  `build_installer.bat`이 실패하던 원인). 증상이 보이면 스크립트를 지우고 `git checkout -- <file>`로 CRLF 재생성.
+- 산출물은 **미서명**(Authenticode NotSigned). 1.2.7 해시: exe `7221FF87…0EBE0`, 설치본 `9569F99D…23744`.
 - pytest marker: `unit` / `integration` / `slow` (`pyproject.toml` `[tool.pytest.ini_options]`).
   실DB를 쓰는 통합 테스트는 기본적으로 건너뛰므로(§6 감사 결과), `-m "not integration"` 결과만으로
   COPY/재개 경로의 정합성을 보장하지 않는다.
@@ -86,7 +93,7 @@ installer\build_installer.bat              :: Inno Setup -> dist\installer\DBMig
 `docs/plans/code-audit-remediation-2026-08-26.md` 기준(commit `3813ac3`, app 1.2.5) — 이 계획을
 구현하고 재감사를 통과하기 전에는 **데이터 이관용 운영 배포에 적합하다고 승인할 수 없다.**
 
-**2026-09-25 수정(브랜치 `fix/copy-integrity-license-failclosed`)**: C-01, C-02, H-07, H-01(워커 측) 해결 +
+**2026-09-25 수정 — v1.2.7로 출시(main `027be89`)**: C-01, C-02, H-07, H-01(워커 측) 해결 +
 모든 복사 경로에 **파티션 완료 전 원본·대상 `COUNT(*)` 일치 검증** 추가. 상세·검증 결과는 감사 문서 §8.
 아래 원문 설명은 수정 전 상태 기록이다. 나머지 H-02~H-06, H-08, H-09, M-*는 미해결.
 
