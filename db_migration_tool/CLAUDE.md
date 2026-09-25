@@ -60,7 +60,7 @@ make test    # pytest tests/ -v --tb=short (test-unit / test-integration / test-
 ### Windows (`my-wsl-01`, `db_migration_tool\`)
 ```bat
 uv run ruff format --check src tests && uv run ruff check src tests && uv run mypy src
-uv run pytest -m "not integration" -v      :: 단위 테스트 — 978 passed (2026-09-25 wave1 병합 후)
+uv run pytest -m "not integration" -v      :: 단위 테스트 — Mac 1111 passed / 3 skipped (2026-09-25 wave3 병합 후)
 set DBMIG_RUN_REAL_PROFILE_TESTS=1&& .venv\Scripts\python.exe -m pytest -m integration -k saved_profiles -q
                                             :: 실DB 연결 검증(APPDATA 프로필의 source=bms93, target=bms30) — 1 passed
 build.bat                                  :: PyInstaller -> dist\DBMigrationTool.exe
@@ -98,14 +98,25 @@ installer\build_installer.bat              :: Inno Setup -> dist\installer\DBMig
 
 **2026-09-25 수정 — v1.2.7로 출시(main `027be89`)**: C-01, C-02, H-07, H-01(워커 측) 해결 +
 모든 복사 경로에 **파티션 완료 전 원본·대상 `COUNT(*)` 일치 검증** 추가. 상세·검증 결과는 감사 문서 §8.
-아래 원문 설명은 수정 전 상태 기록이다.
 
 **2026-09-25 wave1 병합(main)**: H-05, H-06, H-08, H-09, M-02, M-04~M-10, M-12 해결, H-02·H-04는 연결 단계만,
 M-11은 서명 훅만(인증서 없음). 상세와 남은 리뷰 지적은 감사 문서 §8.1~§8.3. 나머지(H-01 UI, H-03, M-01, M-03,
 M-13, M-14 등)는 미해결.
 
 **2026-09-25 wave2 병합(main)**: H-02(연결 수립 단계는 `connect_timeout` 상한), H-03(한계 3), H-04, M-01, M-03(legacy
-워커 삭제), M-14 해결. 상세·남은 리뷰 지적·동작 변경은 감사 문서 §8.4. 미해결: H-01 UI, M-11 인증서, M-13.
+워커 삭제), M-14 해결. 상세·남은 리뷰 지적·동작 변경은 감사 문서 §8.4.
+
+**2026-09-25 wave3 병합(main `b6dd474`)**: M-13(트레이·앱 종료 graceful stop·30초 제한 대기·flush, `src/core/worker_registry.py`),
+H-02 잔여(아카이브 워커 비동기 반복 cancel, close 전 cancel 정지) 해결. 감사 문서 §8.5.
+
+**현재 집계(감사 문서 §8 종합 상태표)**: 해결 22 · 부분 2 · 보류 1.
+- 부분 **H-01**: 워커·이력 상태는 고쳐졌으나 마법사 UI 경로 자동 테스트가 없고 `partial` 대신 `failed`로 표시.
+- 부분 **H-03**: 파티션 단위 snapshot은 적용. PG 9.3 원본 동시 쓰기 미검증, 재개는 새 snapshot.
+- 보류 **M-11**: 코드서명 인증서가 없어 서명 훅만 있다(산출물 UNSIGNED).
+- 리뷰 잔여(major): H-06 같은 프로세스 복수 매니저 키 갈림, H-08 다중 유형 legacy 이력 뒤 유형 누락, H-09 아카이브 legacy 보충 파티션.
+- §6 종료 조건(독립 재감사, clean VM 서명 릴리스·설치 smoke, PG 9.3 실DB matrix)은 미충족 — 운영 승인 보류 유지.
+
+아래 원문 설명은 수정 전 상태 기록이다(해결된 항목 포함).
 
 - **C-01** — `CopyStreamBuffer.close()`가 큐 포화 시 취소 상태를 설정하지만 `read()`가 남은 데이터를
   비우지 않고 EOF를 반환한다. 대상에는 앞부분만 반영되는데 checkpoint는 전진할 수 있다

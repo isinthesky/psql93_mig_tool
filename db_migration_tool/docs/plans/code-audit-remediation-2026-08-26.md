@@ -3,7 +3,7 @@
 - 작성일: 2026-08-26
 - 감사 기준: `main` / `3813ac3` / 애플리케이션 1.2.5
 - 범위: `src`, `tests`, `tools`, PyInstaller 설정, Inno Setup 설치 프로그램, 빌드 스크립트
-- 현재 상태: 계획 수립 완료, 제품 코드 수정 전
+- 현재 상태: 보완 구현 main 통합(`b6dd474`) — 항목별 상태는 §8 종합 상태표. 재감사 전이라 운영 승인은 보류
 
 ## 1. 결론
 
@@ -198,6 +198,47 @@
 
 ## 8. 진행 현황 (2026-09-25)
 
+### 종합 상태표 (main `b6dd474`, D2 릴리스 직전)
+
+상태 구분
+- **해결**: 코드 수정과 회귀 테스트가 main에 들어갔다. 괄호 안은 알려진 한계다.
+- **부분**: §3 완료 판정 중 일부를 아직 충족하지 못했다.
+- **보류**: 외부 조건 때문에 착수할 수 없다. 사유를 적는다.
+
+집계: 해결 22 · 부분 2(H-01, H-03) · 보류 1(M-11). §6 종료 조건(재감사, clean VM 서명 릴리스, PG 9.3 실DB matrix)은 아직 충족하지 못했다.
+
+| ID | 상태 | 검증 근거 | 잔여·검증 대기 |
+|---|---|---|---|
+| C-01 | 해결 | `tests/core/test_copy_stream_integrity.py`(큐 1/2/8 느린 소비자, 수정 전 코드에서 마지막 8행 유실 재현), 커밋 전 `assert_fully_consumed()`. 실DB E2E 3회(§8 첫 표, §8.3, §8.4)에서 원본·대상 집계 5종 일치 | — |
+| C-02 | 해결 | 같은 파일의 모든 청크 분할 지점·무작위 분할 200회·이스케이프 따옴표 테스트. 실DB 중단→재개 E2E(`point_history_260509`, `260512`) 집계 일치 | — |
+| H-01 | 부분 | 워커는 건너뛴 파티션이 있으면 예외로 끝나고 이력이 `failed`로 남는다. 재개가 실패 파티션을 다시 잡는다(`tests/core/test_copy_worker_completeness.py`) | 마법사 UI 경로(`on_error` → `failed`) 자동 테스트가 없다. 마법사는 `partial` 대신 `failed`로 표시한다(아카이브 다이얼로그만 `partial`) |
+| H-02 | 해결(연결 수립 단계는 `connect_timeout` 10초 상한) | `tests/core/test_copy_cancel_and_snapshot.py`, `tests/core/test_worker_shutdown.py`(COPY·commit·Server COPY·연결 중·일시정지·아카이브 export 단계별 중지). `tools/e2e_cancel_copy.py` 실DB 중지→재개(§8.4). 아카이브 워커 비동기 반복 cancel과 close 전 cancel 정지(§8.5) | 리뷰 minor: 대상 준비 commit 앞 `_raise_if_stopped` 없음. 커밋 기록 없는 재개에서 `last_path_id`를 초기화하지 않음(완료 COUNT로 fail-closed) |
+| H-03 | 부분 | 파티션마다 원본 `REPEATABLE READ, READ ONLY` 트랜잭션 하나(`test_copy_cancel_and_snapshot.py`). scratch PostgreSQL 동시 쓰기 통합 5건(`tests/core/test_copy_snapshot_integration.py`, 환경변수 필요) | PG 9.3 원본 동시 쓰기를 검증하지 못했다(운영 원본에 쓰기 금지). 재개는 새 snapshot이라 이미 복사한 행의 update를 탐지하지 못한다. 일시정지 중 xmin 유지(UI 안내 없음) |
+| H-04 | 해결 | `tests/database/test_schema_qualification.py`, `test_sql_safety.py`, 실DB shadow 스키마 테스트 `tests/integration/test_sql_boundaries_realdb.py`(temp DB) | 운영 bms30 기존 트리거 함수는 부모 재생성 때만 교체. `nextval('seq'::regclass)` DEFAULT에 schema 없음 |
+| H-05 | 해결 | `tests/database/test_connection_params.py`, `test_system_ca.py`, TLS 통합 13 passed(§8.3) | Windows 실제 TLS PostgreSQL 연결. 기존 `require` 프로필이 `verify-full`로 바뀜(릴리스 노트) |
+| H-06 | 해결 | 리뷰 회귀 16건·`tests/utils/test_secret_store.py`·뮤테이션 8종 포착(`d50d209`). 실데이터 적용은 D2 릴리스 5단계(§8.6) | 2차 리뷰 major: 같은 프로세스에서 fallback으로 끝난 매니저와 마이그레이션에 성공한 매니저의 키가 갈라질 수 있음. 다운그레이드 불가 |
+| H-07 | 해결 | `tests/licensing/test_check.py::TestFailClosed` | — |
+| H-08 | 해결(legacy 한계) | 이력 identity·재개 게이트 테스트, 실DB 중단→재개에서 identity 게이트 확인(§8.3, §8.4) | 리뷰 major: legacy 채택이 뒤 유형이 통째로 빠진 다중 유형 이력을 잡지 못함 |
+| H-09 | 해결(legacy 한계) | 이력·checkpoint 단일 트랜잭션, N번째 실패 rollback, legacy 누락 보충 14건(`fb27614`) | 아카이브 경로의 legacy 보충 파티션은 워커가 완료하지 못함 |
+| M-01 | 해결 | `tests/core/test_partition_discovery_recovery.py`, 실DB M-01 통합(temp) | — |
+| M-02 | 해결 | `tests/core/test_archive_manifest_cas.py`(스레드 4·프로세스 3 경쟁, 수정 전 lost update 재현) | — |
+| M-03 | 해결(제거) | OFFSET 기반 `migration_worker.py` 삭제, 생성 경로 0건 | — |
+| M-04 | 해결(한계) | `tests/core/test_archive_manifest_auth.py`, `test_file_archive_security.py`, `tests/ui/dialogs/test_archive_security_prompt.py` | passphrase를 비우면 다운그레이드는 확인+WARNING만. 같은 passphrase 옛 아카이브 롤백·기밀성은 범위 밖 |
+| M-05 | 해결(비Windows는 0600 평문) | DPAPI 래핑(`WrappedKeyFile`), 디렉터리 복제 회귀 테스트. 실데이터 적용은 §8.6 | — |
+| M-06 | 해결 | `tests/release/test_issue_license.py` 32건 | 운영: 기존 평문 키 사본 폐기, 서버 signer의 암호화 PEM 읽기 |
+| M-07 | 해결 | `.iss` `[Code]` 컴파일·음성 대조(§8.1), `tests/licensing/test_activation.py` 씨앗 수명 8건 | clean VM 관리자/사용자/무음 설치·업그레이드 smoke 미수행 |
+| M-08 | 해결 | `build.bat` `uv sync --locked`, `uv lock --check`(Mac·Windows) | CI 없음 — lock 강제는 build.bat에서만 |
+| M-09 | 해결 | `installer/verify_prerequisites.ps1` 양성·음성 대조(§8.1). 실제 `build_installer.bat` 실행 결과는 §8.6 | — |
+| M-10 | 해결 | `tests/release/test_windows_script_encoding.py`(LF 주입 시 실패 확인). 실제 batch 실행은 §8.6 | clean Windows VM CI |
+| M-11 | 보류 — 코드서명 인증서 없음 | `installer/codesign.ps1` 훅만: 인증서 없으면 `UNSIGNED BUILD` 경고, `CODESIGN_REQUIRED=1`이면 실패 | 인증서 조달, `unins000.exe` 서명, 릴리스 gate에 `CODESIGN_REQUIRED=1` |
+| M-12 | 해결 | 미완료 이력 프로필 삭제 차단·명시적 폐기 테스트 | — |
+| M-13 | 해결 | `tests/core/test_worker_shutdown.py`(단계별 종료·timeout 강제 종료·임시 파일/잠금/스레드 누수), `tests/test_main_shutdown.py`, `tests/test_tray_icon.py`, `tests/utils/test_logger_mixins.py`(§8.5) | 실제 Windows 트레이 종료 수동 확인 |
+| M-14 | 해결 | `tests/core/test_table_creator_transactions.py`(`FakePgConnection` 중단 트랜잭션 규칙), 실DB M-14 통합(temp) | 부모 잠금 구간이 길어져 동시 생성 시 경합 가능(즉시 실패 후 rollback) |
+
+자동 게이트(Mac, `b6dd474`): 단위 1111 passed / 3 skipped / 21 deselected, ruff format(149 files)·check, mypy(61 files) 통과.
+
+### 1차 수정 — v1.2.7
+
 브랜치 `fix/copy-integrity-license-failclosed`.
 
 | ID | 상태 | 수정 내용 |
@@ -308,3 +349,15 @@ temp `partition_table_info`에 남은 세 행도 지웠다.
 
 남은 항목: H-01(UI 표시), M-11(인증서), M-13, 위 리뷰 지적, CI의 PG 통합 테스트 job(9.x 포함).
 재감사 전까지 운영 승인 보류 원칙은 유지한다.
+
+### 8.5 wave3 통합 (main 병합, 2026-09-25)
+
+`audit/w3-shutdown`을 `--no-ff` 병합(`6f193ae`)하고 리뷰 minor를 후속 커밋(`b6dd474`)으로 고쳤다.
+
+| ID | 상태 | 요약 |
+|---|---|---|
+| M-13 | 해결 | `src/core/worker_registry.py`(약한 참조 `WorkerRegistry` + `ShutdownCoordinator`): 전체 `stop("app_shutdown")`·조회 `cancel_query()` → 30초 대기(이벤트 루프 유지) → flush(로거 → 로컬 DB) → `app.exit(0)`. 초과하면 WARNING 후 강제 종료(`finalize_exit`가 `os._exit`). 종료 중 시작한 워커는 등록 즉시 중지. 트레이 종료는 `quit_requested`만 발행한다. 트레이 없는 창 닫기도 조정자를 거친다(예전엔 프로세스가 남음). DB 로그 writer가 `close()` 뒤 큐에 남은 로그를 끝까지 쓴다. |
+| H-02 잔여 | 해결 | 아카이브 워커의 동기 cancel·다른 스레드 rollback을 비동기 반복 cancel로 바꿨다. COPY 워커와 아카이브 워커 모두 연결 close 전에 `_stop_cancel_retries()`로 cancel 반복을 멈춘다(psycopg2 cancel·close 경합, 리뷰 minor. 수정 전 테스트가 close 순간 cancel 스레드 생존 `[True, True]`로 실패). |
+
+검증: 단위 1111 passed / 3 skipped / 21 deselected(wave2 대비 +41), ruff format·check, mypy(61 files) 통과.
+실DB E2E는 하지 않았다. 종료 경로는 DB 쪽 동작이 wave2 중지 경로와 같고, 미커밋 배치는 연결 종료로 롤백된다.
