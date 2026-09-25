@@ -10,7 +10,11 @@
 
 키 파일 형식
 - 평문(구버전 호환): Fernet 키 44바이트 그대로.
-- 래핑: ``DBMT-KEY1:<scheme>:<base64(blob)>``.
+- 래핑: ``DBMT-KEY2:<scheme>:<base64(blob)>``. blob을 풀면 JSON
+  ``{"v": 2, "key": 현재 키, "previous": 교체 중인 이전 키 또는 null, "migrated": bool}``.
+  `previous`는 키 교체와 DB 재암호화 사이에 중단돼도 이전 키를 잃지 않게 하는 저널이고,
+  `migrated`는 1회 legacy 마이그레이션이 끝났다는 표식이다. 둘 다 보호된 blob 안에 있어
+  DB를 고칠 수 있는 공격자도 위조하거나 지울 수 없다.
 
 모든 쓰기는 같은 디렉터리의 임시 파일에 쓴 뒤 `os.replace`로 교체한다. 도중에 실패하면
 기존 파일은 그대로 남는다.
@@ -22,6 +26,8 @@ import base64
 import binascii
 import contextlib
 import ctypes
+import glob
+import json
 import os
 import sqlite3
 import sys
@@ -34,8 +40,10 @@ from typing import Any, Literal, Protocol
 
 from cryptography.fernet import Fernet
 
-KEY_FILE_HEADER = b"DBMT-KEY1"
+KEY_FILE_HEADER = b"DBMT-KEY2"
 BACKUP_SUFFIX = ".bak-pre-keywrap"
+QUARANTINE_SUFFIX = ".unusable"
+_PAYLOAD_VERSION = 2
 
 # DPAPI 앱 전용 보조 엔트로피. 비밀이 아니다 — 같은 사용자의 다른 앱이 DPAPI blob을
 # 우연히 풀어 쓰는 것을 막는 용도다.
@@ -278,6 +286,25 @@ def backup_sqlite_database(path: Path, suffix: str = BACKUP_SUFFIX) -> Path | No
     return dest
 
 
+def remove_backups(path: Path, suffix: str = BACKUP_SUFFIX) -> list[Path]:
+    """`path`에 대해 만든 백업(과 남은 임시 파일)만 지운다. 지운 경로를 돌려준다."""
+    pattern = glob.escape(str(path.with_name(path.name + suffix))) + "*"
+    removed: list[Path] = []
+    for name in sorted(glob.glob(pattern)):
+        candidate = Path(name)
+        if candidate.is_file():
+            candidate.unlink()
+            removed.append(candidate)
+    return removed
+
+
+def quarantine_file(path: Path, suffix: str = QUARANTINE_SUFFIX) -> Path:
+    """파일을 지우지 않고 옆 이름으로 옮겨 둔다(키 재설정 때 쓸 수 없는 옛 키 보관)."""
+    dest = _backup_destination(path, suffix)
+    os.replace(path, dest)
+    return dest
+
+
 # --- 키 파일 -------------------------------------------------------------------------------
 
 
@@ -289,6 +316,10 @@ class StoredKey:
     key: bytes | None
     form: KeyForm
     scheme: str | None = None
+    # 키 교체 중이면 이전 키(보호된 blob 안에만 있다). 평문 파일에는 없다.
+    previous: bytes | None = None
+    # 1회 legacy 마이그레이션 완료 표식(보호된 blob 안에만 있다). 평문 파일은 항상 False.
+    migrated: bool = False
 
 
 def _validate_fernet_key(key: bytes) -> bytes:
@@ -297,6 +328,26 @@ def _validate_fernet_key(key: bytes) -> bytes:
     except (ValueError, TypeError, binascii.Error) as exc:
         raise KeyFileCorruptError("유효한 Fernet 키가 아닙니다") from exc
     return key
+
+
+def _decode_payload(payload: bytes, scheme: str) -> StoredKey:
+    try:
+        data = json.loads(payload.decode("ascii"))
+        key = data["key"].encode("ascii")
+        prev_raw = data.get("previous")
+        previous = prev_raw.encode("ascii") if prev_raw else None
+        migrated = data.get("migrated") is True
+        if data.get("v") != _PAYLOAD_VERSION:
+            raise ValueError("unknown payload version")
+    except (ValueError, KeyError, TypeError, AttributeError, UnicodeDecodeError) as exc:
+        raise KeyFileCorruptError("래핑된 키의 내용 형식이 잘못되었습니다") from exc
+    return StoredKey(
+        _validate_fernet_key(key),
+        "wrapped",
+        scheme,
+        previous=_validate_fernet_key(previous) if previous is not None else None,
+        migrated=migrated,
+    )
 
 
 class WrappedKeyFile:
@@ -324,27 +375,43 @@ class WrappedKeyFile:
                 blob = base64.b64decode(parts[2], validate=True)
             except binascii.Error as exc:
                 raise KeyFileCorruptError("래핑된 키 파일 본문이 손상되었습니다") from exc
-            key = self.protector.unprotect(blob)
-            return StoredKey(_validate_fernet_key(key), "wrapped", scheme)
+            return _decode_payload(self.protector.unprotect(blob), scheme)
         return StoredKey(_validate_fernet_key(raw), "plain")
 
-    def _encode(self, key: bytes) -> bytes:
+    def _encode(self, key: bytes, previous: bytes | None, migrated: bool) -> bytes:
         if not self.protector.os_protected:
+            if previous is not None:
+                raise KeyProtectError("평문 키 파일에는 이전 키를 함께 둘 수 없습니다")
             return key
-        blob = self.protector.protect(key)
+        payload = json.dumps(
+            {
+                "v": _PAYLOAD_VERSION,
+                "key": key.decode("ascii"),
+                "previous": previous.decode("ascii") if previous is not None else None,
+                "migrated": bool(migrated),
+            },
+            sort_keys=True,
+        ).encode("ascii")
+        blob = self.protector.protect(payload)
         try:
             roundtrip = self.protector.unprotect(blob)
         except SecretStoreError as exc:
             raise KeyProtectError("보호한 키를 다시 풀 수 없습니다") from exc
-        if roundtrip != key:
+        if roundtrip != payload:
             raise KeyProtectError("보호한 키를 되풀었더니 원래 키와 다릅니다")
         scheme = self.protector.scheme.encode("ascii")
         return KEY_FILE_HEADER + b":" + scheme + b":" + base64.b64encode(blob)
 
-    def write(self, key: bytes) -> None:
-        """보호기로 감싸 원자적으로 기록한다. 되풀기 검증에 실패하면 파일을 건드리지 않는다."""
+    def write(self, key: bytes, *, previous: bytes | None = None, migrated: bool = False) -> None:
+        """보호기로 감싸 원자적으로 기록한다. 되풀기 검증에 실패하면 파일을 건드리지 않는다.
+
+        `previous`와 `migrated`는 보호된 blob 안에만 기록된다. 평문 폴백은 `previous`를
+        받지 않고 `migrated`는 기록하지 못한다(호출 측이 DB 표식으로 보완한다).
+        """
         _validate_fernet_key(key)
-        atomic_write_bytes(self.path, self._encode(key))
+        if previous is not None:
+            _validate_fernet_key(previous)
+        atomic_write_bytes(self.path, self._encode(key, previous, migrated))
 
     def write_plain(self, key: bytes) -> None:
         """보호 없이 0600 평문으로 기록한다(보호기 실패 시 최후 수단)."""
@@ -354,3 +421,19 @@ class WrappedKeyFile:
     def harden_permissions(self) -> None:
         if self.path.exists():
             _restrict_to_owner(self.path)
+
+
+def backup_key_file(key_file: WrappedKeyFile, stored: StoredKey) -> Path | None:
+    """키 파일을 백업한다. 평문 키는 보호기로 감싼 형태로만 백업한다.
+
+    OS 보호 저장소가 있는데 평문 키 사본을 만들면, 디렉터리를 복사하는 것만으로 키가
+    새어 나가 M-05 보호가 무력화된다.
+    """
+    if not key_file.path.exists():
+        return None
+    dest = _backup_destination(key_file.path, BACKUP_SUFFIX)
+    if stored.form == "plain" and stored.key is not None and key_file.protector.os_protected:
+        WrappedKeyFile(dest, key_file.protector).write(stored.key)
+    else:
+        atomic_write_bytes(dest, key_file.path.read_bytes())
+    return dest

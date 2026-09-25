@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import shutil
+import sqlite3
 import sys
 from pathlib import Path
 
@@ -19,7 +20,13 @@ from cryptography.fernet import Fernet, InvalidToken
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-from src.database.local_db import Base, LocalDatabase, Profile, SavedConnection
+from src.database.local_db import (
+    Base,
+    LocalDatabase,
+    MigrationHistory,
+    Profile,
+    SavedConnection,
+)
 from src.models import profile as profile_module
 from src.models.profile import (
     ConnectionProfile,
@@ -195,19 +202,24 @@ class TestLegacyMigration:
         assert not any(decrypts(PUBLIC_LEGACY_KEY, t) for t in all_tokens(env.db))
         assert env.profiles().get_all_profiles()[0].target_config["password"] == "dst-pw"
 
-    def test_mixed_rows_keep_existing_key(self, env):
-        """프리셋 관리자가 랜덤 키를 먼저 만들고 프로필은 legacy로 남은 혼합 상태."""
+    def test_mixed_rows_are_moved_to_one_fresh_key(self, env):
+        """프리셋 관리자가 랜덤 평문 키를 먼저 만들고 프로필은 legacy로 남은 혼합 상태.
+
+        평문 키는 래핑하면서 교체한다(리뷰 지적 1). 두 종류 암호문 모두 새 키 하나로 모인다.
+        """
         k0 = Fernet.generate_key()
         env.key_path.write_bytes(k0)
         seed_profile(env.db, "current", k0)
         seed_profile(env.db, "legacy", PUBLIC_LEGACY_KEY)
 
-        names = [p.name for p in env.profiles().get_all_profiles()]
+        profiles = env.profiles().get_all_profiles()
 
-        assert names == ["current", "legacy"]
-        assert env.stored_key() == k0
+        assert [(p.name, p.locked) for p in profiles] == [("current", False), ("legacy", False)]
+        new_key = env.stored_key()
+        assert new_key is not None and new_key != k0
         tokens = all_tokens(env.db)
-        assert all(decrypts(k0, t) for t in tokens)
+        assert all(decrypts(new_key, t) for t in tokens)
+        assert not any(decrypts(k0, t) for t in tokens)
         assert not any(decrypts(PUBLIC_LEGACY_KEY, t) for t in tokens)
 
     def test_read_path_has_no_legacy_fallback(self, env):
@@ -279,21 +291,21 @@ class TestLegacyMigration:
 
 
 class TestKeyWrap:
-    def test_plain_key_file_is_wrapped_and_backed_up(self, env):
+    def test_plain_key_file_is_rotated_and_wrapped(self, env):
+        """평문 키는 래핑하면서 새 키로 교체한다. 백업은 검증 뒤 지운다(리뷰 지적 1)."""
         k0 = Fernet.generate_key()
         env.key_path.write_bytes(k0)
         seed_profile(env.db, "p1", k0)
 
-        assert env.profiles().get_all_profiles()[0].name == "p1"
+        assert env.profiles().get_all_profiles()[0].source_config["password"] == "src-pw"
 
         raw = env.key_path.read_bytes()
         assert raw.startswith(KEY_FILE_HEADER)
         assert k0 not in raw
-        assert env.stored_key() == k0
-        key_backup = env.root / (".encryption_key" + BACKUP_SUFFIX)
-        db_backup = env.root / ("db_migration.db" + BACKUP_SUFFIX)
-        assert key_backup.read_bytes() == k0
-        assert db_backup.exists()
+        stored = env.key_file().read()
+        assert stored.key is not None and stored.key != k0
+        assert stored.previous is None and stored.migrated
+        assert not [p for p in env.root.iterdir() if BACKUP_SUFFIX in p.name]
 
     def test_key_and_db_copied_to_other_machine_cannot_decrypt(self, env, tmp_path):
         k0 = Fernet.generate_key()
@@ -311,8 +323,14 @@ class TestKeyWrap:
         before = snapshot(stolen.root)
         try:
             manager = stolen.profiles()  # 앱은 뜬다
+            assert not manager.key_available
+            profiles = manager.get_all_profiles()  # 이름만 보이는 잠긴 프로필
+            assert [(p.name, p.locked) for p in profiles] == [("p1", True)]
+            assert profiles[0].source_config.get("password", "") == ""
             with pytest.raises(ProfileKeyUnavailableError):
-                manager.get_all_profiles()
+                manager.create_profile(
+                    {"name": "x", "source_config": SOURCE, "target_config": TARGET}
+                )
             saved = stolen.saved()
             assert saved.get_all()[0]["password"] == ""
             with pytest.raises(ProfileKeyUnavailableError):
@@ -363,11 +381,11 @@ class TestFailureSafety:
         real = profile_module._reencrypt_token
         calls = {"n": 0}
 
-        def flaky(legacy, target, token):
+        def flaky(source, target, token):
             calls["n"] += 1
             if calls["n"] == 2:
                 raise RuntimeError("주입된 중간 실패")
-            return real(legacy, target, token)
+            return real(source, target, token)
 
         monkeypatch.setattr(profile_module, "_reencrypt_token", flaky)
         manager = env.profiles()  # 예외가 앱 밖으로 새지 않는다
@@ -376,8 +394,8 @@ class TestFailureSafety:
         persisted = env.stored_key()
         assert persisted is not None and persisted != PUBLIC_LEGACY_KEY
         assert (env.root / ("db_migration.db" + BACKUP_SUFFIX)).exists()
-        with pytest.raises(ProfileDecryptError):
-            manager.get_all_profiles()
+        # 공개 키는 읽기 경로에 없다 — 재암호화가 끝나기 전 legacy 행은 잠긴 채 보인다.
+        assert [p.locked for p in manager.get_all_profiles()] == [True, True, True]
 
         monkeypatch.setattr(profile_module, "_reencrypt_token", real)
         recovered = env.profiles().get_all_profiles()
@@ -427,8 +445,7 @@ class TestFailureSafety:
 
         assert not env.key_path.exists()
         assert all_tokens(env.db) == tokens
-        with pytest.raises(ProfileKeyUnavailableError):
-            manager.get_all_profiles()
+        assert [p.locked for p in manager.get_all_profiles()] == [True]
         with pytest.raises(ProfileKeyUnavailableError):
             manager.create_profile({"name": "x", "source_config": SOURCE, "target_config": TARGET})
 
@@ -452,8 +469,9 @@ class TestFailureSafety:
         # 백업 사본이 생길 수는 있어도 원본 파일은 그대로다.
         after = {k: v for k, v in snapshot(env.root).items() if BACKUP_SUFFIX not in k}
         assert after == before
+        assert [p.locked for p in manager.get_all_profiles()] == [True]
         with pytest.raises(ProfileKeyUnavailableError):
-            manager.get_all_profiles()
+            manager.create_profile({"name": "x", "source_config": SOURCE, "target_config": TARGET})
 
     def test_undecryptable_rows_are_never_deleted(self, env):
         lost = Fernet.generate_key()
@@ -463,8 +481,8 @@ class TestFailureSafety:
         manager = env.profiles()
 
         assert all_tokens(env.db) == tokens
-        with pytest.raises(ProfileDecryptError):
-            manager.get_all_profiles()
+        assert [(p.name, p.locked) for p in manager.get_all_profiles()] == [("orphan", True)]
+        assert all_tokens(env.db) == tokens
 
     def test_corrupt_key_file_is_left_untouched(self, env):
         env.key_path.write_bytes(b"garbage")
@@ -474,5 +492,372 @@ class TestFailureSafety:
         manager = env.profiles()
 
         assert snapshot(env.root) == before
+        assert [p.locked for p in manager.get_all_profiles()] == [True]
         with pytest.raises(ProfileKeyUnavailableError):
-            manager.get_all_profiles()
+            manager.create_profile({"name": "x", "source_config": SOURCE, "target_config": TARGET})
+        assert snapshot(env.root) == before
+
+
+# --- 독립 리뷰 지적 회귀 테스트 -------------------------------------------------------------
+#
+# 1) 평문 키 → 래핑 업그레이드에서 평문 키 사본이 남아 현재 DB를 풀 수 있었다(M-05 무력화).
+# 2) legacy 설치 마이그레이션 뒤 DB 백업이 공개 상수로 풀렸다(H-06 잔존).
+# 3) 마이그레이션 완료 뒤에도 매 시작마다 공개 키 암호문을 재암호화해 "세탁"했다.
+# 4) 복호화 불가 행 하나 또는 키 불가 상태에서 목록 전체가 막히고 복구 경로가 없었다.
+
+
+def sqlite_tokens_in(directory: Path) -> list[str]:
+    """디렉터리 안 모든 SQLite 파일(백업 포함)의 암호문."""
+    tokens: list[str] = []
+    for p in sorted(directory.iterdir()):
+        if not p.is_file() or p.read_bytes()[:16] != b"SQLite format 3\x00":
+            continue
+        con = sqlite3.connect(p)
+        try:
+            for src, dst in con.execute("SELECT source_config, target_config FROM profiles"):
+                tokens += [src, dst]
+            for (pw,) in con.execute("SELECT password FROM saved_connections"):
+                if pw:
+                    tokens.append(pw)
+        finally:
+            con.close()
+    return tokens
+
+
+def plain_keys_in(directory: Path) -> list[bytes]:
+    """디렉터리 안에서 그대로 Fernet 키로 쓸 수 있는 파일 내용."""
+    keys: list[bytes] = []
+    for p in sorted(directory.iterdir()):
+        if not p.is_file():
+            continue
+        raw = p.read_bytes().strip()
+        try:
+            Fernet(raw)
+        except (ValueError, TypeError):
+            continue
+        keys.append(raw)
+    return keys
+
+
+def backups_in(directory: Path) -> list[str]:
+    return sorted(p.name for p in directory.iterdir() if BACKUP_SUFFIX in p.name)
+
+
+def by_name(profiles) -> dict[str, ConnectionProfile]:
+    return {p.name: p for p in profiles}
+
+
+class TestReviewNoKeyMaterialLeftBehind:
+    def test_plain_key_upgrade_rotates_and_leaves_no_plain_key_that_opens_any_db(self, env):
+        k0 = Fernet.generate_key()
+        env.key_path.write_bytes(k0)
+        seed_profile(env.db, "p1", k0)
+        seed_saved(env.db, k0)
+
+        assert env.profiles().get_all_profiles()[0].source_config["password"] == "src-pw"
+
+        new_key = env.stored_key()
+        assert new_key is not None and new_key != k0, "래핑할 때도 키를 교체해야 한다"
+        tokens = sqlite_tokens_in(env.root)
+        assert len(tokens) >= 3
+        assert all(decrypts(new_key, t) for t in all_tokens(env.db))
+        assert sum(decrypts(k0, t) for t in tokens) == 0, "옛 평문 키로 풀리는 사본이 남았다"
+        for key in plain_keys_in(env.root):
+            assert sum(decrypts(key, t) for t in tokens) == 0
+        assert backups_in(env.root) == [], "검증을 마친 마이그레이션 백업은 남기지 않는다"
+
+    def test_whole_directory_copied_to_other_machine_exposes_nothing(self, env, tmp_path):
+        k0 = Fernet.generate_key()
+        env.key_path.write_bytes(k0)
+        seed_profile(env.db, "p1", k0)
+        seed_saved(env.db, k0)
+        env.profiles()
+        env.close()
+
+        stolen_root = tmp_path / "machine-B"
+        shutil.copytree(env.root, stolen_root)
+        tokens = sqlite_tokens_in(stolen_root)
+        assert tokens
+        for key in [k0, PUBLIC_LEGACY_KEY, *plain_keys_in(stolen_root)]:
+            assert sum(decrypts(key, t) for t in tokens) == 0
+
+        stolen = Env(stolen_root, machine=b"machine-B")
+        try:
+            assert all(p.locked for p in stolen.profiles().get_all_profiles())
+        finally:
+            stolen.close()
+
+    def test_legacy_upgrade_leaves_no_public_key_ciphertext_in_any_file(self, env):
+        env.key_path.write_bytes(PUBLIC_LEGACY_KEY)
+        seed_profile(env.db, "p1", PUBLIC_LEGACY_KEY)
+        seed_profile(env.db, "p2", PUBLIC_LEGACY_KEY)
+        seed_saved(env.db, PUBLIC_LEGACY_KEY)
+
+        env.profiles().get_all_profiles()
+
+        tokens = sqlite_tokens_in(env.root)
+        assert len(tokens) >= 5
+        assert sum(decrypts(PUBLIC_LEGACY_KEY, t) for t in tokens) == 0
+        assert backups_in(env.root) == []
+
+    def test_key_backup_taken_during_migration_is_wrapped(self, env, monkeypatch):
+        """마이그레이션 도중(실패로 백업이 남는 동안)에도 키 백업은 평문이 아니다."""
+        k0 = Fernet.generate_key()
+        env.key_path.write_bytes(k0)
+        seed_profile(env.db, "p1", k0)
+
+        def boom(*args, **kwargs):
+            raise RuntimeError("주입된 재암호화 실패")
+
+        monkeypatch.setattr(profile_module, "_reencrypt_token", boom)
+        env.profiles()
+
+        names = backups_in(env.root)
+        assert any(n.startswith(".encryption_key") for n in names)
+        for name in names:
+            assert k0 not in (env.root / name).read_bytes()
+
+
+class TestReviewNoLaunderingAfterMigration:
+    def test_forged_public_key_row_is_not_reencrypted_on_next_start(self, env):
+        seed_profile(env.db, "p1", PUBLIC_LEGACY_KEY)
+        env.profiles()  # 1회 마이그레이션
+        seed_profile(env.db, "forged", PUBLIC_LEGACY_KEY)
+        forged_tokens = [t for t in all_tokens(env.db) if decrypts(PUBLIC_LEGACY_KEY, t)]
+        assert len(forged_tokens) == 2
+        files_before = sorted(p.name for p in env.root.iterdir())
+
+        profiles = by_name(env.profiles().get_all_profiles())
+        env.saved()
+
+        assert profiles["forged"].locked
+        assert "attacker" not in json.dumps(profiles["forged"].source_config)
+        assert not profiles["p1"].locked
+        assert profiles["p1"].source_config["password"] == "src-pw"
+        assert [t for t in all_tokens(env.db) if decrypts(PUBLIC_LEGACY_KEY, t)] == forged_tokens
+        assert sorted(p.name for p in env.root.iterdir()) == files_before, "백업이 쌓이면 안 된다"
+
+    def test_foreign_plain_key_file_after_migration_is_refused(self, env):
+        env.profiles().create_profile(
+            {"name": "p1", "source_config": SOURCE, "target_config": TARGET}
+        )
+        attacker = Fernet.generate_key()
+        env.key_path.write_bytes(attacker)
+        seed_profile(env.db, "forged", attacker)
+        before = snapshot(env.root)
+
+        manager = env.profiles()
+
+        assert snapshot(env.root) == before, "낯선 평문 키를 감싸거나 수용하면 안 된다"
+        assert not manager.key_available
+        assert all(p.locked for p in manager.get_all_profiles())
+        with pytest.raises(ProfileKeyUnavailableError):
+            manager.create_profile({"name": "x", "source_config": SOURCE, "target_config": TARGET})
+
+    def test_deleted_key_file_is_not_silently_replaced_when_data_exists(self, env):
+        env.profiles().create_profile(
+            {"name": "p1", "source_config": SOURCE, "target_config": TARGET}
+        )
+        env.key_path.unlink()
+        before = snapshot(env.root)
+
+        manager = env.profiles()
+
+        assert not env.key_path.exists()
+        assert snapshot(env.root) == before
+        assert [p.locked for p in manager.get_all_profiles()] == [True]
+        with pytest.raises(ProfileKeyUnavailableError):
+            manager.create_profile({"name": "x", "source_config": SOURCE, "target_config": TARGET})
+
+    def test_current_key_reappearing_as_plain_file_is_treated_as_exposed(self, env, caplog):
+        manager = env.profiles()
+        manager.create_profile({"name": "p1", "source_config": SOURCE, "target_config": TARGET})
+        exposed = env.stored_key()
+        assert exposed is not None
+        env.key_path.write_bytes(exposed)  # 누군가 현재 키를 평문으로 꺼내 놓았다
+        caplog.set_level(logging.WARNING)
+
+        assert env.profiles().get_all_profiles()[0].source_config["password"] == "src-pw"
+
+        assert env.key_path.read_bytes().startswith(KEY_FILE_HEADER)
+        assert env.stored_key() != exposed, "노출된 키는 교체해야 한다"
+        assert sum(decrypts(exposed, t) for t in sqlite_tokens_in(env.root)) == 0
+        assert any("평문" in r.getMessage() for r in caplog.records)
+
+    def test_db_marker_removed_does_not_reopen_legacy_migration(self, env):
+        """DB 쪽 표식을 지워도 보호된 키 파일의 완료 표식이 legacy 수용을 막는다."""
+        env.profiles().create_profile(
+            {"name": "p1", "source_config": SOURCE, "target_config": TARGET}
+        )
+        with sqlite3.connect(env.db_path) as con:
+            con.execute(f"DELETE FROM {profile_module.KEY_STATE_TABLE}")
+        seed_profile(env.db, "forged", PUBLIC_LEGACY_KEY)
+
+        profiles = by_name(env.profiles().get_all_profiles())
+
+        assert profiles["forged"].locked
+        assert not profiles["p1"].locked
+
+
+class TestReviewRecovery:
+    def test_one_undecryptable_profile_does_not_hide_the_others(self, env):
+        env.profiles().create_profile(
+            {"name": "good", "source_config": SOURCE, "target_config": TARGET}
+        )
+        seed_profile(env.db, "foreign", Fernet.generate_key())
+
+        profiles = by_name(env.profiles().get_all_profiles())
+
+        assert set(profiles) == {"good", "foreign"}
+        assert not profiles["good"].locked
+        assert profiles["good"].target_config["password"] == "dst-pw"
+        assert profiles["foreign"].locked
+        assert profiles["foreign"].lock_reason
+        assert profiles["foreign"].source_config.get("password", "") == ""
+
+    def test_locked_profile_can_be_reentered_or_deleted(self, env):
+        manager = env.profiles()
+        seed_profile(env.db, "foreign-1", Fernet.generate_key())
+        seed_profile(env.db, "foreign-2", Fernet.generate_key())
+        ids = {p.name: p.id for p in manager.get_all_profiles()}
+
+        selected = manager.get_profile(ids["foreign-1"])
+        assert selected is not None and selected.locked  # 선택은 되어야 편집·삭제할 수 있다
+
+        updated = manager.update_profile(
+            ids["foreign-1"],
+            {"name": "foreign-1", "source_config": SOURCE, "target_config": TARGET},
+        )
+        assert not updated.locked
+        assert manager.delete_profile(ids["foreign-2"])
+        assert [(p.name, p.locked) for p in manager.get_all_profiles()] == [("foreign-1", False)]
+
+    def test_profile_name_lookup_needs_no_key(self, env, tmp_path):
+        env.profiles().create_profile(
+            {"name": "p1", "source_config": SOURCE, "target_config": TARGET}
+        )
+        env.close()
+        other_root = tmp_path / "machine-B"
+        shutil.copytree(env.root, other_root)
+        other = Env(other_root, machine=b"machine-B")
+        try:
+            manager = other.profiles()
+            assert not manager.key_available
+            profile_id = manager.get_all_profiles()[0].id
+            assert manager.get_profile_name(profile_id) == "p1"
+            assert manager.get_profile_name(9999) is None
+        finally:
+            other.close()
+
+    def test_key_reset_quarantines_old_key_and_keeps_history_and_rows(self, env, tmp_path):
+        env.profiles().create_profile(
+            {"name": "old", "source_config": SOURCE, "target_config": TARGET}
+        )
+        with env.db.session_scope() as session:
+            session.add(MigrationHistory(profile_id=1, status="completed"))
+        env.close()
+        root_b = tmp_path / "machine-B"
+        shutil.copytree(env.root, root_b)
+        moved = Env(root_b, machine=b"machine-B")
+        try:
+            old_key_bytes = moved.key_path.read_bytes()
+            old_tokens = all_tokens(moved.db)
+            manager = moved.profiles()
+            assert not manager.key_available
+
+            manager.reset_encryption_key()
+
+            quarantined = [p for p in root_b.iterdir() if ".unusable" in p.name]
+            assert [p.read_bytes() for p in quarantined] == [old_key_bytes], "옛 키는 보관"
+            assert all_tokens(moved.db) == old_tokens, "옛 암호문은 지우지 않는다"
+            with moved.db.session_scope() as session:
+                assert session.query(MigrationHistory).count() == 1
+            manager.create_profile(
+                {"name": "new", "source_config": SOURCE, "target_config": TARGET}
+            )
+
+            restarted = by_name(moved.profiles().get_all_profiles())
+            assert restarted["old"].locked
+            assert not restarted["new"].locked
+        finally:
+            moved.close()
+
+    def test_key_reset_is_refused_while_key_is_usable(self, env):
+        manager = env.profiles()
+        manager.create_profile({"name": "p1", "source_config": SOURCE, "target_config": TARGET})
+        before = snapshot(env.root)
+
+        with pytest.raises(RuntimeError):
+            manager.reset_encryption_key()
+
+        assert snapshot(env.root) == before
+
+
+class TestReviewResumableRotation:
+    def test_wrap_rotation_failing_mid_reencryption_keeps_app_usable_and_resumes(
+        self, env, monkeypatch
+    ):
+        k0 = Fernet.generate_key()
+        env.key_path.write_bytes(k0)
+        seed_profile(env.db, "p0", k0)
+        seed_profile(env.db, "p1", k0)
+        tokens = all_tokens(env.db)
+
+        real = profile_module._reencrypt_token
+        calls = {"n": 0}
+
+        def flaky(*args):
+            calls["n"] += 1
+            if calls["n"] == 2:
+                raise RuntimeError("주입된 중간 실패")
+            return real(*args)
+
+        monkeypatch.setattr(profile_module, "_reencrypt_token", flaky)
+        manager = env.profiles()
+
+        assert all_tokens(env.db) == tokens, "트랜잭션이 통째로 되돌아가야 한다"
+        assert [p.locked for p in manager.get_all_profiles()] == [False, False]
+        assert k0 not in env.key_path.read_bytes()
+        pending = env.key_file().read()
+        assert pending.previous == k0 and pending.key != k0
+        # 도중 상태에서도 새 기록은 새 키로만 한다.
+        manager.create_profile({"name": "p2", "source_config": SOURCE, "target_config": TARGET})
+        new_tokens = [t for t in all_tokens(env.db) if t not in tokens]
+        assert len(new_tokens) == 2
+        assert all(decrypts(pending.key, t) and not decrypts(k0, t) for t in new_tokens)
+        assert backups_in(env.root), "실패한 동안에는 백업을 남긴다"
+
+        monkeypatch.setattr(profile_module, "_reencrypt_token", real)
+        recovered = env.profiles().get_all_profiles()
+
+        assert [p.name for p in recovered] == ["p0", "p1", "p2"]
+        new_key = env.stored_key()
+        assert new_key is not None and new_key != k0
+        assert all(decrypts(new_key, t) for t in all_tokens(env.db))
+        assert sum(decrypts(k0, t) for t in sqlite_tokens_in(env.root)) == 0
+        assert env.key_file().read().previous is None
+        assert backups_in(env.root) == []
+
+    def test_crash_before_dropping_previous_key_is_completed_on_next_start(self, env, monkeypatch):
+        k0 = Fernet.generate_key()
+        env.key_path.write_bytes(k0)
+        seed_profile(env.db, "p1", k0)
+
+        real_write = WrappedKeyFile.write
+
+        def write_then_crash(self, *args, **kwargs):
+            # 재암호화 커밋 뒤 '이전 키를 버리는' 마지막 키 파일 쓰기에서만 실패시킨다.
+            if self.path == env.key_path and kwargs.get("migrated"):
+                raise OSError("주입된 마무리 실패")
+            return real_write(self, *args, **kwargs)
+
+        monkeypatch.setattr(WrappedKeyFile, "write", write_then_crash)
+        env.profiles()
+        assert env.key_file().read().previous == k0
+
+        monkeypatch.setattr(WrappedKeyFile, "write", real_write)
+        assert env.profiles().get_all_profiles()[0].name == "p1"
+
+        assert env.key_file().read().previous is None
+        assert backups_in(env.root) == []
+        assert sum(decrypts(k0, t) for t in sqlite_tokens_in(env.root)) == 0

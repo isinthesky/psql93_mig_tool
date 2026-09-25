@@ -6,10 +6,11 @@ import logging
 from datetime import datetime
 from typing import Any
 
-from cryptography.fernet import Fernet, InvalidToken
+from cryptography.fernet import InvalidToken
 
 from src.database.local_db import LocalDatabase, SavedConnection, get_db
 from src.models.profile import (
+    ProfileCipher,
     ProfileKeyUnavailableError,
     default_profile_key_file,
     ensure_profile_cipher,
@@ -33,7 +34,7 @@ class SavedConnectionManager:
     ):
         self.db = db if db is not None else get_db()
         self._key_file = key_file if key_file is not None else default_profile_key_file()
-        self._cipher: Fernet | None = None
+        self._cipher: ProfileCipher | None = None
         self._key_error: Exception | None = None
         try:
             self._cipher = ensure_profile_cipher(self.db, self._key_file)

@@ -312,3 +312,84 @@ class TestBackups:
             assert copy.execute("select count(*) from t").fetchone()[0] == 2
         finally:
             copy.close()
+
+
+class TestKeyFileJournal:
+    """리뷰 반영: 키 교체 도중 이전 키를 보호된 채로 함께 두는 저널과 완료 표식."""
+
+    def test_previous_key_and_migrated_flag_roundtrip_inside_protected_payload(self, tmp_path):
+        path = tmp_path / ".encryption_key"
+        current, previous = Fernet.generate_key(), Fernet.generate_key()
+        store = WrappedKeyFile(path, FakeDpapi())
+
+        store.write(current, previous=previous)
+
+        raw = path.read_bytes()
+        assert current not in raw and previous not in raw
+        stored = store.read()
+        assert (stored.key, stored.previous, stored.migrated) == (current, previous, False)
+
+        store.write(current, migrated=True)
+        stored = store.read()
+        assert (stored.key, stored.previous, stored.migrated) == (current, None, True)
+
+    def test_plain_file_cannot_hold_previous_key(self, tmp_path):
+        path = tmp_path / ".encryption_key"
+        with pytest.raises(KeyProtectError):
+            WrappedKeyFile(path, PlainFileProtector()).write(
+                Fernet.generate_key(), previous=Fernet.generate_key()
+            )
+        assert not path.exists()
+
+    def test_plain_file_is_never_marked_migrated(self, tmp_path):
+        path = tmp_path / ".encryption_key"
+        store = WrappedKeyFile(path, PlainFileProtector())
+        store.write(Fernet.generate_key(), migrated=True)
+        assert store.read().migrated is False
+
+
+class TestKeyBackupAndCleanup:
+    def test_plain_key_backup_is_wrapped_when_os_protection_exists(self, tmp_path):
+        key = Fernet.generate_key()
+        path = tmp_path / ".encryption_key"
+        path.write_bytes(key)
+        store = WrappedKeyFile(path, FakeDpapi())
+
+        dest = secret_store.backup_key_file(store, store.read())
+
+        assert dest is not None and dest.name == ".encryption_key" + BACKUP_SUFFIX
+        assert key not in dest.read_bytes()
+        assert WrappedKeyFile(dest, FakeDpapi()).read().key == key
+        assert path.read_bytes() == key, "원본 키 파일은 그대로"
+
+    def test_wrapped_key_backup_is_a_byte_copy(self, tmp_path):
+        path = tmp_path / ".encryption_key"
+        store = WrappedKeyFile(path, FakeDpapi())
+        store.write(Fernet.generate_key())
+
+        dest = secret_store.backup_key_file(store, store.read())
+
+        assert dest is not None and dest.read_bytes() == path.read_bytes()
+
+    def test_remove_backups_only_touches_this_files_backups(self, tmp_path):
+        path = tmp_path / "db_migration.db"
+        path.write_bytes(b"db")
+        keep = tmp_path / "other.db.bak-pre-keywrap"
+        keep.write_bytes(b"x")
+        first = backup_file(path)
+        second = backup_file(path)
+
+        removed = secret_store.remove_backups(path)
+
+        assert sorted(removed) == sorted([first, second])
+        assert sorted(p.name for p in tmp_path.iterdir()) == ["db_migration.db", keep.name]
+
+    def test_quarantine_moves_file_aside_without_losing_bytes(self, tmp_path):
+        path = tmp_path / ".encryption_key"
+        path.write_bytes(b"foreign")
+
+        dest = secret_store.quarantine_file(path)
+
+        assert not path.exists()
+        assert dest.read_bytes() == b"foreign"
+        assert BACKUP_SUFFIX not in dest.name, "마이그레이션 백업 정리 대상이 아니어야 한다"
