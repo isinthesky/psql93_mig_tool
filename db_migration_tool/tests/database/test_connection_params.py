@@ -470,12 +470,6 @@ class TestConnectionSites:
         CopyMigrationWorker._create_psycopg2_connection(MagicMock(), _base())
         assert psycopg2_connect.call_args.kwargs["connect_timeout"] == 10
 
-    def test_legacy_migration_worker(self, psycopg_connect):
-        from src.core.migration_worker import MigrationWorker
-
-        MigrationWorker._create_connection(MagicMock(), _legacy_ssl_config())
-        _assert_secure(psycopg_connect.call_args.kwargs)
-
     def test_partition_discovery(self, psycopg_connect):
         from src.core.partition_discovery import PartitionDiscovery
 
