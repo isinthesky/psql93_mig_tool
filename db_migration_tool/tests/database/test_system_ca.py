@@ -117,10 +117,11 @@ class TestFileBundles:
         assert found is None
 
     def test_default_candidates_cover_common_os_bundles(self):
-        paths = {str(p) for p in system_ca.default_candidates()}
-        assert "/etc/ssl/cert.pem" in paths  # macOS, Alpine
-        assert "/etc/ssl/certs/ca-certificates.crt" in paths  # Debian/Ubuntu
-        assert "/etc/pki/tls/certs/ca-bundle.crt" in paths  # RHEL 계열
+        # Path 비교 — Windows에서 str(Path)는 구분자가 역슬래시가 된다.
+        paths = set(system_ca.default_candidates())
+        assert Path("/etc/ssl/cert.pem") in paths  # macOS, Alpine
+        assert Path("/etc/ssl/certs/ca-certificates.crt") in paths  # Debian/Ubuntu
+        assert Path("/etc/pki/tls/certs/ca-bundle.crt") in paths  # RHEL 계열
 
 
 # ── Windows 인증서 저장소 내보내기 ───────────────────────────

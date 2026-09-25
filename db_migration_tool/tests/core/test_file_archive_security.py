@@ -415,7 +415,8 @@ def test_export_racing_writer_on_same_partition_fails_without_mixing_file_and_ma
         rival = ArchiveManifestStore(tmp_path / "archive")
         manifest = rival.load()
         tmp = rival.partitions_dir / ".rival.tmp"
-        tmp.write_text(rival_csv, encoding="utf-8")
+        # 바이트로 쓴다 — Windows 텍스트 모드는 \n을 \r\n으로 바꿔 checksum이 달라진다.
+        tmp.write_bytes(rival_csv.encode("utf-8"))
         meta = rival.compute_file_metadata(tmp)
         rival.commit_partition(
             manifest,
