@@ -2,7 +2,8 @@
 
 **운영 발급은 라이선스 서버의 signer가 한다**(`lgetech-license-server/app/licensing.py`).
 이 도구는 개발·테스트 키 발급과, 서버를 쓸 수 없을 때의 비상 발급에만 쓴다. 서버와 이 도구가
-같은 개인키를 쓴다면 그 키의 사본이 하나 더 있는 것이므로, 사용 후 이 PC의 사본을 지운다.
+같은 개인키를 쓴다면 그 키의 사본이 하나 더 있는 것이므로, 사용 후 작업 PC의 사본은 지우고
+암호화 파일은 오프라인 백업 한 곳에만 둔다(서버 키 형식과의 관계는 아래 '키 교체' 절).
 
 ## 개인키 보호 (감사 M-06)
 
@@ -34,6 +35,10 @@
     python tools/issue_license.py --convert-legacy \\
         --key-file C:\\secure\\old_plain.key --out-private C:\\secure\\license_private.key
 
+    # 키 교체 때만: 암호화 키 → 서버 signer용 raw 32바이트 평문 파일 (새 파일로만 만든다)
+    python tools/issue_license.py --key-file C:\\secure\\license_private.key \\
+        --export-signer-raw C:\\secure\\transfer\\license_private.key
+
 발급 내역은 `--ledger`로 준 CSV에 append 한다. 이 파일도 저장소에 넣지 않는다.
 
 ## 키 교체(rotation) 절차
@@ -41,19 +46,31 @@
 앱은 공개키 하나(`src/licensing/keys.py`의 `LICENSE_PUBLIC_KEY_B32`)만 신뢰한다. 따라서 교체는
 "새 키로 전부 재발급"과 같다.
 
+키 형식이 둘이다. 이 도구는 **암호화 PKCS#8 PEM**만 쓰고 읽는다. 라이선스 서버 signer는
+`secrets/license_private.key`의 **raw 32바이트**만 읽는다(`app/signer.py` `load_private_key`).
+두 형식은 같은 키이고, 형식을 바꾸는 경로는 이 도구의 두 옵션뿐이다.
+암호화 → raw는 `--export-signer-raw`, raw → 암호화는 `--convert-legacy`다.
+암호화 파일은 서버 키의 오프라인 백업을 겸한다.
+
 1. `--genkey`로 새 암호화 키를 만들고 fingerprint를 키 관리 기록에 남긴다.
-2. 라이선스 서버 signer 키와 앱 `keys.py` 공개키를 **함께** 바꾼다(앱/서버 계약, CLAUDE.md §5).
-   공용 테스트 벡터와 공개키 일치 여부를 확인한다.
-3. 새 공개키로 앱을 빌드·배포한다. 옛 키로 서명된 라이선스는 새 앱에서 INVALID가 되므로,
+2. `--export-signer-raw <새 경로>`로 서버용 raw 32바이트 파일을 만든다. 파일은 O_EXCL·0600으로
+   만들고 덮어쓰지 않는다. 가능하면 서버 호스트에서 실행해 `secrets/license_private.key`에
+   바로 쓴다. 다른 PC에서 만들었다면 ssh(scp)로만 옮기고 중간 사본은 즉시 폐기한다.
+   서버 저장소의 `load_private_key` 명령으로 `match`를 확인한다(서버 OPERATIONS.md 'M2 발급 활성화').
+   출력된 `EXPECTED_PUBLIC_KEY_B32`는 서버 고정 공개키와 앱 `keys.py` 값으로 쓴다.
+3. 서버 signer 키·고정 공개키와 앱 `keys.py` 공개키를 **함께** 바꾼다(앱/서버 계약,
+   CLAUDE.md §5). 공용 테스트 벡터와 공개키 일치 여부를 확인한다.
+4. 새 공개키로 앱을 빌드·배포한다. 옛 키로 서명된 라이선스는 새 앱에서 INVALID가 되므로,
    발급 대장의 유효 라이선스를 새 키로 재발급해 새 앱과 함께 전달한다.
-4. 재발급이 끝나면 옛 개인키의 모든 사본(백업 포함)을 폐기하고, 폐기일과 fingerprint를 기록한다.
+5. 재발급이 끝나면 옛 개인키의 모든 사본을 폐기한다. 서버 raw 파일과 백업도 포함한다.
+   폐기일과 fingerprint를 기록한다.
 
 ## 폐기(유출 의심) 절차
 
 앱은 오프라인(TOFU)이라 **개별 라이선스나 키를 원격으로 무효화할 수 없다.** 유출이 의심되면:
 
 1. 즉시 해당 키 사용을 중단하고(서버 signer 포함) 유출 범위·시점을 기록한다.
-2. 위 교체 절차 1~4를 긴급으로 수행한다. 옛 공개키를 가진 기존 빌드는 유출 키로 만든
+2. 위 교체 절차 1~5를 긴급으로 수행한다. 옛 공개키를 가진 기존 빌드는 유출 키로 만든
    위조 라이선스도 계속 받아들이므로, 새 빌드로의 업그레이드가 유일한 차단 수단이다.
 3. 발급 대장에서 교체 전 일련번호를 모두 '폐기 키로 서명됨'으로 표시한다.
 """
@@ -215,11 +232,16 @@ def _write_encrypted(path: Path, private: Ed25519PrivateKey, passphrase: bytes) 
         format=serialization.PrivateFormat.PKCS8,
         encryption_algorithm=serialization.BestAvailableEncryption(passphrase),
     )
+    _create_key_file(path, pem)
+
+
+def _create_key_file(path: Path, data: bytes) -> None:
+    """키 파일을 새로 만든다(O_EXCL, 0600). 기존 파일이 있으면 os.open 이 실패한다."""
     path.parent.mkdir(parents=True, exist_ok=True)
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
     fd = os.open(path, flags, KEY_FILE_MODE)
     with os.fdopen(fd, "wb") as fp:
-        fp.write(pem)
+        fp.write(data)
     restrict_permissions(path)
 
 
@@ -287,6 +309,42 @@ def convert_legacy_key(src: Path, out_private: Path, passphrase: bytes) -> str:
     return fingerprint_of(private)
 
 
+def export_signer_raw(key_file: Path, out_raw: Path, get_passphrase: Callable[[], bytes]) -> str:
+    """암호화 개인키를 라이선스 서버 signer용 raw 32바이트 파일로 내보낸다. fingerprint를 돌려준다.
+
+    서버 signer(`lgetech-license-server/app/signer.py` `load_private_key`)는 raw 32바이트
+    `secrets/license_private.key`만 읽는다. 키 교체 때 운영자가 즉석에서 평문 사본을 만들지
+    않도록 내보내기 경로를 이것 하나로 제한한다.
+
+    - 원본은 암호화 키여야 한다(평문 원본은 `load_private_key`가 패스프레이즈를 묻기 전에 거부).
+    - 결과는 새 파일로만 만든다(O_EXCL, 0600 / Windows는 현재 사용자만). 덮어쓰지 않는다.
+    - 결과는 **평문**이다. 서버 secrets 위치로 옮긴 뒤 중간 사본은 즉시 폐기한다.
+      이 도구는 raw 파일로 발급하지 않는다(평문 키로 보고 거부한다).
+    """
+    if out_raw.exists():
+        raise SystemExit(
+            f"이미 파일이 있습니다: {out_raw}\n"
+            "운영 signer 키를 덮어쓰지 않도록 새 경로에만 내보냅니다. 기존 파일을 확인하세요."
+        )
+    if out_raw.resolve() == key_file.resolve():
+        raise SystemExit("내보낼 경로는 원본 개인키와 달라야 합니다.")
+
+    private = load_private_key(key_file, get_passphrase)
+    raw = private.private_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PrivateFormat.Raw,
+        encryption_algorithm=serialization.NoEncryption(),
+    )
+    _create_key_file(out_raw, raw)
+    _warn(
+        f"라이선스 서버 signer용 평문 개인키(raw 32바이트)를 만들었습니다: {out_raw}\n"
+        "  1) 서버 secrets/license_private.key 로 옮기고 권한 600을 확인하세요.\n"
+        "  2) 서버 저장소에서 load_private_key 로 공개키 일치(match)를 확인하세요.\n"
+        "  3) 서버 밖에 남은 이 평문 사본(전송용 임시 파일 포함)은 즉시 폐기하세요."
+    )
+    return fingerprint_of(private)
+
+
 def public_key_of(private: Ed25519PrivateKey) -> str:
     """개인키에서 공개키를 다시 뽑는다.
 
@@ -347,6 +405,12 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="기존 개인키에서 공개키·fingerprint를 다시 출력 (keys.py 복구용)",
     )
+    parser.add_argument(
+        "--export-signer-raw",
+        type=Path,
+        metavar="OUT",
+        help="암호화 개인키(--key-file)를 서버 signer용 raw 32바이트 평문 파일로 내보냄(키 교체용)",
+    )
     parser.add_argument("--key-file", type=Path, help="발급에 쓸 개인키 경로")
     parser.add_argument("--cust", help="고객사명")
     parser.add_argument("--months", type=int, help="오늘부터 N개월")
@@ -384,6 +448,17 @@ def main(argv: list[str] | None = None) -> int:
         )
         print(f"변환 완료(암호화): {args.out_private}")
         print(f"키 ID       : {fingerprint}")
+        return 0
+
+    if args.export_signer_raw:
+        if not args.key_file:
+            raise SystemExit("--export-signer-raw 에는 --key-file(암호화 원본)이 필요합니다.")
+        fingerprint = export_signer_raw(args.key_file, args.export_signer_raw, _ask_existing)
+        # 패스프레이즈를 다시 묻지 않도록 방금 쓴 raw 파일에서 공개키를 뽑는다.
+        private = Ed25519PrivateKey.from_private_bytes(args.export_signer_raw.read_bytes())
+        print(f"signer 키 저장(평문 raw 32바이트): {args.export_signer_raw}")
+        print(f"키 ID       : {fingerprint}")
+        print(f'EXPECTED_PUBLIC_KEY_B32 = "{public_key_of(private)}"')
         return 0
 
     if args.show_public:

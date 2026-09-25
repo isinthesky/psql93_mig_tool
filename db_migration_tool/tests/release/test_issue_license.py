@@ -255,3 +255,122 @@ class TestMainEndToEnd:
         assert rc == 0
         assert out.read_bytes().startswith(b"-----BEGIN ENCRYPTED PRIVATE KEY-----")
         assert "SHA256:" in capsys.readouterr().out
+
+
+def _server_signer_load(path: Path, expected_public_b32: str) -> Ed25519PrivateKey:
+    """라이선스 서버 signer의 키 로드 계약(lgetech-license-server app/signer.py load_private_key).
+
+    서버는 raw 32바이트 파일만 읽고, 그 공개키가 고정 공개키(Base32, 패딩 없음)와 같아야 한다.
+    다른 저장소라 import 하지 않고 계약만 재현한다.
+    """
+    raw = path.read_bytes()
+    if len(raw) != 32:
+        raise RuntimeError("Ed25519 개인키는 정확히 32바이트여야 합니다.")
+    private = Ed25519PrivateKey.from_private_bytes(raw)
+    if _b32encode(_public_raw(private)) != expected_public_b32:
+        raise RuntimeError("개인키가 고정 공개키와 일치하지 않습니다.")
+    return private
+
+
+class TestExportSignerRaw:
+    """키 교체 때 서버 signer용 raw 32바이트 사본을 만드는 유일한 경로(리뷰 지적 — M-06 후속).
+
+    서버 signer는 raw 32바이트만 읽으므로, 도구가 이 형식을 내보내지 못하면 운영자가 즉석에서
+    평문 사본을 만들게 된다. 내보내기는 암호화 원본에서만, 새 파일(O_EXCL·0600)로만 한다.
+    """
+
+    def test_export_matches_server_signer_contract(self, tool, tmp_path):
+        key_file = tmp_path / "issuer.key"
+        public_b32, fingerprint = tool.generate_keypair(key_file, PASSPHRASE.encode())
+        out = tmp_path / "license_private.key"
+
+        exported_fp = tool.export_signer_raw(key_file, out, lambda: PASSPHRASE.encode())
+
+        assert exported_fp == fingerprint
+        assert len(out.read_bytes()) == 32
+        loaded = _server_signer_load(out, public_b32)
+        original = tool.load_private_key(key_file, lambda: PASSPHRASE.encode())
+        assert _raw_private(loaded) == _raw_private(original)
+
+    @POSIX_ONLY
+    def test_export_file_mode_is_0600(self, tool, tmp_path):
+        key_file = tmp_path / "issuer.key"
+        tool.generate_keypair(key_file, PASSPHRASE.encode())
+        out = tmp_path / "license_private.key"
+        tool.export_signer_raw(key_file, out, lambda: PASSPHRASE.encode())
+        assert stat.S_IMODE(out.stat().st_mode) == 0o600
+
+    def test_export_refuses_existing_output(self, tool, tmp_path):
+        key_file = tmp_path / "issuer.key"
+        tool.generate_keypair(key_file, PASSPHRASE.encode())
+        out = tmp_path / "license_private.key"
+        out.write_bytes(b"keep me")
+        with pytest.raises(SystemExit):
+            tool.export_signer_raw(key_file, out, lambda: PASSPHRASE.encode())
+        assert out.read_bytes() == b"keep me"
+
+    def test_export_refuses_same_path_as_source(self, tool, tmp_path):
+        key_file = tmp_path / "issuer.key"
+        tool.generate_keypair(key_file, PASSPHRASE.encode())
+        before = key_file.read_bytes()
+        with pytest.raises(SystemExit):
+            tool.export_signer_raw(key_file, key_file, lambda: PASSPHRASE.encode())
+        assert key_file.read_bytes() == before
+
+    def test_export_requires_encrypted_source(self, tool, tmp_path):
+        legacy = tmp_path / "legacy.key"
+        _write_legacy_raw_key(legacy)
+        out = tmp_path / "license_private.key"
+        with pytest.raises(SystemExit):
+            tool.export_signer_raw(legacy, out, lambda: PASSPHRASE.encode())
+        assert not out.exists()
+
+    def test_wrong_passphrase_writes_nothing(self, tool, tmp_path):
+        key_file = tmp_path / "issuer.key"
+        tool.generate_keypair(key_file, PASSPHRASE.encode())
+        out = tmp_path / "license_private.key"
+        with pytest.raises(SystemExit):
+            tool.export_signer_raw(key_file, out, lambda: b"wrong passphrase!!")
+        assert not out.exists()
+
+    def test_exported_raw_cannot_be_used_to_issue(self, tool, tmp_path):
+        """내보낸 raw 사본이 도구의 새 발급 경로가 되지 않는다(평문 키로 취급해 거부)."""
+        key_file = tmp_path / "issuer.key"
+        tool.generate_keypair(key_file, PASSPHRASE.encode())
+        out = tmp_path / "license_private.key"
+        tool.export_signer_raw(key_file, out, lambda: PASSPHRASE.encode())
+        with pytest.raises(SystemExit) as info:
+            tool.load_private_key(out, lambda: PASSPHRASE.encode())
+        assert "--convert-legacy" in str(info.value)
+
+    def test_export_cli_prints_key_id_and_warns(self, tool, tmp_path, env_passphrase, capsys):
+        key_file = tmp_path / "issuer.key"
+        public_b32, fingerprint = tool.generate_keypair(key_file, PASSPHRASE.encode())
+        out = tmp_path / "license_private.key"
+
+        rc = tool.main(["--export-signer-raw", str(out), "--key-file", str(key_file)])
+
+        assert rc == 0
+        captured = capsys.readouterr()
+        assert fingerprint in captured.out
+        assert public_b32 in captured.out  # 서버 EXPECTED_PUBLIC_KEY_B32 와 대조할 값
+        assert "평문" in captured.err  # 평문 사본이라는 경고와 폐기 안내
+        assert PASSPHRASE not in captured.out + captured.err
+        _server_signer_load(out, public_b32)
+
+    def test_export_cli_requires_key_file(self, tool, tmp_path, env_passphrase):
+        with pytest.raises(SystemExit):
+            tool.main(["--export-signer-raw", str(tmp_path / "out.key")])
+
+
+class TestRotationDocs:
+    """교체 절차가 서버 signer 키 형식(raw 32바이트)과 만드는 방법을 명시한다."""
+
+    GUIDE = Path(__file__).resolve().parents[2] / "LICENSE_GUIDE.md"
+
+    @pytest.mark.parametrize("source", ["docstring", "guide"])
+    def test_rotation_names_signer_export(self, tool, source):
+        text = tool.__doc__ if source == "docstring" else self.GUIDE.read_text(encoding="utf-8")
+        assert "--export-signer-raw" in text
+        assert "license_private.key" in text
+        assert "32바이트" in text
