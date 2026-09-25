@@ -11,7 +11,6 @@ from typing import Any
 
 import psycopg2
 import psycopg2.extensions
-from psycopg2 import sql
 from PySide6.QtCore import Signal
 
 from src.core.archive_manifest import (
@@ -31,6 +30,7 @@ from src.core.table_types import (
     infer_partition_range,
 )
 from src.database.connection_params import connect_psycopg2
+from src.database.postgres_utils import qualified_name, quote_ident
 from src.models.profile import ConnectionProfile
 
 
@@ -210,7 +210,7 @@ class ArchiveMigrationWorkerBase(BaseMigrationWorker):
                 """
                 SELECT column_name, data_type, character_maximum_length, is_nullable, column_default
                 FROM information_schema.columns
-                WHERE table_name = %s
+                WHERE table_schema = 'public' AND table_name = %s
                 ORDER BY ordinal_position
                 """,
                 (parent_table,),
@@ -234,7 +234,7 @@ class ArchiveMigrationWorkerBase(BaseMigrationWorker):
             cur.execute(
                 """
                 SELECT table_data, from_date, to_date
-                FROM partition_table_info
+                FROM public.partition_table_info
                 WHERE table_name = %s
                 """,
                 (partition_name,),
@@ -255,8 +255,29 @@ class ArchiveMigrationWorkerBase(BaseMigrationWorker):
     @staticmethod
     def _query_row_count(conn, partition_name: str) -> int:
         with conn.cursor() as cur:
-            cur.execute(sql.SQL("SELECT COUNT(*) FROM {}").format(sql.Identifier(partition_name)))
+            cur.execute(f"SELECT COUNT(*) FROM {qualified_name(partition_name)}")
             return int(cur.fetchone()[0])
+
+    @staticmethod
+    def _export_copy_sql(table_type: TableType, partition_name: str) -> str:
+        """`COPY (SELECT ... FROM "public"."파티션" ORDER BY pk) TO STDOUT`."""
+        table_config = TABLE_TYPE_CONFIG[table_type]
+        cols = ", ".join(quote_ident(col) for col in table_config.columns)
+        order_columns = get_partition_primary_key_columns(table_type) or table_config.columns
+        order = ", ".join(quote_ident(col) for col in order_columns)
+        return (
+            f"COPY (SELECT {cols} FROM {qualified_name(partition_name)} ORDER BY {order}) "
+            "TO STDOUT WITH (FORMAT CSV, HEADER FALSE)"
+        )
+
+    @staticmethod
+    def _import_copy_sql(partition_name: str, columns: list[str]) -> str:
+        """`COPY "public"."파티션" (cols) FROM STDIN`."""
+        cols = ", ".join(quote_ident(col) for col in columns)
+        return (
+            f"COPY {qualified_name(partition_name)} ({cols}) "
+            "FROM STDIN WITH (FORMAT CSV, HEADER FALSE)"
+        )
 
     @staticmethod
     def _cleanup_file(path: Path) -> bool:
@@ -584,20 +605,7 @@ class PostgresToFileArchiveWorker(ArchiveMigrationWorkerBase):
             )
 
             table_config = TABLE_TYPE_CONFIG[table_type]
-            cols_sql = sql.SQL(", ").join(sql.Identifier(col) for col in table_config.columns)
-            order_columns = get_partition_primary_key_columns(table_type) or table_config.columns
-            order_sql = sql.SQL(", ").join(sql.Identifier(col) for col in order_columns)
-            copy_query = (
-                sql.SQL(
-                    "COPY (SELECT {cols} FROM {tbl} ORDER BY {order}) TO STDOUT WITH (FORMAT CSV, HEADER FALSE)"
-                )
-                .format(
-                    cols=cols_sql,
-                    tbl=sql.Identifier(partition_name),
-                    order=order_sql,
-                )
-                .as_string(self.source_conn)
-            )
+            copy_query = self._export_copy_sql(table_type, partition_name)
 
             current_phase = "export"
             self._raise_if_stopped(partition_name, current_phase)
@@ -961,15 +969,7 @@ class FileToPostgresArchiveWorker(ArchiveMigrationWorkerBase):
             )
             self._prepare_target_table(partition_name, checkpoint, creator)
 
-            cols_sql = sql.SQL(", ").join(sql.Identifier(col) for col in expected_columns)
-            copy_query = (
-                sql.SQL("COPY {tbl} ({cols}) FROM STDIN WITH (FORMAT CSV, HEADER FALSE)")
-                .format(
-                    tbl=sql.Identifier(partition_name),
-                    cols=cols_sql,
-                )
-                .as_string(self.target_conn)
-            )
+            copy_query = self._import_copy_sql(partition_name, expected_columns)
 
             current_phase = "copy"
             self._raise_if_stopped(partition_name, current_phase)

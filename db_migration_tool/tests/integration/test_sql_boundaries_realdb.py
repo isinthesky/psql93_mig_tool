@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import io
 import os
 from collections.abc import Iterator
 from datetime import date
@@ -28,6 +29,7 @@ import psycopg2
 import pytest
 
 import src.core.scan_workers as scan_mod
+from src.core.file_archive_workers import ArchiveMigrationWorkerBase
 from src.core.partition_discovery import PartitionDiscovery
 from src.core.table_creator import IGNORABLE_CLUSTER_SQLSTATES, TableCreator
 from src.core.table_types import TableType
@@ -82,6 +84,12 @@ def _src() -> Any:
     conn = psycopg2.connect(**_cfg("SRC"))
     conn.set_session(readonly=True)
     return conn
+
+
+def _all(conn: Any, query: str, params: tuple = ()) -> list[tuple]:
+    with conn.cursor() as cur:
+        cur.execute(query, params)
+        return list(cur.fetchall())
 
 
 def _one(conn: Any, query: str, params: tuple = ()) -> Any:
@@ -373,3 +381,60 @@ def test_m14_h04_real_trigger_ddl_routes_to_public_partition(shadow):
         )
         == old_src
     ), "ROLLBACK 후에도 기존 트리거 함수가 바뀌었습니다"
+
+
+def test_h04_archive_queries_and_copy_use_public_under_shadow(shadow):
+    """아카이브 워커: 부모 컬럼(information_schema)·COUNT·metadata·COPY TO/FROM이 shadow
+    search_path에서도 public만 본다. COPY FROM은 트랜잭션 안에서만 하고 ROLLBACK."""
+    admin = shadow["admin"]
+    if _one(admin, "SELECT to_regclass(%s)", (f"public.{PARTITION}",)) is None:
+        source, target = _src(), _dst()
+        try:
+            TableCreator(source, target).ensure_partition_ready(PARTITION)
+        finally:
+            source.close()
+            target.close()
+    before = _shadow_state(admin)
+    public_cols = [
+        r[0]
+        for r in _all(
+            admin,
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_schema = 'public' AND table_name = %s ORDER BY ordinal_position",
+            (PARENT,),
+        )
+    ]
+    public_rows = _one(admin, f"SELECT count(*) FROM public.{PARTITION}")
+
+    conn = _dst(f"{SHADOW},public")
+    try:
+        assert _one(conn, "SHOW search_path").startswith(SHADOW)
+        base = ArchiveMigrationWorkerBase
+        cols = [c["name"] for c in base._query_parent_columns(conn, PARENT)]
+        assert cols == public_cols and "x" not in cols, cols
+        assert base._query_row_count(conn, PARTITION) == public_rows
+        meta = base._query_partition_meta(conn, PARTITION, TableType.POINT_HISTORY)
+        assert meta["from_date"] == shadow["from"], "shadow partition_table_info를 읽었습니다"
+
+        buf = io.StringIO()
+        with conn.cursor() as cur:
+            cur.copy_expert(base._export_copy_sql(TableType.POINT_HISTORY, PARTITION), buf)
+        lines = buf.getvalue().splitlines()
+        assert len(lines) == public_rows
+        assert not any("shadow" in line for line in lines)
+
+        line = f"888888,{shadow['from']},imp,true\n"
+        with conn.cursor() as cur:
+            cur.copy_expert(
+                base._import_copy_sql(
+                    PARTITION, ["path_id", "issued_date", "changed_value", "connection_status"]
+                ),
+                io.StringIO(line),
+            )
+        assert _one(conn, f"SELECT count(*) FROM public.{PARTITION}") == public_rows + 1
+        assert _one(conn, f"SELECT count(*) FROM {SHADOW}.{PARTITION}") == SHADOW_ROWS
+    finally:
+        conn.rollback()
+        conn.close()
+    assert _one(admin, f"SELECT count(*) FROM public.{PARTITION}") == public_rows
+    assert _shadow_state(admin) == before

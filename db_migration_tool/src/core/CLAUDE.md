@@ -48,6 +48,8 @@
 - relation은 `qualified_name(name)`(= `"public"."name"`) 또는 `sql.Identifier("public", name)`로
   schema를 한정한다. 이름 문자열을 `regclass`로 바꾸는 함수(`pg_table_size('name')`)는 쓰지 않고
   카탈로그 oid를 쓴다. 연결의 `search_path=public`은 2차 방어일 뿐이다.
+- `information_schema.columns/tables`는 search_path와 무관하게 모든 스키마를 보여 주므로
+  반드시 `table_schema = 'public'` 조건을 붙인다(search_path 방어가 통하지 않는다).
 - 실패해도 되는 문장은 `isolated_statement()`/`run_optional_statement()`(SAVEPOINT)로 감싼다.
   예외를 잡기만 하면 트랜잭션이 중단돼 이후 문장이 전부 `25P02`로 거부된다.
 - 무시 여부는 예외 클래스가 아니라 `sqlstate_of()`로 판단한다(허용 목록 밖은 즉시 실패).
