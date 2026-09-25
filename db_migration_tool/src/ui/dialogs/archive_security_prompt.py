@@ -53,7 +53,7 @@ def resolve_archive_security(
     """실행에 쓸 passphrase와 legacy 허용 여부를 정한다. 사용자가 취소하면 None."""
     if mode == MODE_EXPORT:
         return _resolve_export(info, ask_passphrase, confirm, alert)
-    return _resolve_import(info, ask_passphrase, confirm)
+    return _resolve_import(info, ask_passphrase, confirm, alert)
 
 
 def _resolve_export(
@@ -101,7 +101,7 @@ def _resolve_export(
 
 
 def _resolve_import(
-    info: ArchiveSecurityInfo, ask: AskPassphrase, confirm: Confirm
+    info: ArchiveSecurityInfo, ask: AskPassphrase, confirm: Confirm, alert: Alert
 ) -> ArchiveSecurityChoice | None:
     if not info.exists:
         # manifest가 없으면 워커가 명확한 오류로 멈춘다. 여기서 막을 일은 없다.
@@ -125,6 +125,25 @@ def _resolve_import(
             if not allow:
                 return None
         return ArchiveSecurityChoice(text, allow)
+
+    # 인증 정보가 없다. auth 블록을 지운 서명 아카이브(다운그레이드)와 진짜 legacy는 파일만으로
+    # 구분할 수 없으므로, 사용자가 아는 사실(export 때 passphrase를 지정했는지)을 먼저 묻는다.
+    text, ok = ask(
+        "인증 정보 없는 아카이브",
+        "이 아카이브의 manifest에는 인증 정보가 없습니다.\n"
+        "export 때 passphrase를 지정했다면 입력하세요(인증 정보가 제거된 것이므로 거부됩니다).\n"
+        "지정하지 않았다면(1.2.7 이하 export 포함) 비워 두고 확인을 누르세요.",
+    )
+    if not ok:
+        return None
+    if text:
+        alert(
+            "다운그레이드 의심",
+            "passphrase로 export한 아카이브인데 manifest에 인증 정보가 없습니다.\n"
+            "인증 정보가 제거되었거나 다른 아카이브로 바뀌었을 수 있어 가져오지 않습니다.\n"
+            "원본 매체에서 아카이브를 다시 받으세요.",
+        )
+        return None
 
     accepted = confirm(
         "인증 없는 아카이브 가져오기",

@@ -184,6 +184,86 @@ def test_save_does_not_clobber_entries_when_primary_manifest_is_unreadable(tmp_p
     assert set(disk) == {"point_history_240101", "point_history_240102"}
 
 
+def _save_entry(store, manifest, name, *, row_count=1):
+    store.upsert_partition(manifest, _entry(name, row_count=row_count))
+    store.save(manifest)
+
+
+def test_backup_fallback_keeps_entry_this_writer_committed_last(tmp_path):
+    """리뷰 지적: 백업은 항상 한 번 전 저장본이다. 기본 manifest가 깨졌을 때 이 writer가
+    바꾸지 않은 항목을 백업 값으로 두면, 마지막으로 commit한 파티션이 manifest에서 사라진다."""
+    archive = tmp_path / "archive"
+    store = ArchiveManifestStore(archive)
+    manifest = store.load_or_create()
+    for name in ("point_history_240100", "point_history_240101", "point_history_240102"):
+        _save_entry(store, manifest, name)
+
+    store.manifest_path.write_text("{torn", encoding="utf-8")
+    _save_entry(store, manifest, "point_history_240109")
+
+    disk = _disk(store)
+    assert set(disk) == {
+        "point_history_240100",
+        "point_history_240101",
+        "point_history_240102",
+        "point_history_240109",
+    }
+    assert disk["point_history_240102"]["checksum_sha256"] == f"{1:064x}"
+
+
+def test_backup_fallback_does_not_roll_back_newer_entry(tmp_path):
+    archive = tmp_path / "archive"
+    store = ArchiveManifestStore(archive)
+    manifest = store.load_or_create()
+    _save_entry(store, manifest, "point_history_240101", row_count=1)
+    _save_entry(store, manifest, "point_history_240101", row_count=2)
+    newest = _disk(store)["point_history_240101"]
+    revision = json.loads(store.manifest_path.read_text(encoding="utf-8"))["revision"]
+
+    store.manifest_path.write_text("{torn", encoding="utf-8")
+    _save_entry(store, manifest, "point_history_240109")
+
+    data = json.loads(store.manifest_path.read_text(encoding="utf-8"))
+    disk = {item["partition_name"]: item for item in data["partitions"]}
+    assert disk["point_history_240101"]["row_count"] == 2
+    assert disk["point_history_240101"]["entry_version"] == newest["entry_version"]
+    # revision도 뒤로 가지 않는다.
+    assert data["revision"] > revision
+
+
+def test_backup_fallback_allows_reexport_of_last_committed_entry(tmp_path):
+    """백업이 한 번 늦어 디스크 version이 base보다 낮다 — 다른 writer가 아니므로 충돌이 아니다."""
+    archive = tmp_path / "archive"
+    store = ArchiveManifestStore(archive)
+    manifest = store.load_or_create()
+    _save_entry(store, manifest, "point_history_240101", row_count=1)
+    _save_entry(store, manifest, "point_history_240101", row_count=2)
+    version = _disk(store)["point_history_240101"]["entry_version"]
+
+    store.manifest_path.write_text("{torn", encoding="utf-8")
+    _save_entry(store, manifest, "point_history_240101", row_count=3)
+
+    disk = _disk(store)
+    assert disk["point_history_240101"]["row_count"] == 3
+    assert disk["point_history_240101"]["entry_version"] == version + 1
+
+
+def test_backup_fallback_keeps_parent_table_added_last(tmp_path):
+    archive = tmp_path / "archive"
+    store = ArchiveManifestStore(archive)
+    manifest = store.load_or_create()
+    manifest.parent_tables["point_history"] = {"table_type": "PH", "columns": []}
+    store.save(manifest)
+    manifest.parent_tables["trend_history"] = {"table_type": "TH", "columns": []}
+    store.save(manifest)
+
+    store.manifest_path.write_text("{torn", encoding="utf-8")
+    _save_entry(store, manifest, "point_history_240109")
+
+    data = json.loads(store.manifest_path.read_text(encoding="utf-8"))
+    assert set(data["parent_tables"]) == {"point_history", "trend_history"}
+
+
 def test_save_refuses_when_no_readable_manifest_exists_on_disk(tmp_path):
     archive = tmp_path / "archive"
     seed = ArchiveManifestStore(archive)

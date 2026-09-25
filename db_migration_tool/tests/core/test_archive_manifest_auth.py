@@ -241,6 +241,45 @@ def test_stripped_auth_block_needs_explicit_confirmation(tmp_path):
         reader.require_trusted(manifest)
 
 
+def _strip_auth_and_tamper(store: ArchiveManifestStore) -> None:
+    """리뷰 재현: auth 제거 + version 2 + 파일과 checksum 동시 변조(legacy와 똑같이 보인다)."""
+    import hashlib
+
+    forged = b"1,2024-01-01 00:00:00,999.0,0\n"
+    store.build_partition_file_path(NAME).write_bytes(forged)
+
+    def mutate(data):
+        data.pop("auth")
+        data["version"] = 2
+        item = data["partitions"][0]
+        item["checksum_sha256"] = hashlib.sha256(forged).hexdigest()
+        item["bytes_written"] = len(forged)
+
+    _rewrite(store, mutate)
+
+
+def test_passphrase_with_unsigned_manifest_is_rejected_as_downgrade(tmp_path):
+    """passphrase를 줬다 = export 때 서명했다는 뜻. 인증 없는 manifest는 다운그레이드 의심이다.
+    legacy 확인 플래그로도 우회할 수 없다."""
+    store = _store(tmp_path / "a", passphrase=PASS)
+    _export_one(store)
+    _strip_auth_and_tamper(store)
+
+    reader = _store(tmp_path / "a", passphrase=PASS, allow_legacy_unverified=True)
+    manifest = reader.load()
+    assert not manifest.is_signed
+    with pytest.raises(ManifestAuthError, match="다운그레이드"):
+        reader.require_trusted(manifest)
+
+
+def test_passphrase_with_legacy_archive_is_rejected_as_downgrade(tmp_path):
+    archive = tmp_path / "legacy"
+    _write_legacy_v2_archive(archive)
+    reader = _store(archive, passphrase=PASS, allow_legacy_unverified=True)
+    with pytest.raises(ManifestAuthError, match="다운그레이드"):
+        reader.require_trusted(reader.load())
+
+
 def test_legacy_archive_requires_explicit_flag_and_warns(tmp_path):
     archive = tmp_path / "legacy"
     _write_legacy_v2_archive(archive)

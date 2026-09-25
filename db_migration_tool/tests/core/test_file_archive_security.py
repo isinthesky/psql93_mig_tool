@@ -185,6 +185,24 @@ def test_import_legacy_archive_with_confirmation_warns_and_proceeds(tmp_path):
     assert any(level == "WARNING" and "인증" in msg for level, msg in logs)
 
 
+def test_import_with_passphrase_refuses_stripped_auth_before_connecting(tmp_path):
+    store = _write_signed_archive(tmp_path)
+    data = json.loads(store.manifest_path.read_text(encoding="utf-8"))
+    data.pop("auth")
+    data["version"] = 2
+    store.manifest_path.write_text(json.dumps(data), encoding="utf-8")
+
+    worker = _import_worker(tmp_path, passphrase=PASS, allow_legacy_unverified=True)
+    worker._create_psycopg2_connection = Mock()
+    worker._import_partition = Mock()
+
+    with pytest.raises(ManifestAuthError, match="다운그레이드"):
+        worker._execute_migration()
+
+    worker._create_psycopg2_connection.assert_not_called()
+    worker._import_partition.assert_not_called()
+
+
 def test_import_signed_archive_requires_passphrase(tmp_path):
     _write_signed_archive(tmp_path)
     worker = _import_worker(tmp_path, allow_legacy_unverified=True)

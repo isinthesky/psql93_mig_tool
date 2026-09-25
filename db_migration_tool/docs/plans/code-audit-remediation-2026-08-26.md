@@ -220,8 +220,8 @@
 
 | ID | 상태 | 수정 내용 |
 |---|---|---|
-| M-02 | 해결(단위 검증) | `ArchiveManifestStore.save`: 잠금 안에서 디스크 최신본을 다시 읽어 3-way 병합. 파티션 항목마다 `entry_version` CAS — 이 writer가 안 바꾼 항목은 디스크 값 유지, 바꾼 항목은 base version·내용이 디스크와 같을 때만 +1 기록, 아니면 `ManifestConflictError`. 디스크 manifest를 못 읽으면 덮지 않고 실패(예전엔 예외를 삼키고 덮음). export는 `commit_partition`으로 파일 교체와 항목 기록을 같은 잠금 안에서 해 경쟁 writer와 섞이지 않는다. Windows 락은 60초 비차단 재시도, `os.replace` 읽기 경합 재시도. |
-| M-04 | 해결(단위 검증) | 신규 항목 `checksum_sha256` 필수(없으면 저장 실패), import는 checksum 없는 항목을 명시적 확인 없이 거부. passphrase 기반 PBKDF2-SHA256(600k)+HMAC-SHA256으로 canonical manifest 인증(export 때 지정했으면 import 때 필수, 기계별 키 없음). 다운그레이드(auth 제거)·세탁(변조 디스크 재서명)·passphrase 없는 쓰기 차단. import는 대상 DB 연결 전에 신뢰 판정 + 선택 파일 전체 SHA-256 사전 검증, DDL은 검증된 메모리 manifest로만 생성(TOCTOU). legacy(1.2.7 이하 48건)는 UI의 명시적 확인 + 작업 로그 WARNING으로만 import. 신뢰 경계: `docs/base/archive-trust-boundary.md`. |
+| M-02 | 해결(단위 검증) | `ArchiveManifestStore.save`: 잠금 안에서 디스크 최신본을 다시 읽어 3-way 병합. 파티션 항목마다 `entry_version` CAS — 이 writer가 안 바꾼 항목은 디스크 값 유지, 바꾼 항목은 base version·내용이 디스크와 같을 때만 +1 기록, 아니면 `ManifestConflictError`. 디스크 manifest를 못 읽으면 덮지 않고 실패(예전엔 예외를 삼키고 덮음). 기본 manifest가 깨져 한 번 늦은 백업으로 병합할 때는 이 writer가 이미 본 항목(없음·낮은 version)을 되살려 마지막 commit 항목이 사라지지 않는다(리뷰 지적 수정). export는 `commit_partition`으로 파일 교체와 항목 기록을 같은 잠금 안에서 해 경쟁 writer와 섞이지 않는다. Windows 락은 60초 비차단 재시도, `os.replace` 읽기 경합 재시도. |
+| M-04 | 해결(단위 검증) | 신규 항목 `checksum_sha256` 필수(없으면 저장 실패), import는 checksum 없는 항목을 명시적 확인 없이 거부. passphrase 기반 PBKDF2-SHA256(600k)+HMAC-SHA256으로 canonical manifest 인증(export 때 지정했으면 import 때 필수, 기계별 키 없음). 세탁(변조 디스크 재서명)·passphrase 없는 쓰기는 차단. 다운그레이드(auth 제거)는 **passphrase를 입력하면 거부**(import 확인 창이 인증 없는 경로에서도 export 때 passphrase를 지정했는지 먼저 묻는다)하지만, 사용자가 비워 두면 legacy와 구분할 수 없어 **명시적 확인 + WARNING(차단 아님)**. 같은 PC에서의 기계적 탐지(로컬 이력 DB에 경로별 salt·revision 기록)는 후속 과제. import는 대상 DB 연결 전에 신뢰 판정 + 선택 파일 전체 SHA-256 사전 검증, DDL은 검증된 메모리 manifest로만 생성(TOCTOU). legacy(1.2.7 이하 48건)는 UI의 명시적 확인 + 작업 로그 WARNING으로만 import. 신뢰 경계: `docs/base/archive-trust-boundary.md`. |
 
 검증
 - 단위 테스트 672 passed(기존 607 + 신규 65): `tests/core/test_archive_manifest_cas.py`(스레드 4·프로세스 3 경쟁 포함),

@@ -59,6 +59,9 @@
 - 파티션 파일을 최종 경로로 옮기는 일은 `commit_partition()` 안에서 manifest 기록과 함께 한다.
 - 새 파티션 항목은 `checksum_sha256` 필수. import는 checksum·인증 없는 아카이브를
   `allow_legacy_unverified`(사용자 명시 확인) 없이는 거부하고, 허용하면 WARNING을 남긴다.
+  passphrase를 줬는데 manifest가 인증 없음이면 다운그레이드 의심으로 무조건 거부한다.
+- `entry_version`은 단조 증가, 항목 삭제 경로 없음. 병합 때 디스크가 base보다 뒤처지면(백업 폴백)
+  오래된 사본으로 보고 되살린다 — 디스크 값을 따라 항목을 잃지 않는다.
 - import는 대상 DB 연결 전에 `require_trusted()`와 전 파일 사전 검증을 하고, DDL은
   검증된 메모리 manifest(`ManifestTableCreator(manifest=...)`)로만 만든다. 디스크를 다시 읽지 않는다.
 - passphrase는 워커 `configure_archive_security()`로만 받는다. 저장·로그 금지.

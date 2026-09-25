@@ -196,7 +196,13 @@ def _snapshot(data: dict[str, Any]) -> dict[str, Any]:
         },
         "source": _canon(data.get("source") or {}),
         "target": _canon(data.get("target") or {}),
+        "revision": _revision(data),
     }
+
+
+def _revision(data: dict[str, Any]) -> int:
+    value = data.get("revision", 0)
+    return value if isinstance(value, int) and not isinstance(value, bool) else 0
 
 
 def _normalize_checksum(value: Any) -> str:
@@ -350,8 +356,9 @@ class ArchiveManifestStore:
             인증된 manifest면 빈 목록.
 
         Raises:
-            ManifestAuthError: 서명됐는데 passphrase가 없거나, 인증 정보가 없는데
-                명시적 허용(``allow_legacy_unverified``)이 없을 때.
+            ManifestAuthError: 서명됐는데 passphrase가 없거나, passphrase를 줬는데 인증
+                정보가 없거나(다운그레이드 의심), 인증 정보가 없는데 명시적 허용
+                (``allow_legacy_unverified``)이 없을 때.
         """
         if manifest.is_signed:
             if manifest.is_authenticated:
@@ -359,6 +366,16 @@ class ArchiveManifestStore:
             raise ManifestAuthError(
                 "이 아카이브는 passphrase로 보호되어 있습니다. export 때 지정한 "
                 "passphrase를 입력해야 가져올 수 있습니다."
+            )
+        if self._passphrase is not None:
+            # passphrase를 줬다 = 사용자는 이 아카이브를 서명해 export했다고 알고 있다.
+            # 그런데 인증 정보가 없다면 auth 블록이 제거된 것(다운그레이드)으로 본다.
+            # legacy 확인 플래그로도 우회할 수 없다.
+            raise ManifestAuthError(
+                "passphrase를 입력했지만 manifest에 인증 정보가 없습니다. 서명된 아카이브에서 "
+                "인증 정보가 제거된 것(다운그레이드)으로 의심되어 거부합니다. passphrase 없이 "
+                "export한 아카이브라면 passphrase를 비우고 '인증 없는 아카이브 가져오기'를 "
+                "확인하세요."
             )
         message = (
             "manifest에 인증 정보가 없습니다(1.2.7 이하에서 만들었거나 passphrase 없이 "
@@ -658,13 +675,20 @@ class ArchiveManifestStore:
         # parent_tables: 키 단위 3-way. 양쪽이 서로 다르게 바꿨으면 충돌.
         theirs_parents: dict[str, Any] = theirs.get("parent_tables") or {}
         parents = copy.deepcopy(theirs_parents)
+        restored: list[str] = []
         for name, value in (mine.get("parent_tables") or {}).items():
             mine_c = _canon(value)
             base_c = base["parent_tables"].get(name)
-            if mine_c == base_c:
-                continue
             their_value = theirs_parents.get(name)
-            their_c = None if their_value is None else _canon(their_value)
+            # 삭제 경로는 없다. 이 writer가 본 키가 디스크에 없으면 디스크가 오래된 사본
+            # (백업 폴백)이다 — 사라진 것으로 따르지 않고 되살린다.
+            stale = base_c is not None and their_value is None
+            if mine_c == base_c:
+                if stale:
+                    parents[name] = copy.deepcopy(value)
+                    restored.append(f"parent_table:{name}")
+                continue
+            their_c = base_c if stale else (None if their_value is None else _canon(their_value))
             if their_c not in (base_c, mine_c):
                 raise ManifestConflictError(
                     f"parent_table '{name}' 메타데이터를 다른 작업이 먼저 다르게 변경했습니다."
@@ -680,15 +704,32 @@ class ArchiveManifestStore:
             name = item.get("partition_name")
             mine_c = _entry_content(item)
             base_c = base["partitions"].get(name)
+            base_v = base["versions"].get(name, 0)
+            their = by_name.get(name)
+            their_v = _entry_version(their)
+            # entry_version은 단조 증가하고 항목을 지우는 경로는 없다. 이 writer가 이미 본
+            # 것보다 디스크가 오래됐다면(항목 없음 또는 낮은 version) 디스크는 오래된 사본
+            # (manifest.json이 깨져 한 번 늦은 백업으로 폴백)이다. 되돌리지 않는다.
+            stale = base_c is not None and (their is None or their_v < base_v)
             if mine_c == base_c:
+                if stale:
+                    # 이 writer가 바꾸지 않았지만 디스크가 뒤처졌다 → 알고 있는 값을 되살린다.
+                    if name not in by_name:
+                        order.append(name)
+                    by_name[name] = copy.deepcopy(item)
+                    by_name[name]["entry_version"] = base_v
+                    restored.append(name)
+                    continue
                 # 이 writer가 바꾸지 않은 항목 → 디스크의 최신 값을 유지한다.
                 continue
-            their = by_name.get(name)
-            their_c = None if their is None else _entry_content(their)
+            if stale:
+                # 오래된 사본은 다른 writer의 변경이 아니다. base와 같은 것으로 본다.
+                their_c = base_c
+                their_v = base_v
+            else:
+                their_c = None if their is None else _entry_content(their)
             if their_c == mine_c:
                 continue  # 같은 값을 이미 누가 썼다 — 충돌 아님
-            base_v = base["versions"].get(name, 0)
-            their_v = _entry_version(their)
             if their_c != base_c or their_v != base_v:
                 raise ManifestConflictError(
                     f"파티션 '{name}' 항목을 다른 작업이 먼저 변경했습니다 "
@@ -703,10 +744,14 @@ class ArchiveManifestStore:
             by_name[name] = new_item
         merged["partitions"] = [by_name[name] for name in order]
 
-        their_revision = theirs.get("revision", 0)
-        if not isinstance(their_revision, int) or isinstance(their_revision, bool):
-            their_revision = 0
-        merged["revision"] = their_revision + 1
+        if restored:
+            self._warn(
+                f"디스크 manifest가 이 작업이 기록한 것보다 오래되어(백업 폴백 등) 항목 "
+                f"{len(restored)}개를 되살렸습니다: {', '.join(restored[:10])}"
+                + (" …" if len(restored) > 10 else "")
+            )
+        # revision도 뒤로 가지 않는다(오래된 백업의 revision보다 이 writer가 본 값이 클 수 있다).
+        merged["revision"] = max(_revision(theirs), int(base.get("revision", 0))) + 1
         return merged
 
     def _adopt_written(self, manifest: ArchiveManifest, written: dict[str, Any]) -> None:

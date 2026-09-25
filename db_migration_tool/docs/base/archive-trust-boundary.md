@@ -14,7 +14,8 @@
 | 공유 폴더·USB에서 **데이터 파일만** 바꿈 | SHA-256 불일치 | 거부 |
 | **파일과 manifest checksum을 함께** 바꿈 | manifest 전체에 passphrase 기반 HMAC-SHA256 | 거부(passphrase를 모르는 공격자는 MAC을 못 만든다) |
 | manifest의 DDL 메타데이터(`parent_tables.columns`)·경로·행 수 조작 | 같은 HMAC가 manifest 전체를 덮는다 | 거부 |
-| `auth` 블록을 지워 legacy처럼 보이게 함(다운그레이드) | 인증 없는 manifest는 **명시적 확인** 없이는 import 불가 | 조용한 통과 없음. 확인하면 경고가 작업 로그에 남는다 |
+| `auth` 블록을 지워 legacy처럼 보이게 함(다운그레이드) — 사용자가 passphrase를 입력한 경우 | passphrase가 있는데 manifest가 인증 없음 → `require_trusted`가 `allow_legacy_unverified`와 무관하게 거부. import 확인 창도 인증 없는 경로에서 "export 때 passphrase를 지정했나"를 먼저 묻고, 입력하면 "다운그레이드 의심"으로 시작하지 않는다 | **거부** |
+| 같은 다운그레이드 — 사용자가 passphrase를 **비워 두고** legacy 확인을 누른 경우 | 파일만으로는 진짜 legacy와 구분할 수 없다 | **차단 아님.** 명시적 확인이 필요하고 경고가 작업 로그에 남는다(§1 한계 7) |
 | 검증 뒤 디스크 manifest 바꿔치기(TOCTOU) | import는 검증한 메모리 사본만 쓴다(`ManifestTableCreator(manifest=...)`), 데이터 파일은 검증한 핸들 그대로 COPY | 거부 |
 | 두 writer(스레드·프로세스)의 동시 저장 | 파일 락 + 항목별 `entry_version` CAS | 한쪽은 `ManifestConflictError`로 실패, 조용한 덮어쓰기 없음 |
 
@@ -31,6 +32,14 @@
    그 순간의 폴더 내용을 그대로 믿는다.
 5. passphrase 강도는 사용자 몫이다. PBKDF2-SHA256 600,000회로 오프라인 추측 비용을 올릴 뿐이다.
 6. 대상 PostgreSQL 연결 보안(H-05 TLS)은 이 문서 범위가 아니다.
+7. **다운그레이드는 사용자의 기억에 기대어서만 막힌다.** 공격자가 `auth`를 지우고 `version`을
+   2로 바꾸고 파일과 checksum을 함께 바꾸면, 그 아카이브는 1.2.7 이하 legacy와 바이트 수준에서
+   구분되지 않는다. 사용자가 "passphrase로 export했다"고 답하면(passphrase 입력) 거부되지만,
+   비워 두고 legacy 확인을 누르면 가져온다. legacy 확인은 "차단"이 아니라 "명시적 확인 + 경고"다.
+   같은 PC에서의 다운그레이드·롤백을 기계적으로 막으려면 로컬 이력 DB에 export 경로별
+   salt·revision을 남기는 외부 상태가 필요하다(미구현, 후속 과제).
+   export 쪽도 같다: 인증 없는 기존 폴더에 passphrase로 이어 쓰려면 "채택" 확인이 필요할 뿐,
+   auth가 지워진 폴더인지 판별하지 못한다. 채택 확인 창은 새 폴더 export를 권장한다.
 
 ## 2. manifest 인증 형식
 
@@ -82,8 +91,9 @@
 2. 신뢰 판정(`require_trusted`) — **대상 DB에 연결하기 전**:
    - 서명 + 검증됨 → 진행
    - 서명됐는데 passphrase 없음 → 거부(확인 플래그로도 우회 불가)
-   - 인증 없음(legacy·passphrase 미지정·auth 제거) → `allow_legacy_unverified` 명시 확인이
-     있을 때만 진행, 경고를 작업 로그에 남긴다
+   - 인증 없음 + passphrase 입력 → **거부**(다운그레이드 의심, 확인 플래그로도 우회 불가)
+   - 인증 없음 + passphrase 없음(legacy·passphrase 미지정 export·사용자가 비워 둔 auth 제거)
+     → `allow_legacy_unverified` 명시 확인이 있을 때만 진행, 경고를 작업 로그에 남긴다
 3. **사전 검증**: 선택한 모든 파티션 파일의 SHA-256을 manifest와 대조한다. 하나라도 틀리면
    대상 DB를 건드리기 전에 전체 거부(`skip_on_error`면 경고 후 해당 파티션만 개별 실패).
 4. 파티션마다 파일을 한 번 열어 같은 핸들로 다시 검증한 뒤 그대로 COPY(TOCTOU 방어),
@@ -97,7 +107,8 @@ DB 적재 시간보다 작다.
 ### 기존 아카이브(1.2.7 이하, 48건) 하위 호환
 
 - 1.2.7 이하 export는 checksum은 있지만 `auth`가 없다(version 2).
-- 가져올 때 UI가 "인증 없는 아카이브 가져오기" 확인을 받는다. 확인하면 진행하고, 거부하면
+- 가져올 때 UI가 먼저 "export 때 passphrase를 지정했나"를 묻는다(legacy는 비워 둔다).
+  이어서 "인증 없는 아카이브 가져오기" 확인을 받는다. 확인하면 진행하고, 거부하면
   시작하지 않는다. 조용히 통과하는 경로는 없다.
 - 계속 쓸 아카이브라면 **새 폴더로 passphrase를 지정해 다시 export** 하는 것을 권장한다.
   기존 폴더를 "채택"해 서명할 수도 있지만, 그 시점의 폴더 내용을 그대로 믿는 것이다.
@@ -119,6 +130,14 @@ DB 적재 시간보다 작다.
 - 기록은 임시 파일 → `fsync` → `os.replace`(Windows는 읽기 경합 시 짧게 재시도)로 원자적이다.
 - 디스크 manifest가 깨져 있으면 백업으로 병합하고, 둘 다 못 읽으면 **덮어쓰지 않고 실패**한다
   (예전에는 예외를 삼키고 메모리 값으로 덮어 다른 writer 항목을 잃었다).
+- 백업은 항상 **한 번 전** 저장본이다. 그래서 백업으로 병합할 때는 디스크가 이 writer가 이미 본
+  것보다 뒤처질 수 있다. `entry_version`은 단조 증가하고 항목을 지우는 경로가 없으므로,
+  base에 있던 항목이 디스크에 없거나 디스크 version이 base보다 낮으면 디스크를 **오래된 사본**으로
+  보고 이 writer가 아는 값을 되살린다(WARNING). 그 항목을 이 writer가 다시 바꾸는 경우도
+  충돌이 아니라 base 기준으로 +1 한다. `parent_tables`는 version이 없어 "없어진 키"만 되살린다.
+  `revision`도 `max(디스크, base) + 1`로 뒤로 가지 않는다.
+  한계: 백업 이후 **다른 writer**가 기록한 항목은 이 writer의 메모리에 없으므로 되살릴 수 없다
+  (데이터 파일은 남고, 재개하면 다시 export된다).
 - 저장이 끝나면 호출자의 메모리 manifest는 기록된 최신본으로 바뀐다.
 - export 도중 같은 파티션을 다른 작업이 먼저 기록하면 그 파티션은 `failed`(재개 가능)로 끝나고,
   디스크의 파일과 manifest는 먼저 기록한 쪽 것으로 서로 일치한다.
@@ -127,7 +146,7 @@ DB 적재 시간보다 작다.
 
 | 파일 | 내용 |
 |---|---|
-| `tests/core/test_archive_manifest_cas.py` | stale writer lost update 재현, 같은 항목 충돌, 동일 값 비충돌, version 증가, 깨진 manifest 비덮어쓰기, `commit_partition` CAS, 스레드 4개·프로세스 3개 경쟁 |
-| `tests/core/test_archive_manifest_auth.py` | 서명·검증, 잘못된 passphrase, 필드별 변조, 파일+checksum 동시 변조, 재직렬화, 다른 경로 이동, NFC/NFD, 백업 비폴백, auth 제거(다운그레이드), legacy 확인 플래그, checksum 필수, 다운그레이드·세탁·채택 |
+| `tests/core/test_archive_manifest_cas.py` | stale writer lost update 재현, 같은 항목 충돌, 동일 값 비충돌, version 증가, 깨진 manifest 비덮어쓰기, 한 번 늦은 백업 폴백에서 항목·version·revision·parent_table 비후퇴, `commit_partition` CAS, 스레드 4개·프로세스 3개 경쟁 |
+| `tests/core/test_archive_manifest_auth.py` | 서명·검증, 잘못된 passphrase, 필드별 변조, 파일+checksum 동시 변조, 재직렬화, 다른 경로 이동, NFC/NFD, 백업 비폴백, auth 제거(다운그레이드: passphrase 입력 시 거부, 미입력 시 확인 필요), legacy 확인 플래그, checksum 필수, 다운그레이드·세탁·채택 |
 | `tests/core/test_file_archive_security.py` | import 신뢰 판정이 대상 연결보다 먼저, legacy 확인·경고, 검증된 manifest로 DDL, checksum 없는 항목, 사전 검증, export 서명·경고·경쟁 |
-| `tests/ui/dialogs/test_archive_security_prompt.py` | 실행 전 확인 대화 판단 로직 |
+| `tests/ui/dialogs/test_archive_security_prompt.py` | 실행 전 확인 대화 판단 로직(인증 없는 import 경로의 passphrase 질문·다운그레이드 거부 포함) |

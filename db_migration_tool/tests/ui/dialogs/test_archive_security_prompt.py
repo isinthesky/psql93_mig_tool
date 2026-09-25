@@ -49,18 +49,42 @@ class Script:
         )
 
 
+NO_PASSPHRASE = ("", True)
+
+
 def test_import_legacy_archive_needs_explicit_confirmation():
-    script = Script(confirms=[True])
+    script = Script(answers=[NO_PASSPHRASE], confirms=[True])
     assert script.run(MODE_IMPORT, UNSIGNED) == ArchiveSecurityChoice(None, True)
     assert script.confirmed and "인증 정보가 없습니다" in script.confirmed[0]
 
 
 def test_import_legacy_archive_declined_does_not_start():
-    assert Script(confirms=[False]).run(MODE_IMPORT, UNSIGNED) is None
+    assert Script(answers=[NO_PASSPHRASE], confirms=[False]).run(MODE_IMPORT, UNSIGNED) is None
+
+
+def test_import_unsigned_archive_asks_for_export_passphrase_before_legacy_confirm():
+    """리뷰 지적: 인증 없는 경로에서 passphrase를 묻지 않으면 auth를 지운 아카이브가
+    legacy 확인 한 번으로 통과한다. 먼저 'export 때 passphrase를 지정했나'를 묻는다."""
+    script = Script(answers=[NO_PASSPHRASE], confirms=[True])
+    script.run(MODE_IMPORT, UNSIGNED)
+    assert len(script.asked) == 1
+
+
+def test_import_unsigned_archive_with_passphrase_is_refused_as_downgrade():
+    script = Script(answers=[("pw", True)], confirms=[True])
+    assert script.run(MODE_IMPORT, UNSIGNED) is None
+    assert script.alerts == ["다운그레이드 의심"]
+    assert not script.confirmed  # legacy 확인 창으로 넘어가지 않는다
+
+
+def test_import_unsigned_archive_passphrase_prompt_cancelled_does_not_start():
+    script = Script(answers=[("", False)], confirms=[True])
+    assert script.run(MODE_IMPORT, UNSIGNED) is None
+    assert not script.confirmed
 
 
 def test_import_legacy_warning_lists_missing_checksums():
-    script = Script(confirms=[True])
+    script = Script(answers=[NO_PASSPHRASE], confirms=[True])
     script.run(MODE_IMPORT, UNSIGNED_NO_SUM)
     assert "point_history_240101" in script.confirmed[0]
 
@@ -149,6 +173,24 @@ def test_prompt_legacy_archive_confirmed(tmp_path, monkeypatch):
     from src.core.archive_manifest import ArchiveManifestStore
 
     ArchiveManifestStore(tmp_path / "a").load_or_create()
-    mod, _ = _patch_dialogs(monkeypatch, texts=[], yes=True)
+    mod, _ = _patch_dialogs(monkeypatch, texts=[""], yes=True)
     choice = mod.prompt_archive_security(None, mode=MODE_IMPORT, archive_path=str(tmp_path / "a"))
     assert choice == ArchiveSecurityChoice(None, True)
+
+
+def test_prompt_stripped_auth_archive_refused_when_passphrase_entered(tmp_path, monkeypatch):
+    """서명된 아카이브에서 auth를 지운 경우 — 사용자가 passphrase를 넣으면 시작하지 않는다."""
+    import json
+
+    from src.core.archive_manifest import ArchiveManifestStore
+
+    path = _signed_archive(tmp_path)
+    manifest_path = ArchiveManifestStore(path).manifest_path
+    data = json.loads(manifest_path.read_text(encoding="utf-8"))
+    data.pop("auth")
+    data["version"] = 2
+    manifest_path.write_text(json.dumps(data), encoding="utf-8")
+
+    mod, alerts = _patch_dialogs(monkeypatch, texts=["pw"], yes=True)
+    assert mod.prompt_archive_security(None, mode=MODE_IMPORT, archive_path=path) is None
+    assert alerts == ["다운그레이드 의심"]
