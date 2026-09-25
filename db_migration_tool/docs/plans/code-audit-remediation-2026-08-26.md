@@ -250,3 +250,28 @@
 - 실DB E2E: 해당 작업에 배정된 파티션이 없어 수행하지 않음(아카이브 경로는 DB 쪽이 기존 COPY와 동일).
 
 남은 한계: 같은 passphrase로 만든 예전 아카이브 한 벌로의 롤백, 기밀성(암호화 없음)은 범위 밖(문서화).
+
+### 8.3 wave1 통합 (main 병합, 2026-09-25)
+
+`audit/w1-conn` → `w1-secrets` → `w1-hist` → `w1-release` → `w1-archive` 순으로 `--no-ff` 병합했다.
+§8.1·§8.2 외 브랜치의 상태는 아래와 같다.
+
+| ID | 상태 | 요약 | 남은 것(리뷰 지적) |
+|---|---|---|---|
+| H-05 | 해결 | 공용 빌더 `src/database/connection_params.py`로 PostgreSQL 연결 지점을 모두 모았다. SSL 기본값은 `verify-full`, CA 칸이 비면 `src/database/system_ca.py`가 OS 신뢰 저장소 PEM을 찾아 넘긴다. `require`는 위험 승인과 감사 로그가 있어야 한다. | 기존 SSL 프로필이 `require`에서 `verify-full`로 바뀐다(릴리스 노트). Windows 실제 TLS PostgreSQL 연결은 릴리스 게이트 |
+| H-02 / H-04 | 부분(연결 단계) | 모든 연결에 `connect_timeout`(기본 10초)과 `search_path=public`을 적용했다. | COPY·commit 취소, relation schema 한정 |
+| H-06 / M-05 | 해결 | 읽기 경로의 legacy fallback을 없애고 1회 마이그레이션(키 교체·재암호화·백업 정리·완료 표식)으로 대체했다. 키는 DPAPI로 감싼다(비Windows는 0600 평문). 복호화하지 못한 행은 잠긴 프로필로 보인다. | 2차 리뷰 major: 첫 매니저 생성이 fallback 키로 끝난 뒤 같은 프로세스의 다른 매니저가 마이그레이션에 성공하면 키가 갈라져 새 자격 증명이 재시작 후 잠길 수 있다. 다운그레이드 불가(릴리스 노트) |
+| H-08 / H-09 / M-12 | 해결(legacy 한계) | 이력과 checkpoint를 한 트랜잭션으로 만들고 endpoint 지문·불변 계획으로 재개를 검증한다. 미완료 이력이 있는 프로필은 명시적 폐기 후에만 삭제된다. | 2차 리뷰 major: legacy 채택이 뒤 유형이 통째로 빠진 다중 유형 이력을 잡지 못한다. 아카이브 경로의 legacy 보충 파티션은 워커가 완료하지 못한다 |
+
+병합 중 처리
+- 텍스트 충돌: `file_archive_migration_dialog.py` import 인접 줄(둘 다 유지), 이 문서 끝 절(§8.1·§8.2로 분리).
+- 의미 충돌: 잠긴 프로필 편집 시 `_confirm_identity_change`가 기본값 설정과 비교하던 문제를 미완료 이력의
+  endpoint 지문과 비교하도록 고쳤다.
+
+검증: 단위 978 passed / 2 skipped, ruff format·check, mypy(61 files) 통과, TLS 통합 13 passed.
+실DB E2E(bms93 → temp, `--drop-after`): Python COPY `point_history_260507`(4,704,295행), Server COPY
+`point_history_260508`(4,704,267행), 중단→재개 `point_history_260509`(4,702,462행, identity 게이트 확인)
+모두 원본·대상 집계 5종 일치.
+
+남은 항목: H-01(UI 표시), H-02·H-04 잔여, H-03, M-01, M-03, M-11(인증서), M-13, M-14와 위 리뷰 지적.
+재감사 전까지 운영 승인 보류 원칙은 유지한다.

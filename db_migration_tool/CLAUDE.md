@@ -60,7 +60,7 @@ make test    # pytest tests/ -v --tb=short (test-unit / test-integration / test-
 ### Windows (`my-wsl-01`, `db_migration_tool\`)
 ```bat
 uv run ruff format --check src tests && uv run ruff check src tests && uv run mypy src
-uv run pytest -m "not integration" -v      :: 단위 테스트 — 570 passed (2026-09-25 기준)
+uv run pytest -m "not integration" -v      :: 단위 테스트 — 978 passed (2026-09-25 wave1 병합 후)
 set DBMIG_RUN_REAL_PROFILE_TESTS=1&& .venv\Scripts\python.exe -m pytest -m integration -k saved_profiles -q
                                             :: 실DB 연결 검증(APPDATA 프로필의 source=bms93, target=bms30) — 1 passed
 build.bat                                  :: PyInstaller -> dist\DBMigrationTool.exe
@@ -98,7 +98,11 @@ installer\build_installer.bat              :: Inno Setup -> dist\installer\DBMig
 
 **2026-09-25 수정 — v1.2.7로 출시(main `027be89`)**: C-01, C-02, H-07, H-01(워커 측) 해결 +
 모든 복사 경로에 **파티션 완료 전 원본·대상 `COUNT(*)` 일치 검증** 추가. 상세·검증 결과는 감사 문서 §8.
-아래 원문 설명은 수정 전 상태 기록이다. 나머지 H-02~H-06, H-08, H-09, M-*는 미해결.
+아래 원문 설명은 수정 전 상태 기록이다.
+
+**2026-09-25 wave1 병합(main)**: H-05, H-06, H-08, H-09, M-02, M-04~M-10, M-12 해결, H-02·H-04는 연결 단계만,
+M-11은 서명 훅만(인증서 없음). 상세와 남은 리뷰 지적은 감사 문서 §8.1~§8.3. 나머지(H-01 UI, H-03, M-01, M-03,
+M-13, M-14 등)는 미해결.
 
 - **C-01** — `CopyStreamBuffer.close()`가 큐 포화 시 취소 상태를 설정하지만 `read()`가 남은 데이터를
   비우지 않고 EOF를 반환한다. 대상에는 앞부분만 반영되는데 checkpoint는 전진할 수 있다
