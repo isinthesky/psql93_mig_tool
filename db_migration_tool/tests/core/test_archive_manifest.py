@@ -102,6 +102,8 @@ def test_verify_partition_file_detects_size_mismatch(tmp_path):
     data_file = store.build_partition_file_path("point_history_240101")
     data_file.parent.mkdir(parents=True, exist_ok=True)
     data_file.write_text("1,1704067200000,12.3,0\n", encoding="utf-8")
+    # 신규 항목은 checksum이 필수다(M-04). 올바른 checksum이어도 크기가 다르면 걸려야 한다.
+    integrity = store.compute_file_metadata(data_file)
 
     entry = ArchivePartitionEntry(
         partition_name="point_history_240101",
@@ -111,6 +113,7 @@ def test_verify_partition_file_detects_size_mismatch(tmp_path):
         file_path="partitions/point_history_240101.csv",
         columns=["path_id", "issued_date", "changed_value", "connection_status"],
         bytes_written=999,
+        checksum_sha256=integrity["checksum_sha256"],
     )
     store.upsert_partition(manifest, entry)
     store.save(manifest)
@@ -133,6 +136,7 @@ def test_filter_partitions_by_date_and_type(tmp_path):
             columns=["path_id", "issued_date", "changed_value", "connection_status"],
             from_timestamp=1704067200000,
             to_timestamp=1704153599000,
+            checksum_sha256="a" * 64,
         ),
     )
     store.upsert_partition(
@@ -146,6 +150,7 @@ def test_filter_partitions_by_date_and_type(tmp_path):
             columns=["path_id", "issued_date", "changed_value", "connection_status"],
             from_timestamp=1706745600000,
             to_timestamp=1709251199000,
+            checksum_sha256="a" * 64,
         ),
     )
     store.save(manifest)

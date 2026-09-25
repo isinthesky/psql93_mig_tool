@@ -149,11 +149,19 @@ def build_manifest_with_partition(worker: FileToPostgresArchiveWorker, *, checks
         from_timestamp=1704067200000,
         to_timestamp=1704153599000,
         bytes_written=metadata["bytes_written"],
-        checksum_sha256=checksum_sha256,
+        checksum_sha256=checksum_sha256 or metadata["checksum_sha256"],
         verified_at=metadata["verified_at"],
     )
     store.upsert_partition(manifest, entry)
     store.save(manifest)
+    if checksum_sha256 is None:
+        # 신규 저장은 checksum이 필수(M-04)이므로, checksum 없는 legacy 항목은
+        # 디스크 manifest를 직접 고쳐 흉내낸다.
+        data = json.loads(store.manifest_path.read_text(encoding="utf-8"))
+        data["partitions"][0]["checksum_sha256"] = None
+        store.manifest_path.write_text(json.dumps(data), encoding="utf-8")
+        manifest = store.load()
+        entry.checksum_sha256 = None
     return manifest, entry, metadata
 
 
@@ -252,7 +260,11 @@ def test_import_worker_skip_on_error_continues_to_next_partition(tmp_path):
         ]
     )
     worker._create_psycopg2_connection = Mock(return_value=DummyConn())
-    worker.archive_store.load = Mock(return_value=SimpleNamespace(partitions=[]))
+    worker.archive_store.load = Mock(
+        return_value=SimpleNamespace(partitions=[], is_authenticated=False)
+    )
+    # 신뢰 판정(M-04)은 test_file_archive_security.py에서 따로 검증한다.
+    worker.archive_store.require_trusted = Mock(return_value=[])
 
     calls = []
 
