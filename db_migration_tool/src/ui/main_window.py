@@ -144,6 +144,16 @@ class MainWindow(QMainWindow):
         log_viewer_action.triggered.connect(self.show_log_viewer)
         toolbar.addAction(log_viewer_action)
 
+        toolbar.addSeparator()
+
+        # 라이선스 액션 — 정상·만료 임박 상태에서도 갱신 키를 등록할 수 있게 한다.
+        # (등록 창이 제한 상태에서만 열리면 만료 전 갱신 경로가 없다.)
+        license_action = QAction("라이선스", self)
+        license_action.setStatusTip("라이선스 상태를 확인하고 새 키(갱신 키)를 등록합니다.")
+        license_action.setToolTip("라이선스 상태 확인·키 등록")
+        license_action.triggered.connect(self.show_license_dialog)
+        toolbar.addAction(license_action)
+
     def create_statusbar(self):
         """상태바 생성"""
         self.status_bar = QStatusBar()

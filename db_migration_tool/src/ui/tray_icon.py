@@ -105,6 +105,11 @@ class TrayIconManager(QObject):
 
         menu.addSeparator()
 
+        # === 라이선스 ===
+        license_action = QAction("라이선스", self.app)
+        license_action.triggered.connect(self._show_license)
+        menu.addAction(license_action)
+
         # === 정보 ===
         about_action = QAction("정보", self.app)
         about_action.triggered.connect(self._show_about)
@@ -161,6 +166,12 @@ class TrayIconManager(QObject):
         # MainWindow의 로그 뷰어 다이얼로그 열기
         if hasattr(self.main_window, "show_log_viewer"):
             self.main_window.show_log_viewer()
+
+    def _show_license(self):
+        """라이선스 상태·등록 창 열기(만료 전 갱신 키 등록 경로)"""
+        self._show_window()
+        if hasattr(self.main_window, "show_license_dialog"):
+            self.main_window.show_license_dialog()
 
     def _show_about(self):
         """정보 다이얼로그 표시"""

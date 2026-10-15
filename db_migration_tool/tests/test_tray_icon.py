@@ -105,6 +105,24 @@ class TestTrayIconManager:
         # 이력이 새로고침되었는지 확인
         mock_main_window.refresh_history.assert_called_once()
 
+    def test_license_action_opens_license_dialog(self, tray_manager, mock_main_window):
+        """트레이 '라이선스'는 창을 띄우고 등록 창을 연다(만료 전 갱신 경로)."""
+        tray_manager._show_license()
+
+        mock_main_window.show.assert_called_once()
+        mock_main_window.show_license_dialog.assert_called_once()
+
+    def test_tray_menu_has_license_item(self, qapp, mock_main_window):
+        """트레이 메뉴에 '라이선스' 항목이 있다."""
+        with patch("src.ui.tray_icon.QSystemTrayIcon") as mock_tray:
+            mock_tray_instance = MagicMock()
+            mock_tray_instance.isSystemTrayAvailable.return_value = True
+            mock_tray.return_value = mock_tray_instance
+            manager = TrayIconManager(qapp, mock_main_window)
+            manager.setup()
+            menu = mock_tray_instance.setContextMenu.call_args.args[0]
+            assert "라이선스" in [action.text() for action in menu.actions()]
+
     def test_quit_action(self, tray_manager, qapp):
         """종료 액션 테스트"""
         # quit 모킹
