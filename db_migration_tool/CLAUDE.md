@@ -6,7 +6,7 @@
   target에 새로 생성)을 소스 `bms93`(PG 9.3)에서 대상 `bms30`(PG 16)로 이관한다.
 - 부가 기능: 파일 아카이브 export/import 프로필(`src/core/file_archive_workers.py`,
   `src/ui/dialogs/file_archive_migration_dialog.py`).
-- 버전 `1.2.9` (`src/version.py`, `pyproject.toml`, `installer/DBMigrationTool.iss`, `uv.lock` 네 곳
+- 버전 `1.2.10` (`src/version.py`, `pyproject.toml`, `installer/DBMigrationTool.iss`, `uv.lock` 네 곳
   동기화, `tools/bump_version.py`가 관리 — 손으로 고치지 않는다).
 - `requires-python = ">=3.13"` (`pyproject.toml`), uv로 관리.
 
@@ -75,7 +75,7 @@ installer\build_installer.bat              :: Inno Setup -> dist\installer\DBMig
 - 원격 실행 시 `cmd /c "build.bat < NUL"` — 오류 경로의 `pause`가 입력 대기로 멈추지 않게 한다.
 - `.gitattributes` 도입 이전 체크아웃에는 `.bat`이 LF로 남아 있을 수 있다(cmd가 한글 줄을 오해석해
   `build_installer.bat`이 실패하던 원인). 증상이 보이면 스크립트를 지우고 `git checkout -- <file>`로 CRLF 재생성.
-- 산출물은 **미서명**(Authenticode NotSigned). 1.2.9 해시: exe `4B7F7075…52988267`, 설치본 `61E2D5E0…4B4C8B71`.
+- 산출물은 **미서명**(Authenticode NotSigned). 1.2.10(툴바·트레이 '라이선스' 메뉴) 해시: exe `DE8EC112…C212CE72`, 설치본 `A4C2F9DA…1DD73889`(90,510,915 B) — 라이선스 관리자 콘솔 '프로그램 다운로드'에 게시. 1.2.9 해시: exe `4B7F7075…52988267`, 설치본 `61E2D5E0…4B4C8B71`.
   1.2.9부터 exe에 버전 리소스가 있다(`tools/version_resource.py`, spec이 빌드 시점 `src/version.py`를 읽음) —
   설치본 버전은 `(Get-Item <exe>).VersionInfo.FileVersion`으로 확인한다. 1.2.8 해시: exe `E2CE917C…31C86B4A1`, 설치본 `2B6FF240…D4868CDC`
   (전체 값·실데이터 백업·키 래핑 결과는 감사 문서 §8.6). 1.2.7: exe `7221FF87…0EBE0`, 설치본 `9569F99D…23744`.
